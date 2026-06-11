@@ -286,6 +286,7 @@ State should record:
 - Attempt count.
 - Started and finished timestamps.
 - Exit status.
+- Inputs.
 - Normalized outputs.
 - Artifact paths.
 - Error classification.
