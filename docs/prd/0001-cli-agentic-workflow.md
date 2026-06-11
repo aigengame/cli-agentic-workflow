@@ -3,7 +3,9 @@
 Status: Accepted
 Date: 2026-06-11
 Related ADR: `docs/adr/0001-local-first-python-bash-workflow-kernel.md`,
-`docs/adr/0002-pattern-iteration-as-run-groups.md`
+`docs/adr/0002-pattern-iteration-as-run-groups.md`,
+`docs/adr/0003-asyncio-executor-concurrency-model.md`,
+`docs/adr/0004-python-stack-and-toolchain.md`
 Tracking issue: https://github.com/aigengame/cli-agentic-workflow/issues/1
 
 ## Summary
@@ -408,6 +410,16 @@ nodes:
 ```
 
 ## Architecture
+
+The executor concurrency model is a single-threaded asyncio event loop; each node attempt
+is a task (decided 2026-06-11, ADR 0003).
+
+### Technology Choices
+
+Stack and toolchain decisions (pydantic v2, JSON Schema 2020-12, typer, Python >= 3.12,
+ruff/mypy/pytest) are recorded with their rationale in
+`docs/adr/0004-python-stack-and-toolchain.md`; the executor concurrency model is
+`docs/adr/0003-asyncio-executor-concurrency-model.md`.
 
 Proposed package layout:
 
