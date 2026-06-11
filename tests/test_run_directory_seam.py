@@ -99,9 +99,7 @@ def test_state_records_succeeded_run_node_attempt_and_normalized_output(
     assert run["workflow_name"] == "sample"
     assert run["definition_checksum"] == snapshot["definition_checksum"]
     assert run["status"] == "succeeded"
-    assert datetime.fromisoformat(run["created_at"]) <= datetime.fromisoformat(
-        run["finished_at"]
-    )
+    assert datetime.fromisoformat(run["created_at"]) <= datetime.fromisoformat(run["finished_at"])
 
     node = state_row(run_dir, "SELECT * FROM node")
     assert node["node_id"] == "greet"

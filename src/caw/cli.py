@@ -33,10 +33,7 @@ def run(workflow_file: Path) -> None:
     runs_root = Path.cwd() / ".caw" / "runs"
     result = asyncio.run(execute_run(workflow, runs_root))
     for node_result in result.node_results:
-        typer.echo(
-            f"node {node_result.node_id} attempt 1 "
-            f"exited {node_result.exit_status}"
-        )
+        typer.echo(f"node {node_result.node_id} attempt 1 exited {node_result.exit_status}")
     if not result.succeeded:
         typer.echo(f"run {result.run_id} failed")
         raise typer.Exit(code=1)

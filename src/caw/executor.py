@@ -113,9 +113,7 @@ async def execute_run(workflow: Workflow, runs_root: Path) -> RunResult:
                 exit_status=node_result.exit_status,
                 output=node_result.normalized_output,
             )
-            state.record_node_finished(
-                run_id=run_id, node_id=node.id, status=node_result.status
-            )
+            state.record_node_finished(run_id=run_id, node_id=node.id, status=node_result.status)
             events.append(
                 "node_finished",
                 {
@@ -127,8 +125,6 @@ async def execute_run(workflow: Workflow, runs_root: Path) -> RunResult:
             )
             node_results.append(node_result)
         run_result = RunResult(run_id=run_id, node_results=tuple(node_results))
-        state.record_run_finished(
-            run_id=run_id, status=run_result.status, finished_at=_now()
-        )
+        state.record_run_finished(run_id=run_id, status=run_result.status, finished_at=_now())
         events.append("run_finished", {"status": run_result.status})
     return run_result
