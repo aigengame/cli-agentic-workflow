@@ -166,3 +166,7 @@ Work is tracked as GitHub issues with a triage-label workflow; issues labeled
 `ready-for-agent` are fully specified and independently grabbable. Start from
 [PRD #1](https://github.com/aigengame/cli-agentic-workflow/issues/1) for the big picture.
 Commits follow [Conventional Commits](https://www.conventionalcommits.org/).
+
+## License
+
+[MIT](LICENSE)
