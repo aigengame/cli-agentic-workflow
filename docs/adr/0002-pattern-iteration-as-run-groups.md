@@ -23,6 +23,10 @@ the acyclic IR to protect.
 ## Consequences
 
 - The kernel only ever executes static, pre-validated DAGs; validation happens once per run.
+- Cyclic behavior such as `loop until done` never enters the IR; it exists only at the
+  pattern level as successive Runs in a Run Group. Validation, state recovery, and
+  execution semantics stay simple while higher-level iterative workflows remain
+  expressible.
 - New requirements: a run group id and iteration index in run state, persisted controller
   state, cross-run aggregate reporting, and group-level resume.
 - Dynamic fan-out width is resolved at materialization time, never mid-run. A pattern that
