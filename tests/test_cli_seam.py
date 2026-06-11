@@ -1,5 +1,6 @@
 """CLI-seam tests: invoke the caw CLI and assert exit codes and stdout."""
 
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -10,21 +11,6 @@ from caw.cli import app
 runner = CliRunner()
 
 
-def write_workflow(directory: Path, command: str) -> Path:
-    workflow_file = directory / "workflow.yaml"
-    workflow_file.write_text(
-        "name: sample\n"
-        "version: 1\n"
-        "nodes:\n"
-        "  - id: greet\n"
-        "    kind: shell\n"
-        "    inputs:\n"
-        f"      command: {command!r}\n",
-        encoding="utf-8",
-    )
-    return workflow_file
-
-
 def test_help_exits_zero_and_names_the_cli() -> None:
     result = runner.invoke(app, ["--help"])
 
@@ -33,9 +19,11 @@ def test_help_exits_zero_and_names_the_cli() -> None:
 
 
 def test_run_succeeding_shell_node_exits_zero_and_reports_success(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    write_workflow: Callable[[str], Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    workflow_file = write_workflow(tmp_path, "echo hello")
+    workflow_file = write_workflow("echo hello")
     monkeypatch.chdir(tmp_path)
 
     result = runner.invoke(app, ["run", str(workflow_file)])
@@ -45,9 +33,11 @@ def test_run_succeeding_shell_node_exits_zero_and_reports_success(
 
 
 def test_run_failing_shell_node_exits_nonzero_and_reports_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    write_workflow: Callable[[str], Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    workflow_file = write_workflow(tmp_path, "exit 7")
+    workflow_file = write_workflow("exit 7")
     monkeypatch.chdir(tmp_path)
 
     result = runner.invoke(app, ["run", str(workflow_file)])
