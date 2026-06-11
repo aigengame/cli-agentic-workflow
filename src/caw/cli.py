@@ -5,7 +5,7 @@ from pathlib import Path
 
 import typer
 
-from caw.config import load_workflow_file
+from caw.config import WorkflowConfigError, load_workflow_file
 from caw.executor import execute_run
 from caw.model import normalize_workflow
 
@@ -24,8 +24,12 @@ def main() -> None:
 @app.command()
 def run(workflow_file: Path) -> None:
     """Run a workflow file and print a plain-text result."""
-    raw = load_workflow_file(workflow_file)
-    workflow = normalize_workflow(raw, source=str(workflow_file))
+    try:
+        raw = load_workflow_file(workflow_file)
+        workflow = normalize_workflow(raw, source=str(workflow_file))
+    except WorkflowConfigError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
     runs_root = Path.cwd() / ".caw" / "runs"
     result = asyncio.run(execute_run(workflow, runs_root))
     for node_result in result.node_results:
