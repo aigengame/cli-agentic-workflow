@@ -32,4 +32,7 @@ def run(workflow_file: Path) -> None:
             f"node {node_result.node_id} attempt 1 "
             f"exited {node_result.exit_status}"
         )
+    if not result.succeeded:
+        typer.echo("run failed")
+        raise typer.Exit(code=1)
     typer.echo("run succeeded")

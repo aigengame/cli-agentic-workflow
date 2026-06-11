@@ -42,3 +42,16 @@ def test_run_succeeding_shell_node_exits_zero_and_reports_success(
 
     assert result.exit_code == 0
     assert "succeeded" in result.output
+
+
+def test_run_failing_shell_node_exits_nonzero_and_reports_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workflow_file = write_workflow(tmp_path, "exit 7")
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["run", str(workflow_file)])
+
+    assert result.exit_code != 0
+    assert "failed" in result.output
+    assert "exited 7" in result.output
