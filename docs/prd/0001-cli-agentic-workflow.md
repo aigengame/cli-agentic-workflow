@@ -1,6 +1,6 @@
 # PRD: CLI Agentic Workflow Orchestrator
 
-Status: Draft
+Status: Accepted
 Date: 2026-06-11
 Related ADR: `docs/adr/0001-local-first-python-bash-workflow-kernel.md`,
 `docs/adr/0002-pattern-iteration-as-run-groups.md`
