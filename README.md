@@ -1,17 +1,16 @@
-# caw
+# cli-agentic-workflow(caw)
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)](https://www.python.org/)
+![caw title image](assets/caw-hero.png)
+
+> A lightweight, local-first CLI that orchestrates AI agent CLIs like `claude -p` and `codex exec` into powerful, inspectable workflows — define a DAG in simple YAML, then validate, run, resume, and report with zero infrastructure.
+
 [![Status: pre-release](https://img.shields.io/badge/status-pre--release-orange.svg)](https://github.com/aigengame/cli-agentic-workflow/issues/1)
+[![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)](https://www.python.org/)
 [![uv](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/uv/main/assets/badge/v0.json)](https://github.com/astral-sh/uv)
-[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
-[![Conventional Commits](https://img.shields.io/badge/Conventional%20Commits-1.0.0-fe5196.svg?logo=conventionalcommits&logoColor=white)](https://www.conventionalcommits.org/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-caw is a lightweight, local-first CLI that orchestrates AI agent CLIs like `claude -p` and
-`codex exec` into powerful, inspectable workflows — define a DAG in simple YAML, then
-validate, run, resume, and report with zero infrastructure.
 
-caw is not another chat UI and not an agent model provider. It is a local workflow kernel
+`caw` is not another chat UI and not an agent model provider. It is a local workflow kernel
 that turns agent invocations into structured, repeatable workflow runs: every graph is
 visible before execution, every node output is persisted, and every run can be resumed and
 audited.
