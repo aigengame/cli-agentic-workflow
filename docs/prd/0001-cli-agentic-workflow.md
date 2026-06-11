@@ -2,7 +2,9 @@
 
 Status: Draft
 Date: 2026-06-11
-Related ADR: `docs/adr/0001-local-first-python-bash-workflow-kernel.md`
+Related ADR: `docs/adr/0001-local-first-python-bash-workflow-kernel.md`,
+`docs/adr/0002-pattern-iteration-as-run-groups.md`
+Tracking issue: https://github.com/aigengame/cli-agentic-workflow/issues/1
 
 ## Summary
 
