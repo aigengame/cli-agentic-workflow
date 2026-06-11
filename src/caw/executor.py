@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from caw.events import EventLog
 from caw.model import Node, Workflow, definition_checksum, workflow_snapshot
 from caw.state import StateStore
 
@@ -88,7 +89,7 @@ async def execute_run(workflow: Workflow, runs_root: Path) -> RunResult:
     (run_dir / "workflow.normalized.json").write_text(
         json.dumps(workflow_snapshot(workflow), indent=2) + "\n", encoding="utf-8"
     )
-    (run_dir / "events.jsonl").touch()
+    events = EventLog(run_dir / "events.jsonl", run_id=run_id)
 
     with StateStore(run_dir / "state.sqlite") as state:
         state.record_run_started(
@@ -97,9 +98,11 @@ async def execute_run(workflow: Workflow, runs_root: Path) -> RunResult:
             definition_checksum=definition_checksum(workflow),
             created_at=_now(),
         )
+        events.append("run_started", {"workflow_name": workflow.name})
         node_results: list[NodeResult] = []
         for node in workflow.nodes:
             state.record_node_started(run_id=run_id, node_id=node.id)
+            events.append("node_started", {"node_id": node.id, "attempt": 1})
             node_result = await _execute_shell_node(node)
             state.record_attempt(
                 run_id=run_id,
@@ -113,9 +116,19 @@ async def execute_run(workflow: Workflow, runs_root: Path) -> RunResult:
             state.record_node_finished(
                 run_id=run_id, node_id=node.id, status=node_result.status
             )
+            events.append(
+                "node_finished",
+                {
+                    "node_id": node.id,
+                    "attempt": 1,
+                    "exit_status": node_result.exit_status,
+                    "status": node_result.status,
+                },
+            )
             node_results.append(node_result)
         run_result = RunResult(run_id=run_id, node_results=tuple(node_results))
         state.record_run_finished(
             run_id=run_id, status=run_result.status, finished_at=_now()
         )
+        events.append("run_finished", {"status": run_result.status})
     return run_result

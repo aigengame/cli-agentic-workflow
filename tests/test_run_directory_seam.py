@@ -142,3 +142,62 @@ def test_state_records_failed_run_node_and_attempt_exit_status(
     output = json.loads(attempt["output_json"])
     assert output["exit_status"] == 7
     assert "oops" in output["stderr"]
+
+
+def read_events(run_dir: Path) -> list[dict[str, Any]]:
+    lines = (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    return [json.loads(line) for line in lines]
+
+
+def test_events_form_an_append_only_trace_of_a_succeeding_run(
+    write_workflow: Callable[[str], Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow_file = write_workflow("echo hello")
+    monkeypatch.chdir(tmp_path)
+
+    invoke_run(workflow_file)
+
+    run_dir = single_run_dir(tmp_path)
+    events = read_events(run_dir)
+    assert [event["type"] for event in events] == [
+        "run_started",
+        "node_started",
+        "node_finished",
+        "run_finished",
+    ]
+    assert [event["seq"] for event in events] == [1, 2, 3, 4]
+    for event in events:
+        assert event["run_id"] == run_dir.name
+        datetime.fromisoformat(event["ts"])
+
+    node_finished = events[2]
+    assert node_finished["data"]["node_id"] == "greet"
+    assert node_finished["data"]["attempt"] == 1
+    assert node_finished["data"]["exit_status"] == 0
+    assert node_finished["data"]["status"] == "succeeded"
+    assert events[3]["data"]["status"] == "succeeded"
+
+
+def test_events_trace_a_failing_run(
+    write_workflow: Callable[[str], Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow_file = write_workflow("exit 7")
+    monkeypatch.chdir(tmp_path)
+
+    invoke_run(workflow_file)
+
+    events = read_events(single_run_dir(tmp_path))
+    assert [event["type"] for event in events] == [
+        "run_started",
+        "node_started",
+        "node_finished",
+        "run_finished",
+    ]
+    node_finished = events[2]
+    assert node_finished["data"]["exit_status"] == 7
+    assert node_finished["data"]["status"] == "failed"
+    assert events[3]["data"]["status"] == "failed"
