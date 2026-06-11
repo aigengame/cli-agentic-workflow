@@ -118,8 +118,8 @@ _Avoid_: macro
 
 **Pattern Controller**:
 The pattern-level component that expresses iterative behavior by evaluating a finished Run
-and materializing the next one; the kernel itself only executes acyclic Runs (see ADR
-0002).
+and materializing the next one; the kernel itself only executes acyclic Runs
+(see ADR 0002).
 _Avoid_: orchestrator, loop controller
 
 **Run Group**:
