@@ -17,8 +17,8 @@ commands, hooks, and plugin scripts support explicit workflow fragments. Codex C
 non-interactive `exec` behavior and related automation surfaces.
 
 The core architectural question is whether v0.1 should be implemented with Python and bash
-alone, or whether it should immediately adopt a heavier engine such as `iii engine` or another
-durable workflow backend.
+alone, or whether it should immediately adopt a heavier external workflow framework, such as
+`iii` (https://github.com/iii-hq/iii), or another durable workflow backend.
 
 ## Decision
 
@@ -34,8 +34,9 @@ The v0.1 architecture will:
 - Persist run state locally using SQLite, JSONL events, normalized workflow snapshots, and
   artifact directories.
 - Keep each concrete Workflow IR acyclic.
-- Implement loops and tournaments as pattern-level controllers over repeated or expanded DAGs.
-- Avoid requiring `iii engine` or any external durable workflow infrastructure in v0.1.
+- Implement loops and tournaments as pattern controllers that materialize successive
+  immutable DAG runs linked into a run group (refined in ADR 0002).
+- Avoid requiring an external workflow framework, such as `iii`, in v0.1.
 - Define an internal execution backend interface so a future engine can be introduced without
   rewriting workflow definitions.
 
@@ -99,13 +100,15 @@ Rejected as too restrictive.
 Python should own the runtime, but bash wrappers are valuable for integrating existing local
 commands, setting up environments, and preserving the CLI-native nature of the project.
 
-### Adopt `iii engine` or other extern engine/runtime in v0.1
+### Adopt an External Workflow Framework in v0.1
 
 Postponed.
 
-If `iii engine` is a specific durable workflow engine, it may be useful later for distributed
-execution, worker queues, remote runs, or long-lived background workflows. It should not be a
-mandatory v0.1 dependency unless the product scope requires those capabilities immediately.
+External workflow frameworks, such as `iii` (https://github.com/iii-hq/iii, an open-source
+infrastructure for composing, extending, and observing services in real time), may be useful
+later for distributed execution, worker queues, remote runs, or long-lived background
+workflows. None should be a mandatory v0.1 dependency unless the product scope requires those
+capabilities immediately.
 
 Adoption should be reconsidered when at least one of these requirements becomes mandatory:
 
@@ -194,8 +197,9 @@ Higher-level patterns may express behavior that feels cyclic:
 - adversarial verification with regeneration
 - tournament rounds
 
-These patterns should compile into repeated or expanded DAG executions rather than cycles in
-the core IR.
+These patterns are executed by pattern controllers: each iteration is a separate immutable
+DAG run, and successive runs are linked into a run group. The core IR never contains cycles
+and a running graph is never expanded in place (see ADR 0002).
 
 ## Future Reconsideration Triggers
 
@@ -206,5 +210,5 @@ Reopen this ADR if:
 - Workflows regularly run for hours or days.
 - A built-in background run manager becomes a product requirement.
 - The project needs to coordinate tens to hundreds of concurrent agents.
-- `iii engine` is confirmed to provide essential capabilities that cannot be replicated
-  locally at acceptable complexity.
+- An external workflow framework, such as `iii`, is confirmed to provide essential
+  capabilities that cannot be replicated locally at acceptable complexity.

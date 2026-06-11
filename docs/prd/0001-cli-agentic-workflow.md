@@ -49,7 +49,9 @@ External capability notes retrieved from current documentation on 2026-06-11:
 - Keep each concrete workflow run as a DAG for validation and recovery.
 - Express iterative behavior through higher-level patterns that repeatedly instantiate or
   resume DAG runs.
-- Support agent adapters for `claude -p` and `codex exec`.
+- Support agent adapters for `claude -p` and `codex exec`, both required in v0.1 with
+  symmetric capabilities (decided 2026-06-11): structured output contracts, exit-code
+  normalization, and artifact capture must work identically through the adapter interface.
 - Support declarative workflow configuration files and formatted output.
 - Provide built-in reusable patterns for common agentic workflows.
 - Persist run state, logs, node outputs, and artifacts locally.
@@ -60,7 +62,7 @@ External capability notes retrieved from current documentation on 2026-06-11:
 - Replace Claude Code, Codex, or any agent CLI.
 - Build a hosted control plane in v0.1.
 - Build a distributed scheduler in v0.1.
-- Require an external engine such as `iii engine` for v0.1.
+- Require an external workflow framework, such as `iii`, for v0.1.
 - Build a browser UI in v0.1.
 - Guarantee deterministic agent outputs.
 - Hide security, sandbox, cost, or approval decisions behind opaque defaults.
@@ -154,23 +156,36 @@ Against ad hoc shell scripts:
 
 ## Missing Aspects to Include
 
-The initial concept should explicitly cover:
+Scope triage decided 2026-06-11.
 
-- Run state durability and resume.
-- Cancellation and timeout behavior.
-- Retry policy and idempotency expectations.
-- Artifact storage and cleanup.
-- Structured output contracts and schema validation.
-- Prompt template versioning.
-- Sandbox and approval policy passthrough for agent CLIs.
-- Secrets handling and environment variable policy.
-- Token, cost, and rate-limit controls.
-- Human approval gates for high-impact steps.
-- Dry-run and graph inspection modes.
-- Trace logs and machine-readable event streams.
-- Adapter capability discovery.
-- Workflow test fixtures and simulation mode.
-- Compatibility boundaries for different agent CLI versions.
+In scope for v0.1, each mapped to an implementation phase:
+
+- Run state durability and resume (Phase 3).
+- Cancellation and timeout behavior (Phase 3).
+- Retry policy and idempotency expectations (Phase 3).
+- Artifact storage (Phase 3) and cleanup policy (Phase 6).
+- Structured output contracts and schema validation (Phases 4 and 6).
+- Human approval gates for high-impact steps (Phase 3).
+- Dry-run and graph inspection modes (Phase 2).
+- Trace logs and machine-readable event streams (Phase 3).
+- Adapter capability discovery (Phase 4).
+- Sandbox and approval policy passthrough for agent CLIs (Phase 4): adapters expose the
+  underlying CLI's sandbox and approval flags as agent node options; `caw` adds no policy
+  engine of its own.
+- Secrets and environment variable policy, minimal form (Phases 3 and 4): env vars reach a
+  node only when declared in its `env` field, and env values are never persisted into
+  state, events, or artifacts.
+- Workflow test fixtures and simulation mode (Phase 4): a mock adapter that replays
+  fixtures, required by Phase 5 pattern tests.
+- Agent CLI version compatibility, minimal form (Phase 4): capability checks record the CLI
+  version and documentation states the supported range.
+
+Deferred to post-v0.1:
+
+- Prompt template versioning: workflow files are source-controlled and run state records
+  the definition checksum, which covers version traceability until a real need appears.
+- Token, cost, and rate-limit controls: v0.1 only records usage reported by adapters into
+  state and reports; active budget enforcement is a hardening feature.
 
 ## Primary Personas
 
@@ -244,7 +259,15 @@ Edges represent:
 
 - Ordering dependencies.
 - Data dependencies.
-- Conditional routing.
+
+Edges carry no conditions (decided 2026-06-11). Conditional behavior is expressed only by a
+node's `when` predicate. Pattern-level branch selection, such as classify-and-act, compiles
+into `when` predicates on branch entry nodes.
+
+Skip semantics the kernel must define: a node whose `when` evaluates false is marked
+`skipped`; by default a skipped dependency skips its dependents; a join node that must
+tolerate partially skipped branches declares an explicit join policy; a failed dependency
+always blocks dependents.
 
 The v0.1 executor should reject cycles in the concrete run graph.
 
@@ -253,6 +276,7 @@ The v0.1 executor should reject cycles in the concrete run graph.
 State should record:
 
 - Run id.
+- Run group id and iteration index, when the run was materialized by a pattern controller.
 - Workflow definition checksum.
 - Node status.
 - Attempt count.
@@ -274,11 +298,16 @@ and join into a downstream node.
 
 ### Await
 
-`await` is a synchronization primitive. In v0.1 it should support:
+`await` parks a run on a condition outside the graph: the awaiting node enters a waiting
+state, run state is persisted, and the run resumes when the condition is satisfied.
 
-- Waiting for dependency completion.
-- Joining parallel branches.
-- Waiting for an explicit human approval gate.
+Dependency completion and parallel joins are not awaits. They are ordinary edge scheduling
+handled by the DAG executor.
+
+In v0.1 the only await trigger source is the human gate (decided 2026-06-11, required in
+v0.1): a `human_gate` node parks the run, and approval happens through an interactive TTY
+confirmation or `caw resume <run-id> --approve <node-id>`. External-event triggers such as
+files, webhooks, or timers are later extensions that reuse the same parking mechanism.
 
 ## Built-in Workflow Patterns
 
@@ -287,13 +316,15 @@ and join into a downstream node.
 Runs a DAG iteration, evaluates a done condition, and repeats until done, failed, or max
 iterations is reached.
 
-This is not a cyclic graph in the core IR. It is an iteration controller over repeated DAG
-runs or repeated DAG subgraphs.
+This is not a cyclic graph in the core IR. It is a pattern controller over repeated runs:
+each iteration is a separate immutable DAG run, successive runs are linked into a run group,
+and feedback from iteration N becomes input to the materialized run N+1 (see ADR 0002).
 
 ### Classify and Act
 
 Runs a classifier node, maps the classification to one of several branches, then executes
-the selected branch.
+the selected branch. Branch selection compiles into `when` predicates on branch entry nodes;
+no edge-level conditions are involved.
 
 ### Adversarial Verification
 
@@ -309,12 +340,19 @@ then emits accepted candidates.
 
 Runs multiple independent agents or prompts in parallel, then synthesizes a final answer.
 
+Decided 2026-06-11: fan-out synthesis is the first end-to-end agent sample. The reference
+sample fans the same task out to `claude.print` and `codex.exec` and synthesizes a final
+answer, exercising both adapters and the parallel-join semantics in a single run.
+
 ### Tournament
 
 Runs candidates in brackets or rounds, compares outputs, promotes winners, and produces a
 final result with comparison evidence.
 
 ## CLI Requirements
+
+The CLI command name is `caw` (decided 2026-06-11; also used for the Python package
+`src/caw/` and the local state directory `.caw/`).
 
 Initial commands:
 
@@ -331,9 +369,9 @@ caw patterns init <pattern-name>
 
 ## Configuration Requirements
 
-The preferred v0.1 format should be YAML because workflow definitions need readable nested
-structures. TOML or JSON can be supported later, or used as a fallback if a dependency-free
-stdlib-only mode is required.
+The v0.1 workflow configuration format is YAML (decided 2026-06-11). Workflow definitions
+need readable nested structures, and node prompts need multi-line strings, which YAML block
+scalars handle well. TOML and JSON are possible later extensions, not v0.1 requirements.
 
 Example sketch:
 
@@ -389,6 +427,7 @@ src/caw/
     shell.py
     claude.py
     codex.py
+    mock.py
   patterns/
     loop_until_done.py
     classify_and_act.py
@@ -472,21 +511,32 @@ Exit criteria:
 - Implement state store.
 - Implement event stream.
 - Implement retries, timeouts, cancellation, and resume.
+- Implement the await parking mechanism and the `human_gate` node on top of resume.
+- Enforce the env policy: node env vars must be declared in the node's `env` field, and env
+  values are never persisted into state, events, or artifacts.
 
 Exit criteria:
 
 - A shell-only workflow can run, fail, resume, and report.
+- A workflow with a `human_gate` node parks, persists, and resumes after approval.
 
 ### Phase 4: Agent Adapters
 
 - Implement `codex.exec` adapter.
 - Implement `claude.print` adapter for `claude -p`.
+- Implement a mock adapter that replays fixtures, for tests and simulation mode.
 - Normalize exit codes, stdout, stderr, structured outputs, and artifacts.
-- Add adapter capability checks.
+- Record token and cost usage reported by adapters into run state.
+- Pass through the underlying CLI's sandbox and approval flags as agent node options.
+- Add adapter capability checks, including CLI version recording.
 
 Exit criteria:
 
 - Sample workflows can call both adapters when the external CLIs are installed.
+- An `agent` node can switch between `claude.print` and `codex.exec` by changing only its
+  `uses` value, with no other workflow changes.
+- The first end-to-end agent sample, a hand-written fan-out synthesis workflow, runs both
+  adapters in parallel and synthesizes a final answer.
 - Missing CLI dependencies produce clear errors.
 
 ### Phase 5: Built-in Patterns
@@ -503,7 +553,6 @@ Exit criteria:
 - Add Markdown, JSON, JSONL, and text reporters.
 - Add schema validation for final outputs.
 - Add artifact cleanup policy.
-- Add human approval gate support if not implemented earlier.
 
 Exit criteria:
 
@@ -535,9 +584,9 @@ Exit criteria:
 | --- | --- |
 | Feasibility analysis | `Feasibility Analysis`, `Key Risks` |
 | Product usability and competitiveness | `Usability and Product Experience`, `Competitive Position` |
-| Missing product aspects | `Missing Aspects to Include`, `Open Questions` |
+| Missing product aspects | `Missing Aspects to Include` |
 | Python and bash feasibility | `Functional Feasibility` |
-| Need for `iii engine` or similar infrastructure | PRD `Non-goals`, ADR decision and alternatives |
+| Need for an external workflow framework | PRD `Non-goals`, ADR decision and alternatives |
 | Architecture design | `Architecture`, `State and Artifacts`, related ADR |
 | Implementation flow | `Implementation Plan` |
 | Primitive workflow model | `Core Concepts` |
@@ -546,12 +595,12 @@ Exit criteria:
 
 ## Open Questions
 
-1. Should the CLI command be `caw`, `agentflow`, or another name?
-2. Should YAML be the default config format despite adding a dependency?
-3. Should human approval gates be required in v0.1?
-4. What exactly is meant by `iii engine`, and is it a concrete dependency candidate or a
-   shorthand for durable workflow infrastructure?
-5. Which workflow pattern should be the first end-to-end sample?
+None at this time (2026-06-11). Earlier open questions were resolved and recorded inline:
+CLI name (`caw`), YAML as the v0.1 config format, both agent adapters required with
+symmetric capabilities, human gate required in v0.1 (Await semantics split), external
+workflow framework wording with `iii` as an example, run-group iteration semantics
+(ADR 0002), node-level `when` as the only conditional mechanism, scope triage of missing
+aspects, and fan-out synthesis as the first end-to-end agent sample.
 
 ## References
 
@@ -567,3 +616,5 @@ External references were checked on 2026-06-11 through Context7.
   https://github.com/openai/codex/blob/main/codex-rs/cli/src/main.rs
 - Codex app-server automation API examples:
   https://github.com/openai/codex/blob/main/codex-rs/app-server/README.md
+- `iii`, an example external workflow framework:
+  https://github.com/iii-hq/iii
