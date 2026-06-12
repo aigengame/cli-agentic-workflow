@@ -134,9 +134,32 @@ def execution_order(workflow: Workflow) -> tuple[Node, ...]:
     return tuple(ordered)
 
 
-def _first_error_line(exc: ValidationError) -> str:
+def _node_id_at(raw: dict[str, Any], index: int) -> str | None:
+    nodes = raw.get("nodes")
+    if not isinstance(nodes, list) or not 0 <= index < len(nodes):
+        return None
+    entry = nodes[index]
+    if not isinstance(entry, dict):
+        return None
+    node_id = entry.get("id")
+    if isinstance(node_id, str) and node_id.strip():
+        return node_id
+    return None
+
+
+def _render_location(loc: tuple[int | str, ...], raw: dict[str, Any]) -> str:
+    parts = [str(part) for part in loc]
+    if len(loc) >= 2 and loc[0] == "nodes" and isinstance(loc[1], int):
+        # Name the node by id where possible: nodes[greet].kind beats nodes.0.kind.
+        node_id = _node_id_at(raw, loc[1])
+        if node_id is not None:
+            parts[:2] = [f"nodes[{node_id}]"]
+    return ".".join(parts) or "workflow"
+
+
+def _first_error_line(exc: ValidationError, raw: dict[str, Any]) -> str:
     first = exc.errors()[0]
-    location = ".".join(str(part) for part in first["loc"]) or "workflow"
+    location = _render_location(first["loc"], raw)
     remainder = exc.error_count() - 1
     suffix = f" (+{remainder} more)" if remainder else ""
     return f"{location}: {first['msg']}{suffix}"
@@ -148,7 +171,7 @@ def normalize_workflow(raw: dict[str, Any], source: str) -> Workflow:
         return Workflow.model_validate(raw)
     except ValidationError as exc:
         raise WorkflowConfigError(
-            f"invalid workflow definition in {source}: {_first_error_line(exc)}"
+            f"invalid workflow definition in {source}: {_first_error_line(exc, raw)}"
         ) from exc
 
 
