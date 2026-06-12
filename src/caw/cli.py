@@ -10,6 +10,11 @@ Exit code contract:
 - 3: infrastructure error (e.g. unwritable runs root, State database
   failure) — the Run could not be executed or completed (`caw run` only)
 
+Carve-out: command-line usage errors (unknown options, invalid option
+values) also exit 2, but render the framework's multi-line usage message
+without an `error:` prefix. Only workflow config errors are guaranteed
+the single `error:` line.
+
 `caw validate` never executes anything: no run directory is created and
 no subprocess is spawned.
 """

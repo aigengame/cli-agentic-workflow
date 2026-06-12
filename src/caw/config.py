@@ -41,7 +41,7 @@ def load_workflow_file(path: Path) -> dict[str, Any]:
     """Read a YAML workflow definition file and return its raw mapping."""
     try:
         text = path.read_text(encoding="utf-8")
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:
         raise WorkflowConfigError(f"cannot read workflow file {path}: {exc}") from exc
     try:
         data = yaml.load(text, Loader=_UniqueKeySafeLoader)

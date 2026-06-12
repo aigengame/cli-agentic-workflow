@@ -305,6 +305,41 @@ def test_run_missing_workflow_file_fails_with_an_error_naming_the_file(
     assert "absent.yaml" in result.output
 
 
+@pytest.mark.parametrize("command", ["run", "validate", "graph"])
+def test_non_utf8_workflow_file_is_a_config_error_with_one_error_line(
+    command: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workflow_file = tmp_path / "workflow.yaml"
+    workflow_file.write_bytes(b"name: sample\nversion: 1\n\xff\xfe broken bytes\n")
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, [command, str(workflow_file)])
+
+    assert result.exit_code == 2, f"caw {command} must treat a non-UTF-8 file as a config error"
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    lines = [line for line in result.output.splitlines() if line.strip()]
+    assert len(lines) == 1
+    assert lines[0].startswith("error:")
+    assert "workflow.yaml" in lines[0]
+    assert not (tmp_path / ".caw").exists()
+
+
+def test_usage_errors_exit_two_with_the_documented_framework_usage_shape(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Documented carve-out (see the caw.cli docstring): CLI usage errors share
+    # exit code 2 with config errors but render the framework's multi-line
+    # usage message instead of a single `error:` line.
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["graph", "whatever.yaml", "--format", "yaml"])
+
+    assert result.exit_code == 2
+    assert "Invalid value" in result.output, "the framework names the rejected option value"
+    assert "error:" not in result.output, "usage errors do not use the config-error line shape"
+    assert not (tmp_path / ".caw").exists()
+
+
 def test_run_rejects_duplicate_node_ids_before_executing_anything(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
