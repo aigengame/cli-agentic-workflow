@@ -133,6 +133,10 @@ async def execute_run(workflow: Workflow, runs_root: Path) -> RunResult:
                 },
             )
             node_results.append(node_result)
+            if not node_result.succeeded:
+                # Pipeline semantics: a node failure stops the run; later nodes
+                # are never attempted (issue #26).
+                break
         run_result = RunResult(run_id=run_id, node_results=tuple(node_results))
         state.record_run_finished(run_id=run_id, status=run_result.status, finished_at=_now())
         events.append("run_finished", {"status": run_result.status})

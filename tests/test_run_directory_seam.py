@@ -160,6 +160,45 @@ def test_state_records_failed_run_node_and_attempt_exit_status(
     assert "oops" in output["stderr"]
 
 
+def test_a_node_failure_stops_the_run_before_later_nodes_execute(
+    write_workflow_data: Callable[[dict[str, Any]], Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = tmp_path / "deployed.txt"
+    workflow_file = write_workflow_data(
+        {
+            "name": "sample",
+            "version": 1,
+            "nodes": [
+                {"id": "build", "kind": "shell", "inputs": {"command": "exit 7"}},
+                {"id": "deploy", "kind": "shell", "inputs": {"command": f"touch {marker}"}},
+            ],
+        }
+    )
+    monkeypatch.chdir(tmp_path)
+
+    exit_code, _ = invoke_run(workflow_file)
+
+    assert exit_code == 1
+    assert not marker.exists(), "the second node's command never runs after the first fails"
+    run_dir = single_run_dir(tmp_path)
+    assert state_row(run_dir, "SELECT * FROM run")["status"] == "failed"
+
+    connection = sqlite3.connect(run_dir / "state.sqlite")
+    try:
+        node_ids = [row[0] for row in connection.execute("SELECT node_id FROM node")]
+    finally:
+        connection.close()
+    assert node_ids == ["build"], "non-executed nodes are never recorded as started"
+
+    events = read_events(run_dir)
+    started_nodes = [e["data"]["node_id"] for e in events if e["type"] == "node_started"]
+    assert started_nodes == ["build"]
+    assert events[-1]["type"] == "run_finished"
+    assert events[-1]["data"]["status"] == "failed"
+
+
 def test_non_utf8_node_output_is_preserved_with_backslash_escapes(
     write_workflow: Callable[[str], Path],
     tmp_path: Path,
