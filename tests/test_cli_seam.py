@@ -56,7 +56,7 @@ def test_run_missing_workflow_file_fails_with_an_error_naming_the_file(
 
     assert result.exit_code == 2
     assert result.exception is None or isinstance(result.exception, SystemExit)
-    assert "absent.yaml" in result.output + result.stderr
+    assert "absent.yaml" in result.output
 
 
 def test_run_rejects_duplicate_node_ids_before_executing_anything(
@@ -172,5 +172,5 @@ def test_run_invalid_workflow_definition_fails_before_executing_anything(
 
     assert result.exit_code == 2
     assert result.exception is None or isinstance(result.exception, SystemExit)
-    assert "invalid.yaml" in result.output + result.stderr
+    assert "invalid.yaml" in result.output
     assert not (tmp_path / ".caw").exists(), "no run directory is created for invalid input"

@@ -81,6 +81,24 @@ def test_snapshot_carries_a_definition_checksum_over_the_normalized_workflow(
     assert snapshot["definition_checksum"] == expected
 
 
+def test_workflow_fixture_round_trips_commands_with_backslash_newline_and_mixed_quotes(
+    write_workflow: Callable[[str], Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    command = 'echo "first line"\necho \'second\\nline\' "with\'mixed"'
+    workflow_file = write_workflow(command)
+    monkeypatch.chdir(tmp_path)
+
+    exit_code, _ = invoke_run(workflow_file)
+
+    assert exit_code == 0
+    snapshot = json.loads(
+        (single_run_dir(tmp_path) / "workflow.normalized.json").read_text(encoding="utf-8")
+    )
+    assert snapshot["workflow"]["nodes"][0]["inputs"]["command"] == command
+
+
 def test_state_records_succeeded_run_node_attempt_and_normalized_output(
     write_workflow: Callable[[str], Path],
     tmp_path: Path,
