@@ -93,13 +93,17 @@ async def _execute_shell_node(node: Node) -> NodeResult:
 def _finalize_crashed_run(
     state: StateStore, events: EventLog, run_id: str, in_flight_node_id: str | None, error: str
 ) -> None:
-    """Best-effort finalization of a crashed Run; never masks the original exception."""
+    """Best-effort finalization of a crashed Run; never masks the original exception.
+
+    Suppresses BaseException, not just Exception: a second KeyboardInterrupt or
+    SystemExit arriving mid-finalization must not replace the crash being reported.
+    """
     if in_flight_node_id is not None:
-        with contextlib.suppress(Exception):
+        with contextlib.suppress(BaseException):
             state.record_node_finished(run_id=run_id, node_id=in_flight_node_id, status="errored")
-    with contextlib.suppress(Exception):
+    with contextlib.suppress(BaseException):
         state.record_run_errored(run_id=run_id, error=error, finished_at=_now())
-    with contextlib.suppress(Exception):
+    with contextlib.suppress(BaseException):
         events.append("run_errored", {"error": error, "node_id": in_flight_node_id})
 
 

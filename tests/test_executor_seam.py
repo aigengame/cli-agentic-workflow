@@ -112,6 +112,32 @@ async def test_a_mid_run_crash_finalizes_state_and_appends_a_terminal_event(
 
 
 @pytest.mark.asyncio
+async def test_crash_finalization_never_masks_the_original_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workflow = shell_workflow("echo ok")
+
+    async def failing_create(command: str, **kwargs: Any) -> asyncio.subprocess.Process:
+        raise OSError("forced spawn failure")
+
+    def exploding_record(*args: Any, **kwargs: Any) -> None:
+        # A BaseException (e.g. a second KeyboardInterrupt) raised while
+        # finalizing must not replace the error that crashed the run.
+        raise SystemExit(13)
+
+    monkeypatch.setattr("caw.executor.asyncio.create_subprocess_shell", failing_create)
+    monkeypatch.setattr("caw.executor.StateStore.record_run_errored", exploding_record)
+
+    with pytest.raises(OSError, match="forced spawn failure"):
+        await execute_run(workflow, tmp_path / "runs")
+
+    # Best-effort finalization continues past the failing step: the terminal
+    # event is still appended even though the State write blew up.
+    run_dir = single_run_dir(tmp_path / "runs")
+    assert read_events(run_dir)[-1]["type"] == "run_errored"
+
+
+@pytest.mark.asyncio
 async def test_cancelling_a_run_terminates_the_in_flight_node_subprocess(tmp_path: Path) -> None:
     pid_file = tmp_path / "node.pid"
     workflow = shell_workflow(f"echo $$ > {pid_file}; exec sleep 30")
