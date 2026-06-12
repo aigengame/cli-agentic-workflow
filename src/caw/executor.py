@@ -1,6 +1,7 @@
 """Execute one Run of a normalized Workflow on the local Engine Backend (ADR 0003)."""
 
 import asyncio
+import contextlib
 import json
 import secrets
 from dataclasses import dataclass
@@ -66,10 +67,18 @@ async def _execute_shell_node(node: Node) -> NodeResult:
     started_at = _now()
     process = await asyncio.create_subprocess_shell(
         node.inputs.command,
+        stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await process.communicate()
+    try:
+        stdout, stderr = await process.communicate()
+    except asyncio.CancelledError:
+        if process.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                process.kill()
+        await process.wait()
+        raise
     exit_status = process.returncode if process.returncode is not None else -1
     return NodeResult(
         node_id=node.id,
