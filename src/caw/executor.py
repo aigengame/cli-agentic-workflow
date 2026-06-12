@@ -90,6 +90,19 @@ async def _execute_shell_node(node: Node) -> NodeResult:
     )
 
 
+def _finalize_crashed_run(
+    state: StateStore, events: EventLog, run_id: str, in_flight_node_id: str | None, error: str
+) -> None:
+    """Best-effort finalization of a crashed Run; never masks the original exception."""
+    if in_flight_node_id is not None:
+        with contextlib.suppress(Exception):
+            state.record_node_finished(run_id=run_id, node_id=in_flight_node_id, status="errored")
+    with contextlib.suppress(Exception):
+        state.record_run_errored(run_id=run_id, error=error, finished_at=_now())
+    with contextlib.suppress(Exception):
+        events.append("run_errored", {"error": error, "node_id": in_flight_node_id})
+
+
 async def execute_run(workflow: Workflow, runs_root: Path) -> RunResult:
     """Materialize a run directory, execute the Workflow's Nodes, and persist the Run."""
     run_id = _new_run_id()
@@ -109,35 +122,46 @@ async def execute_run(workflow: Workflow, runs_root: Path) -> RunResult:
         )
         events.append("run_started", {"workflow_name": workflow.name})
         node_results: list[NodeResult] = []
-        for node in workflow.nodes:
-            state.record_node_started(run_id=run_id, node_id=node.id)
-            events.append("node_started", {"node_id": node.id, "attempt": 1})
-            node_result = await _execute_shell_node(node)
-            state.record_attempt(
-                run_id=run_id,
-                node_id=node.id,
-                attempt=1,
-                started_at=node_result.started_at,
-                finished_at=node_result.finished_at,
-                exit_status=node_result.exit_status,
-                output=node_result.normalized_output,
-            )
-            state.record_node_finished(run_id=run_id, node_id=node.id, status=node_result.status)
-            events.append(
-                "node_finished",
-                {
-                    "node_id": node.id,
-                    "attempt": 1,
-                    "exit_status": node_result.exit_status,
-                    "status": node_result.status,
-                },
-            )
-            node_results.append(node_result)
-            if not node_result.succeeded:
-                # Pipeline semantics: a node failure stops the run; later nodes
-                # are never attempted (issue #26).
-                break
-        run_result = RunResult(run_id=run_id, node_results=tuple(node_results))
-        state.record_run_finished(run_id=run_id, status=run_result.status, finished_at=_now())
-        events.append("run_finished", {"status": run_result.status})
+        in_flight_node_id: str | None = None
+        try:
+            for node in workflow.nodes:
+                in_flight_node_id = node.id
+                state.record_node_started(run_id=run_id, node_id=node.id)
+                events.append("node_started", {"node_id": node.id, "attempt": 1})
+                node_result = await _execute_shell_node(node)
+                state.record_attempt(
+                    run_id=run_id,
+                    node_id=node.id,
+                    attempt=1,
+                    started_at=node_result.started_at,
+                    finished_at=node_result.finished_at,
+                    exit_status=node_result.exit_status,
+                    output=node_result.normalized_output,
+                )
+                state.record_node_finished(
+                    run_id=run_id, node_id=node.id, status=node_result.status
+                )
+                events.append(
+                    "node_finished",
+                    {
+                        "node_id": node.id,
+                        "attempt": 1,
+                        "exit_status": node_result.exit_status,
+                        "status": node_result.status,
+                    },
+                )
+                in_flight_node_id = None
+                node_results.append(node_result)
+                if not node_result.succeeded:
+                    # Pipeline semantics: a node failure stops the run; later nodes
+                    # are never attempted (issue #26).
+                    break
+            run_result = RunResult(run_id=run_id, node_results=tuple(node_results))
+            state.record_run_finished(run_id=run_id, status=run_result.status, finished_at=_now())
+            events.append("run_finished", {"status": run_result.status})
+        except BaseException as exc:
+            message = str(exc)
+            error = f"{type(exc).__name__}: {message}" if message else type(exc).__name__
+            _finalize_crashed_run(state, events, run_id, in_flight_node_id, error)
+            raise
     return run_result

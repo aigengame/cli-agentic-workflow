@@ -13,7 +13,8 @@ CREATE TABLE IF NOT EXISTS run (
     definition_checksum TEXT NOT NULL,
     status TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    finished_at TEXT
+    finished_at TEXT,
+    error TEXT
 );
 CREATE TABLE IF NOT EXISTS node (
     run_id TEXT NOT NULL REFERENCES run (run_id),
@@ -75,6 +76,12 @@ class StateStore:
         self._execute(
             "UPDATE run SET status = ?, finished_at = ? WHERE run_id = ?",
             (status, finished_at, run_id),
+        )
+
+    def record_run_errored(self, run_id: str, error: str, finished_at: str) -> None:
+        self._execute(
+            "UPDATE run SET status = 'errored', error = ?, finished_at = ? WHERE run_id = ?",
+            (error, finished_at, run_id),
         )
 
     def record_node_started(self, run_id: str, node_id: str) -> None:

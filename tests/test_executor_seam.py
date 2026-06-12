@@ -1,8 +1,10 @@
 """Executor-seam tests: drive execute_run directly on the asyncio Engine Backend."""
 
 import asyncio
+import json
 import os
 import signal
+import sqlite3
 import subprocess
 import sys
 from collections.abc import Callable
@@ -25,6 +27,26 @@ def shell_workflow(*commands: str) -> Workflow:
         ],
     }
     return normalize_workflow(raw, source="<test>")
+
+
+def single_run_dir(runs_root: Path) -> Path:
+    run_dirs = list(runs_root.iterdir())
+    assert len(run_dirs) == 1
+    return run_dirs[0]
+
+
+def state_rows(run_dir: Path, query: str) -> list[dict[str, Any]]:
+    connection = sqlite3.connect(run_dir / "state.sqlite")
+    connection.row_factory = sqlite3.Row
+    try:
+        return [dict(row) for row in connection.execute(query)]
+    finally:
+        connection.close()
+
+
+def read_events(run_dir: Path) -> list[dict[str, Any]]:
+    lines = (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    return [json.loads(line) for line in lines]
 
 
 def test_stdin_reading_node_completes_instead_of_hanging_the_run(
@@ -56,6 +78,40 @@ def test_stdin_reading_node_completes_instead_of_hanging_the_run(
 
 
 @pytest.mark.asyncio
+async def test_a_mid_run_crash_finalizes_state_and_appends_a_terminal_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workflow = shell_workflow("echo ok", "echo never")
+    real_create = asyncio.create_subprocess_shell
+    spawn_count = 0
+
+    async def failing_create(command: str, **kwargs: Any) -> asyncio.subprocess.Process:
+        nonlocal spawn_count
+        spawn_count += 1
+        if spawn_count == 2:
+            raise OSError("forced spawn failure")
+        return await real_create(command, **kwargs)
+
+    monkeypatch.setattr("caw.executor.asyncio.create_subprocess_shell", failing_create)
+
+    with pytest.raises(OSError, match="forced spawn failure"):
+        await execute_run(workflow, tmp_path / "runs")
+
+    run_dir = single_run_dir(tmp_path / "runs")
+    (run,) = state_rows(run_dir, "SELECT * FROM run")
+    assert run["status"] == "errored"
+    assert run["finished_at"] is not None
+    assert "OSError" in run["error"] and "forced spawn failure" in run["error"]
+
+    nodes = {row["node_id"]: row["status"] for row in state_rows(run_dir, "SELECT * FROM node")}
+    assert nodes == {"node1": "succeeded", "node2": "errored"}
+
+    last_event = read_events(run_dir)[-1]
+    assert last_event["type"] == "run_errored"
+    assert "forced spawn failure" in last_event["data"]["error"]
+
+
+@pytest.mark.asyncio
 async def test_cancelling_a_run_terminates_the_in_flight_node_subprocess(tmp_path: Path) -> None:
     pid_file = tmp_path / "node.pid"
     workflow = shell_workflow(f"echo $$ > {pid_file}; exec sleep 30")
@@ -82,3 +138,13 @@ async def test_cancelling_a_run_terminates_the_in_flight_node_subprocess(tmp_pat
     else:
         os.kill(pid, signal.SIGKILL)
         pytest.fail(f"node subprocess {pid} was still alive after cancellation")
+
+    # Cancellation takes the same finalization path as any other crash (issue #22).
+    run_dir = single_run_dir(tmp_path / "runs")
+    (run,) = state_rows(run_dir, "SELECT * FROM run")
+    assert run["status"] == "errored"
+    assert run["finished_at"] is not None
+    assert "CancelledError" in run["error"]
+    (node,) = state_rows(run_dir, "SELECT * FROM node")
+    assert node["status"] == "errored"
+    assert read_events(run_dir)[-1]["type"] == "run_errored"
