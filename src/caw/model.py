@@ -33,6 +33,7 @@ class Node(BaseModel):
     id: str
     kind: Literal["shell"]
     inputs: ShellNodeInputs
+    needs: tuple[str, ...] = ()
 
     _id_non_blank = field_validator("id")(_require_non_blank)
 
@@ -59,6 +60,23 @@ class Workflow(BaseModel):
                 raise ValueError(f"duplicate node id {node.id!r}")
             seen.add(node.id)
         return nodes
+
+
+def execution_order(workflow: Workflow) -> tuple[Node, ...]:
+    """The deterministic topological order a Run executes Nodes in.
+
+    Among Nodes whose dependencies are all satisfied, declaration order in the
+    workflow definition breaks the tie.
+    """
+    ordered: list[Node] = []
+    done: set[str] = set()
+    remaining = list(workflow.nodes)
+    while remaining:
+        node = next(n for n in remaining if done.issuperset(n.needs))
+        ordered.append(node)
+        done.add(node.id)
+        remaining.remove(node)
+    return tuple(ordered)
 
 
 def _first_error_line(exc: ValidationError) -> str:

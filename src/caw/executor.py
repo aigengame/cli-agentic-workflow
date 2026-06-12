@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from caw.events import EventLog
-from caw.model import Node, Workflow, definition_checksum, workflow_snapshot
+from caw.model import Node, Workflow, definition_checksum, execution_order, workflow_snapshot
 from caw.state import StateStore
 
 
@@ -128,7 +128,7 @@ async def execute_run(workflow: Workflow, runs_root: Path) -> RunResult:
         node_results: list[NodeResult] = []
         in_flight_node_id: str | None = None
         try:
-            for node in workflow.nodes:
+            for node in execution_order(workflow):
                 in_flight_node_id = node.id
                 state.record_node_started(run_id=run_id, node_id=node.id)
                 events.append("node_started", {"node_id": node.id, "attempt": 1})

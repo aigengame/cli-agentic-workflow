@@ -49,6 +49,59 @@ def read_events(run_dir: Path) -> list[dict[str, Any]]:
     return [json.loads(line) for line in lines]
 
 
+@pytest.mark.asyncio
+async def test_run_executes_nodes_in_dependency_order_not_declaration_order(
+    tmp_path: Path,
+) -> None:
+    log = tmp_path / "order.log"
+    raw: dict[str, Any] = {
+        "name": "sample",
+        "version": 1,
+        "nodes": [
+            {
+                "id": "second",
+                "kind": "shell",
+                "needs": ["first"],
+                "inputs": {"command": f"echo second >> {log}"},
+            },
+            {"id": "first", "kind": "shell", "inputs": {"command": f"echo first >> {log}"}},
+        ],
+    }
+    workflow = normalize_workflow(raw, source="<test>")
+
+    result = await execute_run(workflow, tmp_path / "runs")
+
+    assert result.succeeded
+    assert log.read_text(encoding="utf-8").split() == ["first", "second"]
+
+
+@pytest.mark.asyncio
+async def test_ready_nodes_execute_in_declaration_order_as_the_deterministic_tie_break(
+    tmp_path: Path,
+) -> None:
+    log = tmp_path / "order.log"
+    raw: dict[str, Any] = {
+        "name": "sample",
+        "version": 1,
+        "nodes": [
+            {
+                "id": "join",
+                "kind": "shell",
+                "needs": ["left", "right"],
+                "inputs": {"command": f"echo join >> {log}"},
+            },
+            {"id": "left", "kind": "shell", "inputs": {"command": f"echo left >> {log}"}},
+            {"id": "right", "kind": "shell", "inputs": {"command": f"echo right >> {log}"}},
+        ],
+    }
+    workflow = normalize_workflow(raw, source="<test>")
+
+    result = await execute_run(workflow, tmp_path / "runs")
+
+    assert result.succeeded
+    assert log.read_text(encoding="utf-8").split() == ["left", "right", "join"]
+
+
 def test_stdin_reading_node_completes_instead_of_hanging_the_run(
     write_workflow: Callable[[str], Path], tmp_path: Path
 ) -> None:

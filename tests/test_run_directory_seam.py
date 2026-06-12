@@ -75,6 +75,7 @@ def test_snapshot_carries_a_definition_checksum_over_the_normalized_workflow(
         "id": "greet",
         "kind": "shell",
         "inputs": {"command": "echo hello"},
+        "needs": [],
     }
     canonical = json.dumps(workflow, sort_keys=True, separators=(",", ":")).encode("utf-8")
     expected = f"sha256:{hashlib.sha256(canonical).hexdigest()}"
