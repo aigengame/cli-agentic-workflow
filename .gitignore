@@ -1,1 +1,14 @@
 RULES.md
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# caw local run state
+.caw/
