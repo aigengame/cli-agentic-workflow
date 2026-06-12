@@ -7,7 +7,7 @@ from types import TracebackType
 from typing import Any
 
 _SCHEMA = """
-CREATE TABLE run (
+CREATE TABLE IF NOT EXISTS run (
     run_id TEXT PRIMARY KEY,
     workflow_name TEXT NOT NULL,
     definition_checksum TEXT NOT NULL,
@@ -15,13 +15,13 @@ CREATE TABLE run (
     created_at TEXT NOT NULL,
     finished_at TEXT
 );
-CREATE TABLE node (
+CREATE TABLE IF NOT EXISTS node (
     run_id TEXT NOT NULL REFERENCES run (run_id),
     node_id TEXT NOT NULL,
     status TEXT NOT NULL,
     PRIMARY KEY (run_id, node_id)
 );
-CREATE TABLE attempt (
+CREATE TABLE IF NOT EXISTS attempt (
     run_id TEXT NOT NULL,
     node_id TEXT NOT NULL,
     attempt INTEGER NOT NULL,
@@ -40,8 +40,13 @@ class StateStore:
 
     def __init__(self, path: Path) -> None:
         self._connection = sqlite3.connect(path)
-        self._connection.executescript(_SCHEMA)
-        self._connection.commit()
+        try:
+            self._connection.execute("PRAGMA foreign_keys = ON")
+            self._connection.executescript(_SCHEMA)
+            self._connection.commit()
+        except BaseException:
+            self._connection.close()
+            raise
 
     def __enter__(self) -> "StateStore":
         return self
