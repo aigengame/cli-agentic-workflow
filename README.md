@@ -150,6 +150,7 @@ caw report <run-id> --format markdown
 - Architecture decisions: [`docs/adr/`](docs/adr/) — local-first kernel (0001), run-group
   iteration (0002), asyncio executor (0003), Python stack (0004)
 - Domain vocabulary: [`CONTEXT.md`](CONTEXT.md)
+- CI and release flow: [`docs/release-flow.md`](docs/release-flow.md)
 
 ## Development
 
