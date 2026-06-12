@@ -163,7 +163,11 @@ def test_graph_renders_a_json_plan_with_nodes_edges_and_order(
         {"from": "build", "to": "test"},
         {"from": "test", "to": "deploy"},
     ]
-    assert plan["order"] == ["build", "test", "deploy"]
+    assert plan["topological_order"] == ["build", "test", "deploy"], (
+        "the plan names the order's semantics: a topological linearization, "
+        "not a promise of sequential execution"
+    )
+    assert "order" not in plan, "the unqualified key is gone before external consumers exist"
     assert not (tmp_path / ".caw").exists()
 
 

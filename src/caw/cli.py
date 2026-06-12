@@ -3,7 +3,7 @@
 Exit code contract:
 
 - 0: success (`caw run`: the Run succeeded; `caw validate`: the workflow
-  is valid)
+  is valid; `caw graph`: the plan was rendered)
 - 1: the Run finished with a failed Node (`caw run` only)
 - 2: config error (unreadable file or invalid workflow definition);
   config errors print exactly one `error:` line
@@ -15,8 +15,8 @@ values) also exit 2, but render the framework's multi-line usage message
 without an `error:` prefix. Only workflow config errors are guaranteed
 the single `error:` line.
 
-`caw validate` never executes anything: no run directory is created and
-no subprocess is spawned.
+`caw validate` and `caw graph` never execute anything: no run directory
+is created and no subprocess is spawned.
 """
 
 import asyncio
@@ -80,7 +80,12 @@ class GraphFormat(StrEnum):
 
 
 def _json_plan(workflow: Workflow) -> dict[str, Any]:
-    """The machine-readable plan: nodes in declaration order, edges, execution order."""
+    """The machine-readable plan: nodes in declaration order, edges, topological order.
+
+    "topological_order" is a topological linearization of the dependency graph
+    with declaration order breaking ties among ready nodes — not a promise that
+    nodes execute strictly sequentially (parallel scheduling is issue #4).
+    """
     return {
         "workflow": workflow.name,
         "nodes": [
@@ -92,7 +97,7 @@ def _json_plan(workflow: Workflow) -> dict[str, Any]:
             for node in workflow.nodes
             for dependency in node.needs
         ],
-        "order": [node.id for node in execution_order(workflow)],
+        "topological_order": [node.id for node in execution_order(workflow)],
     }
 
 

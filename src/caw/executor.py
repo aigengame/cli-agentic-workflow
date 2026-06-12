@@ -157,8 +157,11 @@ async def execute_run(workflow: Workflow, runs_root: Path) -> RunResult:
                 in_flight_node_id = None
                 node_results.append(node_result)
                 if not node_result.succeeded:
-                    # Pipeline semantics: a node failure stops the run; later nodes
-                    # are never attempted (issue #26).
+                    # Stop-on-failure over the sequential topological order: a node
+                    # failure stops the run, so no later node — dependent or not — is
+                    # attempted (#26). Edges (#3) deliberately did not change this;
+                    # parallel scheduling (#4) will narrow the skip to the failed
+                    # node's dependents.
                     break
             run_result = RunResult(run_id=run_id, node_results=tuple(node_results))
             state.record_run_finished(run_id=run_id, status=run_result.status, finished_at=_now())
