@@ -2,6 +2,7 @@
 
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 from typer.testing import CliRunner
@@ -9,6 +10,87 @@ from typer.testing import CliRunner
 from caw.cli import app
 
 runner = CliRunner()
+
+
+def linear_pipeline(marker_command: str = "echo hello") -> dict[str, Any]:
+    """A sample three-node linear pipeline: build -> test -> deploy."""
+    return {
+        "name": "sample",
+        "version": 1,
+        "nodes": [
+            {"id": "build", "kind": "shell", "inputs": {"command": marker_command}},
+            {
+                "id": "test",
+                "kind": "shell",
+                "needs": ["build"],
+                "inputs": {"command": marker_command},
+            },
+            {
+                "id": "deploy",
+                "kind": "shell",
+                "needs": ["test"],
+                "inputs": {"command": marker_command},
+            },
+        ],
+    }
+
+
+def test_validate_a_valid_pipeline_exits_zero_and_executes_nothing(
+    write_workflow_data: Callable[[dict[str, Any]], Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = tmp_path / "marker.txt"
+    workflow_file = write_workflow_data(linear_pipeline(f"touch {marker}"))
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["validate", str(workflow_file)])
+
+    assert result.exit_code == 0, result.output
+    assert not marker.exists(), "validate never executes a node"
+    assert not (tmp_path / ".caw").exists(), "validate never creates a run directory"
+
+
+def test_validate_reports_one_ok_line_naming_the_workflow_file(
+    write_workflow_data: Callable[[dict[str, Any]], Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow_file = write_workflow_data(linear_pipeline())
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["validate", str(workflow_file)])
+
+    assert result.exit_code == 0
+    lines = [line for line in result.output.splitlines() if line.strip()]
+    assert len(lines) == 1
+    assert "valid" in lines[0]
+    assert "workflow.yaml" in lines[0]
+
+
+def test_validate_invalid_workflow_exits_two_with_a_single_error_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workflow_file = tmp_path / "workflow.yaml"
+    workflow_file.write_text(
+        "name: sample\n"
+        "version: 1\n"
+        "nodes:\n"
+        "  - id: a\n    kind: shell\n    needs: [b]\n    inputs:\n      command: echo a\n"
+        "  - id: b\n    kind: shell\n    needs: [a]\n    inputs:\n      command: echo b\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["validate", str(workflow_file)])
+
+    assert result.exit_code == 2
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    lines = [line for line in result.output.splitlines() if line.strip()]
+    assert len(lines) == 1
+    assert lines[0].startswith("error:")
+    assert "dependency cycle" in lines[0]
+    assert not (tmp_path / ".caw").exists()
 
 
 def test_help_exits_zero_and_names_the_cli() -> None:
