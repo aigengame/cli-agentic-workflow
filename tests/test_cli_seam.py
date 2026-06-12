@@ -1,5 +1,6 @@
 """CLI-seam tests: invoke the caw CLI and assert exit codes and stdout."""
 
+import json
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -98,6 +99,94 @@ def test_help_exits_zero_and_names_the_cli() -> None:
 
     assert result.exit_code == 0
     assert "caw" in result.output
+
+
+def test_graph_renders_a_text_plan_in_execution_order_with_needs(
+    write_workflow_data: Callable[[dict[str, Any]], Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow_file = write_workflow_data(
+        {
+            "name": "sample",
+            "version": 1,
+            "nodes": [
+                {
+                    "id": "deploy",
+                    "kind": "shell",
+                    "needs": ["test"],
+                    "inputs": {"command": "echo deploy"},
+                },
+                {
+                    "id": "test",
+                    "kind": "shell",
+                    "needs": ["build"],
+                    "inputs": {"command": "echo test"},
+                },
+                {"id": "build", "kind": "shell", "inputs": {"command": "echo build"}},
+            ],
+        }
+    )
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["graph", str(workflow_file)])
+
+    assert result.exit_code == 0, result.output
+    assert "sample" in result.output, "the plan names the workflow"
+    assert (
+        result.output.index("build") < result.output.index("test") < result.output.index("deploy")
+    ), "nodes are listed in execution order, not declaration order"
+    assert "needs: build" in result.output
+    assert "needs: test" in result.output
+    assert not (tmp_path / ".caw").exists(), "graph never creates a run directory"
+
+
+def test_graph_renders_a_json_plan_with_nodes_edges_and_order(
+    write_workflow_data: Callable[[dict[str, Any]], Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow_file = write_workflow_data(linear_pipeline())
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["graph", str(workflow_file), "--format", "json"])
+
+    assert result.exit_code == 0, result.output
+    plan = json.loads(result.output)
+    assert plan["workflow"] == "sample"
+    assert plan["nodes"] == [
+        {"id": "build", "kind": "shell", "needs": []},
+        {"id": "test", "kind": "shell", "needs": ["build"]},
+        {"id": "deploy", "kind": "shell", "needs": ["test"]},
+    ]
+    assert plan["edges"] == [
+        {"from": "build", "to": "test"},
+        {"from": "test", "to": "deploy"},
+    ]
+    assert plan["order"] == ["build", "test", "deploy"]
+    assert not (tmp_path / ".caw").exists()
+
+
+def test_graph_invalid_workflow_exits_two_with_a_single_error_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workflow_file = tmp_path / "workflow.yaml"
+    workflow_file.write_text(
+        "name: sample\nversion: 1\nnodes:\n"
+        "  - id: deploy\n    kind: shell\n    needs: [build]\n    inputs:\n"
+        "      command: echo deploy\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["graph", str(workflow_file)])
+
+    assert result.exit_code == 2
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    lines = [line for line in result.output.splitlines() if line.strip()]
+    assert len(lines) == 1
+    assert lines[0].startswith("error:")
+    assert not (tmp_path / ".caw").exists()
 
 
 def test_run_succeeding_shell_node_exits_zero_and_reports_success(

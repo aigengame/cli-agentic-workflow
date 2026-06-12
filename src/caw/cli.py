@@ -15,14 +15,17 @@ no subprocess is spawned.
 """
 
 import asyncio
+import json
 import sqlite3
+from enum import StrEnum
 from pathlib import Path
+from typing import Annotated, Any
 
 import typer
 
 from caw.config import WorkflowConfigError, load_workflow_file
 from caw.executor import NodeResult, execute_run
-from caw.model import Workflow, normalize_workflow
+from caw.model import Workflow, execution_order, normalize_workflow
 
 app = typer.Typer(
     name="caw",
@@ -62,6 +65,48 @@ def validate(workflow_file: Path) -> None:
     """Validate a workflow file without executing anything."""
     workflow = _load_normalized_workflow(workflow_file)
     typer.echo(f"workflow {workflow_file} is valid ({len(workflow.nodes)} nodes)")
+
+
+class GraphFormat(StrEnum):
+    """Output formats of `caw graph`."""
+
+    text = "text"
+    json = "json"
+
+
+def _json_plan(workflow: Workflow) -> dict[str, Any]:
+    """The machine-readable plan: nodes in declaration order, edges, execution order."""
+    return {
+        "workflow": workflow.name,
+        "nodes": [
+            {"id": node.id, "kind": node.kind, "needs": list(node.needs)}
+            for node in workflow.nodes
+        ],
+        "edges": [
+            {"from": dependency, "to": node.id}
+            for node in workflow.nodes
+            for dependency in node.needs
+        ],
+        "order": [node.id for node in execution_order(workflow)],
+    }
+
+
+@app.command()
+def graph(
+    workflow_file: Path,
+    format: Annotated[
+        GraphFormat, typer.Option(help="Render the plan as human-readable text or as JSON.")
+    ] = GraphFormat.text,
+) -> None:
+    """Render the planned execution graph of a workflow file without executing it."""
+    workflow = _load_normalized_workflow(workflow_file)
+    if format is GraphFormat.json:
+        typer.echo(json.dumps(_json_plan(workflow), indent=2))
+        return
+    typer.echo(f"workflow {workflow.name}: {len(workflow.nodes)} nodes")
+    for position, node in enumerate(execution_order(workflow), start=1):
+        needs = f"  (needs: {', '.join(node.needs)})" if node.needs else ""
+        typer.echo(f"  {position}. {node.id}{needs}")
 
 
 @app.command()
