@@ -134,7 +134,18 @@ def _find_cycle(remaining: list[Node]) -> list[str]:
     while current.id not in first_seen_at:
         first_seen_at[current.id] = len(path)
         path.append(current.id)
-        current = next(by_id[reference] for reference in current.needs if reference in by_id)
+        successor = next(
+            (by_id[reference] for reference in current.needs if reference in by_id), None
+        )
+        if successor is None:
+            # Raise ValueError, never StopIteration: pydantic converts only
+            # ValueError/AssertionError into validation errors, so a breach of
+            # the known-reference invariant must not escape as a raw traceback.
+            raise ValueError(
+                f"node {current.id!r} is unorderable but lies on no cycle; "
+                f"it needs a node outside the workflow"
+            )
+        current = successor
     return [*path[first_seen_at[current.id] :], current.id]
 
 
@@ -142,10 +153,18 @@ def execution_order(workflow: Workflow) -> tuple[Node, ...]:
     """The deterministic topological order a Run executes Nodes in.
 
     Among Nodes whose dependencies are all satisfied, declaration order in the
-    workflow definition breaks the tie. A constructed Workflow is already
-    validated acyclic, so every Node is ordered.
+    workflow definition breaks the tie. A normally constructed Workflow is
+    validated acyclic, so every Node is ordered; a Workflow that bypassed
+    validation (model_construct, model_copy(update=...)) and violates that
+    invariant fails loudly instead of yielding a partial order.
     """
-    ordered, _ = _peel_in_declaration_order(workflow.nodes)
+    ordered, remaining = _peel_in_declaration_order(workflow.nodes)
+    if remaining:
+        unorderable = ", ".join(repr(node.id) for node in remaining)
+        raise ValueError(
+            f"workflow {workflow.name!r} has unorderable nodes (dependency cycle "
+            f"or unknown reference; was validation bypassed?): {unorderable}"
+        )
     return tuple(ordered)
 
 
