@@ -83,8 +83,8 @@ async def _execute_shell_node(node: Node) -> NodeResult:
     return NodeResult(
         node_id=node.id,
         exit_status=exit_status,
-        stdout=stdout.decode(errors="replace"),
-        stderr=stderr.decode(errors="replace"),
+        stdout=stdout.decode(errors="backslashreplace"),
+        stderr=stderr.decode(errors="backslashreplace"),
         started_at=started_at,
         finished_at=_now(),
     )

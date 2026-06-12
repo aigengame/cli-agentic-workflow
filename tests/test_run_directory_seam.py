@@ -160,6 +160,23 @@ def test_state_records_failed_run_node_and_attempt_exit_status(
     assert "oops" in output["stderr"]
 
 
+def test_non_utf8_node_output_is_preserved_with_backslash_escapes(
+    write_workflow: Callable[[str], Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow_file = write_workflow(r"printf '\377\376'")
+    monkeypatch.chdir(tmp_path)
+
+    exit_code, _ = invoke_run(workflow_file)
+
+    assert exit_code == 0
+    attempt = state_row(single_run_dir(tmp_path), "SELECT * FROM attempt")
+    output = json.loads(attempt["output_json"])
+    assert output["stdout"] == "\\xff\\xfe", "invalid UTF-8 bytes survive as backslash escapes"
+    assert "�" not in output["stdout"]
+
+
 def read_events(run_dir: Path) -> list[dict[str, Any]]:
     lines = (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
     return [json.loads(line) for line in lines]
