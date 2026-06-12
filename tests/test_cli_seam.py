@@ -282,6 +282,37 @@ def test_run_rejects_an_unhashable_yaml_mapping_key_as_a_config_error(
     assert not (tmp_path / ".caw").exists()
 
 
+@pytest.mark.parametrize(
+    ("case", "yaml_text"),
+    [
+        (
+            "validation error",
+            "name: sample\nversion: 1\nnodes:\n"
+            "  - id: greet\n    kind: shell\n    inputs:\n      command: echo hello\n"
+            "  - id: greet\n    kind: shell\n    inputs:\n      command: echo hello\n",
+        ),
+        (
+            "yaml error",
+            "name: sample\nname: again\nversion: 1\nnodes:\n"
+            "  - id: greet\n    kind: shell\n    inputs:\n      command: echo hello\n",
+        ),
+    ],
+)
+def test_run_config_errors_print_a_single_error_line(
+    case: str, yaml_text: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workflow_file = tmp_path / "workflow.yaml"
+    workflow_file.write_text(yaml_text, encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["run", str(workflow_file)])
+
+    assert result.exit_code == 2
+    lines = [line for line in result.output.splitlines() if line.strip()]
+    assert len(lines) == 1, f"a {case} must print a single error line, got:\n{result.output}"
+    assert lines[0].startswith("error:")
+
+
 def test_run_invalid_workflow_definition_fails_before_executing_anything(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

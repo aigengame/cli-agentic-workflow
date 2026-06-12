@@ -4,7 +4,7 @@ import hashlib
 import json
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 
 from caw.config import WorkflowConfigError
 
@@ -61,12 +61,22 @@ class Workflow(BaseModel):
         return nodes
 
 
+def _first_error_line(exc: ValidationError) -> str:
+    first = exc.errors()[0]
+    location = ".".join(str(part) for part in first["loc"]) or "workflow"
+    remainder = exc.error_count() - 1
+    suffix = f" (+{remainder} more)" if remainder else ""
+    return f"{location}: {first['msg']}{suffix}"
+
+
 def normalize_workflow(raw: dict[str, Any], source: str) -> Workflow:
     """Normalize a raw workflow mapping into the Workflow IR, or fail with field paths."""
     try:
         return Workflow.model_validate(raw)
-    except ValueError as exc:
-        raise WorkflowConfigError(f"invalid workflow definition in {source}: {exc}") from exc
+    except ValidationError as exc:
+        raise WorkflowConfigError(
+            f"invalid workflow definition in {source}: {_first_error_line(exc)}"
+        ) from exc
 
 
 def definition_checksum(workflow: Workflow) -> str:

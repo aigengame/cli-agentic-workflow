@@ -46,7 +46,10 @@ def load_workflow_file(path: Path) -> dict[str, Any]:
     try:
         data = yaml.load(text, Loader=_UniqueKeySafeLoader)
     except yaml.YAMLError as exc:
-        raise WorkflowConfigError(f"invalid YAML in workflow file {path}: {exc}") from exc
+        # PyYAML error strings span several lines (problem, mark, caret art);
+        # collapse them so the CLI's error contract stays one line per error.
+        reason = " ".join(str(exc).split())
+        raise WorkflowConfigError(f"invalid YAML in workflow file {path}: {reason}") from exc
     if not isinstance(data, dict):
         raise WorkflowConfigError(f"workflow file {path} must contain a YAML mapping")
     return data
