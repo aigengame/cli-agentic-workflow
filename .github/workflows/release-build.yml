@@ -1,0 +1,52 @@
+name: release-build
+
+# Convergence point for both release trigger paths:
+# - Manual: a human pushes a v* tag, which fires `push: tags` directly.
+# - Automatic: release-please creates the tag with the default GITHUB_TOKEN,
+#   which GitHub never propagates to `push` triggers (anti-recursion), so the
+#   release-please workflow calls this one explicitly via `workflow_call`.
+on:
+  push:
+    tags: ["v*"]
+  workflow_call:
+    inputs:
+      tag:
+        description: Existing v* tag to build and attach artifacts to
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-build-${{ inputs.tag || github.ref_name }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          python-version: "3.12"
+      - name: Build sdist and wheel
+        run: uv build
+      - name: Ensure the GitHub Release exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # release-please creates the Release before this workflow is called;
+        # a manually pushed tag has none yet, so create it here exactly once.
+        run: |
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --title "$TAG" --verify-tag --generate-notes
+          fi
+      - name: Attach artifacts to the Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # --clobber keeps the upload idempotent if both trigger paths ever race.
+        run: gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber
