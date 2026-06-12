@@ -102,6 +102,34 @@ async def test_ready_nodes_execute_in_declaration_order_as_the_deterministic_tie
     assert log.read_text(encoding="utf-8").split() == ["left", "right", "join"]
 
 
+@pytest.mark.asyncio
+async def test_nodes_depending_on_a_failed_node_never_run(tmp_path: Path) -> None:
+    # Sequential Pipeline semantics: a node failure stops the run (issue #26),
+    # which in particular guarantees that transitive dependents of the failed
+    # node are never attempted.
+    marker = tmp_path / "deployed.txt"
+    raw: dict[str, Any] = {
+        "name": "sample",
+        "version": 1,
+        "nodes": [
+            {"id": "build", "kind": "shell", "inputs": {"command": "exit 7"}},
+            {
+                "id": "deploy",
+                "kind": "shell",
+                "needs": ["build"],
+                "inputs": {"command": f"touch {marker}"},
+            },
+        ],
+    }
+    workflow = normalize_workflow(raw, source="<test>")
+
+    result = await execute_run(workflow, tmp_path / "runs")
+
+    assert not result.succeeded
+    assert not marker.exists(), "a dependent of a failed node never runs"
+    assert [node_result.node_id for node_result in result.node_results] == ["build"]
+
+
 def test_stdin_reading_node_completes_instead_of_hanging_the_run(
     write_workflow: Callable[[str], Path], tmp_path: Path
 ) -> None:

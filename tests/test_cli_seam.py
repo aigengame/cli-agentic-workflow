@@ -189,6 +189,27 @@ def test_graph_invalid_workflow_exits_two_with_a_single_error_line(
     assert not (tmp_path / ".caw").exists()
 
 
+def test_run_executes_a_multi_node_linear_workflow_in_dependency_order(
+    write_workflow_data: Callable[[dict[str, Any]], Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    log = tmp_path / "order.log"
+    pipeline = linear_pipeline()
+    for node in pipeline["nodes"]:
+        node["inputs"]["command"] = f"echo {node['id']} >> {log}"
+    workflow_file = write_workflow_data(pipeline)
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["run", str(workflow_file)])
+
+    assert result.exit_code == 0, result.output
+    assert "succeeded" in result.output
+    assert log.read_text(encoding="utf-8").split() == ["build", "test", "deploy"]
+    for node_id in ("build", "test", "deploy"):
+        assert f"node {node_id} attempt 1 exited 0" in result.output
+
+
 def test_run_succeeding_shell_node_exits_zero_and_reports_success(
     write_workflow: Callable[[str], Path],
     tmp_path: Path,
