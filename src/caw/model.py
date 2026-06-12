@@ -80,24 +80,32 @@ class Workflow(BaseModel):
     @field_validator("nodes")
     @classmethod
     def _needs_must_be_acyclic(cls, nodes: tuple[Node, ...]) -> tuple[Node, ...]:
-        # Kahn's algorithm: peel off nodes whose needs are all satisfied; whatever
-        # remains lies on or downstream of a dependency cycle. This runs after the
-        # known-reference validator, so every need of a remaining node is itself
-        # either peeled or remaining.
-        done: set[str] = set()
-        remaining = list(nodes)
-        progressed = True
-        while progressed:
-            progressed = False
-            for node in list(remaining):
-                if done.issuperset(node.needs):
-                    done.add(node.id)
-                    remaining.remove(node)
-                    progressed = True
+        # This runs after the known-reference validator, so every need of a
+        # remaining node is itself either peeled or remaining.
+        _, remaining = _peel_in_declaration_order(nodes)
         if remaining:
             cycle = " -> ".join(_find_cycle(remaining))
             raise ValueError(f"dependency cycle: {cycle}")
         return nodes
+
+
+def _peel_in_declaration_order(nodes: tuple[Node, ...]) -> tuple[list[Node], list[Node]]:
+    """Kahn's algorithm over needs edges, preferring declaration order among ready nodes.
+
+    Returns the peeled (topologically ordered) nodes and the unpeelable remainder;
+    a non-empty remainder lies on or downstream of a dependency cycle.
+    """
+    ordered: list[Node] = []
+    done: set[str] = set()
+    remaining = list(nodes)
+    while remaining:
+        node = next((n for n in remaining if done.issuperset(n.needs)), None)
+        if node is None:
+            break
+        ordered.append(node)
+        done.add(node.id)
+        remaining.remove(node)
+    return ordered, remaining
 
 
 def _find_cycle(remaining: list[Node]) -> list[str]:
@@ -121,16 +129,10 @@ def execution_order(workflow: Workflow) -> tuple[Node, ...]:
     """The deterministic topological order a Run executes Nodes in.
 
     Among Nodes whose dependencies are all satisfied, declaration order in the
-    workflow definition breaks the tie.
+    workflow definition breaks the tie. A constructed Workflow is already
+    validated acyclic, so every Node is ordered.
     """
-    ordered: list[Node] = []
-    done: set[str] = set()
-    remaining = list(workflow.nodes)
-    while remaining:
-        node = next(n for n in remaining if done.issuperset(n.needs))
-        ordered.append(node)
-        done.add(node.id)
-        remaining.remove(node)
+    ordered, _ = _peel_in_declaration_order(workflow.nodes)
     return tuple(ordered)
 
 
