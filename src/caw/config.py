@@ -17,6 +17,11 @@ class _UniqueKeySafeLoader(yaml.SafeLoader):
     def construct_mapping(self, node: yaml.MappingNode, deep: bool = False) -> dict[Any, Any]:
         seen: set[Any] = set()
         for key_node, _ in node.value:
+            if key_node.tag == "tag:yaml.org,2002:merge":
+                # `<<` merge keys are expanded by the base loader's flatten_mapping,
+                # and an explicit key legally overrides a merged one — neither is a
+                # duplicate-key authoring error.
+                continue
             key = self.construct_object(key_node, deep=deep)
             if not isinstance(key, Hashable):
                 # Let the base loader report unhashable keys as a ConstructorError.

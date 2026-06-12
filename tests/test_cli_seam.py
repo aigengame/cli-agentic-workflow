@@ -212,6 +212,62 @@ def test_run_rejects_duplicate_yaml_mapping_keys_instead_of_dropping_half_the_wo
     assert not (tmp_path / ".caw").exists()
 
 
+def test_run_accepts_yaml_merge_keys_in_a_workflow_definition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workflow_file = tmp_path / "workflow.yaml"
+    workflow_file.write_text(
+        "name: sample\n"
+        "version: 1\n"
+        "nodes:\n"
+        "  - id: first\n"
+        "    kind: shell\n"
+        "    inputs: &base\n"
+        "      command: echo hello\n"
+        "  - id: second\n"
+        "    kind: shell\n"
+        "    inputs:\n"
+        "      <<: *base\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["run", str(workflow_file)])
+
+    assert result.exit_code == 0, result.output
+    assert "succeeded" in result.output
+
+
+def test_run_allows_an_explicit_key_to_override_a_merged_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    marker = tmp_path / "overridden.txt"
+    workflow_file = tmp_path / "workflow.yaml"
+    workflow_file.write_text(
+        "name: sample\n"
+        "version: 1\n"
+        "nodes:\n"
+        "  - id: first\n"
+        "    kind: shell\n"
+        "    inputs: &base\n"
+        "      command: echo from-base\n"
+        "  - id: second\n"
+        "    kind: shell\n"
+        "    inputs:\n"
+        "      <<: *base\n"
+        f"      command: touch {marker}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["run", str(workflow_file)])
+
+    # YAML merge semantics: an explicit key legally overrides a merged one and
+    # must not be rejected as a duplicate; the marker proves the override ran.
+    assert result.exit_code == 0, result.output
+    assert marker.exists()
+
+
 def test_run_rejects_an_unhashable_yaml_mapping_key_as_a_config_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
