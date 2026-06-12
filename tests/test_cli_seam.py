@@ -532,6 +532,84 @@ def test_run_rejects_a_needs_reference_to_a_nonexistent_node_naming_file_and_nod
     assert not (tmp_path / ".caw").exists()
 
 
+def test_run_rejects_duplicate_needs_entries_naming_node_and_duplicate(
+    write_workflow_data: Callable[[dict[str, Any]], Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow_file = write_workflow_data(
+        {
+            "name": "sample",
+            "version": 1,
+            "nodes": [
+                {"id": "build", "kind": "shell", "inputs": {"command": "echo build"}},
+                {
+                    "id": "test",
+                    "kind": "shell",
+                    "needs": ["build", "build"],
+                    "inputs": {"command": "echo test"},
+                },
+            ],
+        }
+    )
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["run", str(workflow_file)])
+
+    assert result.exit_code == 2
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    lines = [line for line in result.output.splitlines() if line.strip()]
+    assert len(lines) == 1
+    assert lines[0].startswith("error:")
+    assert "test" in lines[0], "the error names the node with the duplicate entry"
+    assert "build" in lines[0], "the error names the duplicated id"
+    assert not (tmp_path / ".caw").exists()
+
+
+@pytest.mark.parametrize(
+    ("case", "needs_value"),
+    [
+        ("scalar string", "build"),
+        ("integer", 123),
+        ("null", None),
+    ],
+)
+def test_run_rejects_non_list_needs_naming_the_contract_not_a_python_type(
+    case: str,
+    needs_value: Any,
+    write_workflow_data: Callable[[dict[str, Any]], Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow_file = write_workflow_data(
+        {
+            "name": "sample",
+            "version": 1,
+            "nodes": [
+                {"id": "build", "kind": "shell", "inputs": {"command": "echo build"}},
+                {
+                    "id": "test",
+                    "kind": "shell",
+                    "needs": needs_value,
+                    "inputs": {"command": "echo test"},
+                },
+            ],
+        }
+    )
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["run", str(workflow_file)])
+
+    assert result.exit_code == 2, f"a {case} needs value must be a config error"
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    lines = [line for line in result.output.splitlines() if line.strip()]
+    assert len(lines) == 1
+    assert lines[0].startswith("error:")
+    assert "a list of node ids" in lines[0], "the error names the contract"
+    assert "tuple" not in lines[0], "no Python type leaks into the YAML-facing message"
+    assert not (tmp_path / ".caw").exists()
+
+
 def test_run_rejects_a_node_that_needs_itself(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

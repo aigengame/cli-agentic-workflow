@@ -37,6 +37,19 @@ class Node(BaseModel):
 
     _id_non_blank = field_validator("id")(_require_non_blank)
 
+    @field_validator("needs", mode="before")
+    @classmethod
+    def _needs_must_be_a_list_of_unique_ids(cls, value: object) -> object:
+        if isinstance(value, str) or not isinstance(value, list | tuple):
+            raise ValueError("must be a list of node ids")
+        seen: set[str] = set()
+        for entry in value:
+            if isinstance(entry, str):
+                if entry in seen:
+                    raise ValueError(f"duplicate needs entry {entry!r}")
+                seen.add(entry)
+        return value
+
     @model_validator(mode="after")
     def _must_not_need_itself(self) -> "Node":
         if self.id in self.needs:
