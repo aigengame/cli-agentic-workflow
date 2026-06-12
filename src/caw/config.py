@@ -1,5 +1,6 @@
 """Parse workflow definition files into raw configuration data."""
 
+from collections.abc import Hashable
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,9 @@ class _UniqueKeySafeLoader(yaml.SafeLoader):
         seen: set[Any] = set()
         for key_node, _ in node.value:
             key = self.construct_object(key_node, deep=deep)
+            if not isinstance(key, Hashable):
+                # Let the base loader report unhashable keys as a ConstructorError.
+                continue
             if key in seen:
                 raise yaml.constructor.ConstructorError(
                     "while constructing a mapping",

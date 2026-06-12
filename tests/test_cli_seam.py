@@ -212,6 +212,20 @@ def test_run_rejects_duplicate_yaml_mapping_keys_instead_of_dropping_half_the_wo
     assert not (tmp_path / ".caw").exists()
 
 
+def test_run_rejects_an_unhashable_yaml_mapping_key_as_a_config_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workflow_file = tmp_path / "workflow.yaml"
+    workflow_file.write_text("? [a, b]\n: c\nname: sample\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["run", str(workflow_file)])
+
+    assert result.exit_code == 2
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    assert not (tmp_path / ".caw").exists()
+
+
 def test_run_invalid_workflow_definition_fails_before_executing_anything(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
