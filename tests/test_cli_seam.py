@@ -47,6 +47,60 @@ def test_run_failing_shell_node_exits_nonzero_and_reports_failure(
     assert "exited 7" in result.output
 
 
+def test_run_failing_node_prints_its_stderr_excerpt(
+    write_workflow: Callable[[str], Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow_file = write_workflow("echo diagnostic detail >&2; exit 7")
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["run", str(workflow_file)])
+
+    assert result.exit_code == 1
+    assert "diagnostic detail" in result.output
+
+
+def test_run_failing_node_stderr_excerpt_is_bounded_to_the_last_lines(
+    write_workflow: Callable[[str], Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow_file = write_workflow(
+        'for i in $(seq 1 100); do echo "stderr line $i" >&2; done; exit 7'
+    )
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["run", str(workflow_file)])
+
+    assert result.exit_code == 1
+    assert "stderr line 100" in result.output
+    assert "stderr line 81" in result.output, "the last 20 lines are shown"
+    assert "stderr line 80\n" not in result.output, "earlier lines are cut"
+
+
+def test_run_infra_failure_exits_three_with_one_error_line_and_no_traceback(
+    write_workflow: Callable[[str], Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow_file = write_workflow("echo hello")
+    caw_dir = tmp_path / ".caw"
+    caw_dir.mkdir()
+    caw_dir.chmod(0o555)
+    monkeypatch.chdir(tmp_path)
+
+    try:
+        result = runner.invoke(app, ["run", str(workflow_file)])
+    finally:
+        caw_dir.chmod(0o755)
+
+    assert result.exit_code == 3, "infra errors are distinct from success, node failure, config"
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    assert "error:" in result.output
+    assert "Traceback" not in result.output
+
+
 def test_run_missing_workflow_file_fails_with_an_error_naming_the_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
