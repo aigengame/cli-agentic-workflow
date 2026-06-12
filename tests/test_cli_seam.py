@@ -698,7 +698,7 @@ def test_run_rejects_a_dependency_cycle_naming_the_offending_nodes(
     assert result.exit_code == 2
     assert result.exception is None or isinstance(result.exception, SystemExit)
     assert "workflow.yaml" in result.output
-    assert "dependency cycle: a -> b -> a" in result.output, "the cycle members are named"
+    assert "dependency cycle: 'a' -> 'b' -> 'a'" in result.output, "the cycle members are named"
     assert not (tmp_path / ".caw").exists()
 
 

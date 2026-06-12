@@ -97,7 +97,9 @@ class Workflow(BaseModel):
         # remaining node is itself either peeled or remaining.
         _, remaining = _peel_in_declaration_order(nodes)
         if remaining:
-            cycle = " -> ".join(_find_cycle(remaining))
+            # Quote each id (!r) so control characters cannot break the
+            # one-error-line contract.
+            cycle = " -> ".join(repr(node_id) for node_id in _find_cycle(remaining))
             raise ValueError(f"dependency cycle: {cycle}")
         return nodes
 
@@ -124,8 +126,9 @@ def _peel_in_declaration_order(nodes: tuple[Node, ...]) -> tuple[list[Node], lis
 def _find_cycle(remaining: list[Node]) -> list[str]:
     """Extract one actual cycle from the unpeelable remainder of Kahn's algorithm.
 
-    Walks `needs` references between remaining nodes until one repeats; the
-    rendered path reads left to right along `needs` (x -> y means x needs y).
+    Walks `needs` references between remaining nodes until one repeats. The
+    returned path reads left to right in execution direction (x -> y means y
+    needs x, so x would run before y), matching the JSON plan's edge direction.
     """
     by_id = {node.id: node for node in remaining}
     path: list[str] = []
@@ -146,7 +149,8 @@ def _find_cycle(remaining: list[Node]) -> list[str]:
                 f"it needs a node outside the workflow"
             )
         current = successor
-    return [*path[first_seen_at[current.id] :], current.id]
+    needs_walk = [*path[first_seen_at[current.id] :], current.id]
+    return needs_walk[::-1]
 
 
 def execution_order(workflow: Workflow) -> tuple[Node, ...]:
@@ -184,10 +188,12 @@ def _node_id_at(raw: dict[str, Any], index: int) -> str | None:
 def _render_location(loc: tuple[int | str, ...], raw: dict[str, Any]) -> str:
     parts = [str(part) for part in loc]
     if len(loc) >= 2 and loc[0] == "nodes" and isinstance(loc[1], int):
-        # Name the node by id where possible: nodes[greet].kind beats nodes.0.kind.
+        # Pair the position with the quoted id: nodes[1 'greet'].kind stays
+        # unambiguous for integer-like ids and for duplicate ids, where the
+        # index alone or the id alone would mislead.
         node_id = _node_id_at(raw, loc[1])
         if node_id is not None:
-            parts[:2] = [f"nodes[{node_id}]"]
+            parts[:2] = [f"nodes[{loc[1]} {node_id!r}]"]
     return ".".join(parts) or "workflow"
 
 
