@@ -4,9 +4,15 @@ import hashlib
 import json
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, field_validator
 
 from caw.config import WorkflowConfigError
+
+
+def _require_non_blank(value: str) -> str:
+    if not value.strip():
+        raise ValueError("must not be blank or whitespace-only")
+    return value
 
 
 class ShellNodeInputs(BaseModel):
@@ -15,6 +21,8 @@ class ShellNodeInputs(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     command: str
+
+    _command_non_blank = field_validator("command")(_require_non_blank)
 
 
 class Node(BaseModel):
@@ -26,6 +34,8 @@ class Node(BaseModel):
     kind: Literal["shell"]
     inputs: ShellNodeInputs
 
+    _id_non_blank = field_validator("id")(_require_non_blank)
+
 
 class Workflow(BaseModel):
     """A normalized Workflow IR for one Run."""
@@ -35,6 +45,20 @@ class Workflow(BaseModel):
     name: str
     version: int
     nodes: tuple[Node, ...]
+
+    _name_non_blank = field_validator("name")(_require_non_blank)
+
+    @field_validator("nodes")
+    @classmethod
+    def _node_ids_must_be_unique(cls, nodes: tuple[Node, ...]) -> tuple[Node, ...]:
+        if not nodes:
+            raise ValueError("nodes must not be empty")
+        seen: set[str] = set()
+        for node in nodes:
+            if node.id in seen:
+                raise ValueError(f"duplicate node id {node.id!r}")
+            seen.add(node.id)
+        return nodes
 
 
 def normalize_workflow(raw: dict[str, Any], source: str) -> Workflow:
