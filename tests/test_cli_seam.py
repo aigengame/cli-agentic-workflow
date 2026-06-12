@@ -313,6 +313,90 @@ def test_run_config_errors_print_a_single_error_line(
     assert lines[0].startswith("error:")
 
 
+def test_run_rejects_a_needs_reference_to_a_nonexistent_node_naming_file_and_node(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workflow_file = tmp_path / "workflow.yaml"
+    workflow_file.write_text(
+        "name: sample\n"
+        "version: 1\n"
+        "nodes:\n"
+        "  - id: deploy\n"
+        "    kind: shell\n"
+        "    needs: [build]\n"
+        "    inputs:\n"
+        "      command: echo deploy\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["run", str(workflow_file)])
+
+    assert result.exit_code == 2
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    assert "workflow.yaml" in result.output, "the error names the workflow file"
+    assert "deploy" in result.output, "the error names the referencing node"
+    assert "build" in result.output, "the error names the unknown reference"
+    assert not (tmp_path / ".caw").exists()
+
+
+def test_run_rejects_a_node_that_needs_itself(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workflow_file = tmp_path / "workflow.yaml"
+    workflow_file.write_text(
+        "name: sample\n"
+        "version: 1\n"
+        "nodes:\n"
+        "  - id: build\n"
+        "    kind: shell\n"
+        "    needs: [build]\n"
+        "    inputs:\n"
+        "      command: echo build\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["run", str(workflow_file)])
+
+    assert result.exit_code == 2
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    assert "workflow.yaml" in result.output
+    assert "build" in result.output, "the error names the self-referencing node"
+    assert not (tmp_path / ".caw").exists()
+
+
+def test_run_rejects_a_dependency_cycle_naming_the_offending_nodes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workflow_file = tmp_path / "workflow.yaml"
+    workflow_file.write_text(
+        "name: sample\n"
+        "version: 1\n"
+        "nodes:\n"
+        "  - id: a\n"
+        "    kind: shell\n"
+        "    needs: [b]\n"
+        "    inputs:\n"
+        "      command: echo a\n"
+        "  - id: b\n"
+        "    kind: shell\n"
+        "    needs: [a]\n"
+        "    inputs:\n"
+        "      command: echo b\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["run", str(workflow_file)])
+
+    assert result.exit_code == 2
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    assert "workflow.yaml" in result.output
+    assert "dependency cycle: a -> b -> a" in result.output, "the cycle members are named"
+    assert not (tmp_path / ".caw").exists()
+
+
 def test_run_invalid_workflow_definition_fails_before_executing_anything(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

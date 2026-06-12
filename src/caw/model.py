@@ -4,7 +4,7 @@ import hashlib
 import json
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, ValidationError, field_validator, model_validator
 
 from caw.config import WorkflowConfigError
 
@@ -37,6 +37,12 @@ class Node(BaseModel):
 
     _id_non_blank = field_validator("id")(_require_non_blank)
 
+    @model_validator(mode="after")
+    def _must_not_need_itself(self) -> "Node":
+        if self.id in self.needs:
+            raise ValueError(f"node {self.id!r} must not need itself")
+        return self
+
 
 class Workflow(BaseModel):
     """A normalized Workflow IR for one Run."""
@@ -60,6 +66,55 @@ class Workflow(BaseModel):
                 raise ValueError(f"duplicate node id {node.id!r}")
             seen.add(node.id)
         return nodes
+
+    @field_validator("nodes")
+    @classmethod
+    def _needs_must_reference_known_nodes(cls, nodes: tuple[Node, ...]) -> tuple[Node, ...]:
+        known = {node.id for node in nodes}
+        for node in nodes:
+            for reference in node.needs:
+                if reference not in known:
+                    raise ValueError(f"node {node.id!r} needs unknown node {reference!r}")
+        return nodes
+
+    @field_validator("nodes")
+    @classmethod
+    def _needs_must_be_acyclic(cls, nodes: tuple[Node, ...]) -> tuple[Node, ...]:
+        # Kahn's algorithm: peel off nodes whose needs are all satisfied; whatever
+        # remains lies on or downstream of a dependency cycle. This runs after the
+        # known-reference validator, so every need of a remaining node is itself
+        # either peeled or remaining.
+        done: set[str] = set()
+        remaining = list(nodes)
+        progressed = True
+        while progressed:
+            progressed = False
+            for node in list(remaining):
+                if done.issuperset(node.needs):
+                    done.add(node.id)
+                    remaining.remove(node)
+                    progressed = True
+        if remaining:
+            cycle = " -> ".join(_find_cycle(remaining))
+            raise ValueError(f"dependency cycle: {cycle}")
+        return nodes
+
+
+def _find_cycle(remaining: list[Node]) -> list[str]:
+    """Extract one actual cycle from the unpeelable remainder of Kahn's algorithm.
+
+    Walks `needs` references between remaining nodes until one repeats; the
+    rendered path reads left to right along `needs` (x -> y means x needs y).
+    """
+    by_id = {node.id: node for node in remaining}
+    path: list[str] = []
+    first_seen_at: dict[str, int] = {}
+    current = remaining[0]
+    while current.id not in first_seen_at:
+        first_seen_at[current.id] = len(path)
+        path.append(current.id)
+        current = next(by_id[reference] for reference in current.needs if reference in by_id)
+    return [*path[first_seen_at[current.id] :], current.id]
 
 
 def execution_order(workflow: Workflow) -> tuple[Node, ...]:
