@@ -6,7 +6,7 @@ import heapq
 import json
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Any, Literal
 
 from pydantic import (
     BaseModel,
@@ -76,10 +76,54 @@ class AgentNodeInputs(BaseModel):
         return names
 
 
-NodeInputs = Annotated[
-    ShellNodeInputs | AgentNodeInputs,
-    Field(discriminator="kind"),
-]
+# The node-level `kind` is the single source of truth (#62): it selects which
+# inputs model is built, so the top-level kind, the `caw graph` plan, and the
+# executor dispatch can never disagree. Because the concrete model is chosen by
+# kind (not by a discriminated union), validation errors name the authored field
+# directly (`inputs.command`) with no injected discriminator tag to strip.
+_INPUTS_MODEL_FOR_KIND: dict[str, type[ShellNodeInputs | AgentNodeInputs]] = {
+    "shell": ShellNodeInputs,
+    "agent": AgentNodeInputs,
+}
+
+
+def _build_inputs(
+    model: type[ShellNodeInputs | AgentNodeInputs], inputs: dict[str, Any]
+) -> ShellNodeInputs | AgentNodeInputs:
+    """Build the kind's inputs model, re-raising any failure under the `inputs` field.
+
+    Validating the inputs model here (rather than via a discriminated union on the
+    field) means an inner failure carries the inputs-local path (``command``);
+    re-prefixing it with ``inputs`` keeps the rendered location precise
+    (``inputs.command``) without the discriminated union's injected tag — so #62
+    removes the discriminator-strip workaround entirely.
+    """
+    try:
+        return model.model_validate(inputs)
+    except ValidationError as exc:
+        raise ValidationError.from_exception_data(
+            exc.title, [_reprefix_inputs(error) for error in exc.errors()]
+        ) from exc
+
+
+def _reprefix_inputs(error: Any) -> Any:
+    """Re-locate one inner-inputs error under the node's ``inputs`` field.
+
+    Preserves the original error type so the rendered message is unchanged (a
+    ``missing`` stays "Field required", a ``value_error`` carries its own
+    message), only prepending ``inputs`` to the location path.
+    """
+    relocated: dict[str, Any] = {
+        "type": error["type"],
+        "loc": ("inputs", *error["loc"]),
+        "input": error.get("input"),
+    }
+    ctx = error.get("ctx")
+    if ctx is not None:
+        # A value_error renders from ctx['error']; keep the original ValueError so
+        # the message is not double-prefixed with "Value error,".
+        relocated["ctx"] = ctx
+    return relocated
 
 
 class Node(BaseModel):
@@ -89,22 +133,36 @@ class Node(BaseModel):
 
     id: str
     kind: Literal["shell", "agent"]
-    inputs: NodeInputs
+    inputs: ShellNodeInputs | AgentNodeInputs
     needs: tuple[str, ...] = ()
 
     @model_validator(mode="before")
     @classmethod
-    def _stamp_inputs_kind(cls, data: object) -> object:
-        # `kind` lives at the node level in workflow definitions, never inside
-        # `inputs`. Copy it down so the discriminated `inputs` union resolves to
-        # the matching inputs model; a mismatching explicit `inputs.kind` is left
-        # to surface as a discriminator error rather than being silently rewritten.
+    def _build_inputs_from_kind(cls, data: object) -> object:
+        # `kind` lives at the node level in workflow definitions and is the single
+        # source of truth: build the inputs model the node-level `kind` names,
+        # rather than letting `inputs` pick its own variant independently (#62).
+        # An explicit `inputs.kind` that disagrees with the node `kind` is a
+        # mismatch — rejected as a config error instead of validating to a node
+        # whose graph label and runner disagree.
         if isinstance(data, dict):
             kind = data.get("kind")
             inputs = data.get("inputs")
-            if isinstance(kind, str) and isinstance(inputs, dict) and "kind" not in inputs:
-                inputs = {**inputs, "kind": kind}
-                data = {**data, "inputs": inputs}
+            if isinstance(kind, str) and isinstance(inputs, dict):
+                explicit = inputs.get("kind")
+                if explicit is not None and explicit != kind:
+                    raise ValueError(
+                        f"node kind {kind!r} disagrees with inputs.kind {explicit!r}; "
+                        f"the node-level kind is authoritative"
+                    )
+                model = _INPUTS_MODEL_FOR_KIND.get(kind)
+                if model is not None:
+                    # Build the concrete inputs model the kind names and hand the
+                    # built instance to the field. The field type is a plain union,
+                    # so pydantic accepts the already-built instance as-is without
+                    # re-resolving a variant — keeping validation errors on the
+                    # authored field (inputs.command) with no discriminator tag.
+                    data = {**data, "inputs": _build_inputs(model, {**inputs, "kind": kind})}
         return data
 
     _id_non_blank = field_validator("id")(_require_non_blank)
@@ -293,30 +351,10 @@ def _node_id_at(raw: dict[str, Any], index: int) -> str | None:
     return None
 
 
-_INPUTS_DISCRIMINATOR_TAGS = frozenset({"shell", "agent"})
-
-
-def _strip_inputs_discriminator(loc: tuple[int | str, ...]) -> tuple[int | str, ...]:
-    """Drop the ``inputs`` discriminator tag pydantic injects into the error path.
-
-    A discriminated-union field error carries the chosen tag as a path segment,
-    e.g. ``(..., 'inputs', 'shell', 'command')``. That tag is an internal routing
-    detail, not a field a workflow author wrote, so it would make the one-error
-    line read ``inputs.shell.command``. Drop it so the path names the authored
-    field (``inputs.command``), preserving the error-location contract.
-    """
-    for index, part in enumerate(loc):
-        if (
-            part == "inputs"
-            and index + 1 < len(loc)
-            and loc[index + 1] in _INPUTS_DISCRIMINATOR_TAGS
-        ):
-            return (*loc[: index + 1], *loc[index + 2 :])
-    return loc
-
-
 def _render_location(loc: tuple[int | str, ...], raw: dict[str, Any]) -> str:
-    loc = _strip_inputs_discriminator(loc)
+    # The node-level kind selects the inputs model directly (#62), so no
+    # discriminated-union tag is ever injected into the path: the location reads
+    # `inputs.command` straight off the error, with no strip step.
     parts = [str(part) for part in loc]
     if len(loc) >= 2 and loc[0] == "nodes" and isinstance(loc[1], int):
         # Pair the position with the quoted id: nodes[1 'greet'].kind stays
