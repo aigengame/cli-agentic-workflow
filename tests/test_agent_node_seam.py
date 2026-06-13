@@ -12,6 +12,7 @@ from typing import Any
 
 import pytest
 
+from caw.adapter import Adapter, AdapterRegistry, AgentInvocation, AgentResult
 from caw.config import WorkflowConfigError
 from caw.executor import execute_run
 from caw.model import Workflow, normalize_workflow
@@ -121,23 +122,45 @@ async def test_agent_node_records_an_attempt_and_node_events_like_a_shell_node(
     assert node_row["status"] == "succeeded"
 
 
+class EnvObservingAdapter(Adapter):
+    """A test-only Adapter that records the env it received (the env-observation seam).
+
+    The production MockAdapter must not write resolved env values to a
+    fixture-controlled path (#65); this test-only subclass stands in for the
+    environment a real Agent CLI process would observe, capturing it in memory so
+    a test can assert that ONLY declared variables — already filtered by the
+    kernel's env policy — reached the Node, with no secret-bearing filesystem sink.
+    """
+
+    def __init__(self) -> None:
+        self.observed_env: dict[str, str] | None = None
+
+    async def invoke(self, invocation: AgentInvocation) -> AgentResult:
+        self.observed_env = dict(invocation.env)
+        return AgentResult(exit_status=0)
+
+
 @pytest.mark.asyncio
 async def test_only_declared_env_vars_reach_the_node_process(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("DECLARED_VAR", "declared-value")
     monkeypatch.setenv("UNDECLARED_VAR", "undeclared-value")
-    seen_env = tmp_path / "seen_env.json"
-    # The mock Adapter writes the env it received to `echo_env_to`, standing in
-    # for the env an Agent CLI process would see.
-    fixture = write_fixture(tmp_path / "fixture.json", exit_status=0, echo_env_to=str(seen_env))
-    workflow = agent_workflow(fixture, env=["DECLARED_VAR"])
+    # The test-only EnvObservingAdapter records the env it received, standing in
+    # for the env an Agent CLI process would see (the seam moved out of the
+    # production mock adapter, #65).
+    observer = EnvObservingAdapter()
+    registry = AdapterRegistry({"observe": observer})
+    raw = agent_workflow(write_fixture(tmp_path / "f.json"), env=["DECLARED_VAR"]).model_dump(
+        mode="json"
+    )
+    raw["nodes"][0]["inputs"]["adapter"] = "observe"
+    workflow = normalize_workflow(raw, source="<test>", known_adapters=frozenset({"observe"}))
 
-    result = await execute_run(workflow, tmp_path / "runs")
+    result = await execute_run(workflow, tmp_path / "runs", registry=registry)
 
     assert result.succeeded
-    received = json.loads(seen_env.read_text(encoding="utf-8"))
-    assert received == {"DECLARED_VAR": "declared-value"}, (
+    assert observer.observed_env == {"DECLARED_VAR": "declared-value"}, (
         "only the declared var reaches the node, with no parent-environment leakage"
     )
 
@@ -171,6 +194,22 @@ async def test_env_values_appear_nowhere_in_state_events_or_artifacts(
     for indexed in result.node_results:
         for path in indexed.artifacts:
             assert sentinel not in Path(path).read_text(encoding="utf-8")
+
+
+def test_agent_invocation_repr_does_not_expose_env_values() -> None:
+    # #65a: AgentInvocation.env holds resolved secret VALUES. Its repr must not
+    # serialize them, so a future log line, exception message, or event payload
+    # that stringifies an invocation cannot leak a secret. The declared NAME may
+    # appear (it is already in the inspectable definition); the VALUE must not.
+    from caw.adapter import AgentInvocation
+
+    sentinel = "s3cr3t-sentinel-do-not-leak"
+    invocation = AgentInvocation(
+        node_id="n", adapter="mock", prompt="p", env={"API_TOKEN": sentinel}
+    )
+
+    rendered = repr(invocation)
+    assert sentinel not in rendered, "the env VALUE must not appear in the repr"
 
 
 def test_env_declaration_carries_names_not_values(tmp_path: Path) -> None:
@@ -427,8 +466,6 @@ async def test_a_generic_adapter_exception_fails_the_node_not_the_run(tmp_path: 
     # An Adapter whose invoke() raises an arbitrary (non-AdapterError) Exception
     # must be normalized into a failed Node so the scheduler skips dependents,
     # never escape and crash the whole Run; the independent branch still completes.
-    from caw.adapter import Adapter, AdapterRegistry, AgentInvocation, AgentResult
-
     class ExplodingAdapter(Adapter):
         async def invoke(self, invocation: AgentInvocation) -> AgentResult:
             raise RuntimeError("boom from a real CLI parse/subprocess/timeout")

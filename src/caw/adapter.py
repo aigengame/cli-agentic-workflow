@@ -33,7 +33,7 @@ class AdapterError(Exception):
     """
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, repr=False)
 class AgentInvocation:
     """A normalized, vendor-neutral request handed to an Adapter.
 
@@ -42,6 +42,11 @@ class AgentInvocation:
     policy; an Adapter passes these to the Agent CLI process and nowhere else. The
     kernel never persists these values (#5). ``output_schema`` and ``fixture`` are
     resolved file paths or ``None``.
+
+    The repr REDACTS env values (#65): the declared NAMES render — they are
+    already in the inspectable definition — but each VALUE is replaced with a
+    redaction marker, so a log line, exception message, or event payload that
+    stringifies an invocation cannot leak a secret.
     """
 
     node_id: str
@@ -51,6 +56,14 @@ class AgentInvocation:
     env: Mapping[str, str] = field(default_factory=dict)
     output_schema: Path | None = None
     fixture: Path | None = None
+
+    def __repr__(self) -> str:
+        redacted_env = {name: "***" for name in self.env}
+        return (
+            f"{type(self).__name__}(node_id={self.node_id!r}, adapter={self.adapter!r}, "
+            f"prompt={self.prompt!r}, args={self.args!r}, env={redacted_env!r}, "
+            f"output_schema={self.output_schema!r}, fixture={self.fixture!r})"
+        )
 
 
 @dataclass(frozen=True)
@@ -88,10 +101,9 @@ class MockAdapter(Adapter):
     (a list of file paths). This lets whole Workflows and Patterns run with no
     real Agent CLI installed (#5 acceptance criteria 1 and 4).
 
-    For env-policy testing the fixture may also set ``echo_env_to``: a file path
-    the mock writes the env it received to. This stands in for the environment a
-    real Agent CLI process would observe, so a test can assert that ONLY declared
-    variables — already filtered by the kernel's env policy — reached the Node.
+    The shipped adapter never writes the resolved env to a path: env-observation
+    for the env-policy test lives in a test-only adapter seam, so a secret value
+    cannot reach a fixture-controlled filesystem sink (#65).
     """
 
     async def invoke(self, invocation: AgentInvocation) -> AgentResult:
@@ -121,9 +133,6 @@ class MockAdapter(Adapter):
             raise AdapterError(
                 f"fixture {fixture} for node {node_id!r} must declare an integer exit_status"
             )
-        echo_env_to = raw.get("echo_env_to")
-        if isinstance(echo_env_to, str):
-            Path(echo_env_to).write_text(json.dumps(dict(invocation.env)), encoding="utf-8")
         artifacts = MockAdapter._parse_artifacts(raw.get("artifacts", ()), fixture, node_id)
         return AgentResult(
             exit_status=exit_status,
