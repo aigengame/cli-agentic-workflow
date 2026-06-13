@@ -85,47 +85,124 @@ class TestCiWorkflow:
             assert any(gate in command for command in commands), f"missing gate: {gate}"
 
 
-class TestReleaseBuildWorkflow:
-    """Both release trigger paths converge on one tag-driven build workflow."""
+class TestReleaseWorkflowLayout:
+    """The release lifecycle lives in a single release.yml (issue #51).
 
-    def test_triggers_on_version_tags_and_workflow_call(self) -> None:
-        triggers = triggers_of(load_workflow("release-build.yml"))
-        assert triggers["push"]["tags"] == ["v*"]
-        assert "workflow_call" in triggers
+    Merging release-please.yml and release-build.yml is safe once the raw
+    ``push: tags`` build trigger is gone: with no GITHUB_TOKEN-created tag to
+    dodge, the ``workflow_call`` indirection is unnecessary and the build runs
+    as a downstream job in the same run.
+    """
 
-    def test_builds_distributions_with_uv(self) -> None:
-        commands = run_commands_of(load_workflow("release-build.yml"))
+    def test_single_release_file_exists(self) -> None:
+        names = {path.name for path in workflow_files()}
+        assert "release.yml" in names, "the release lifecycle must live in release.yml"
+
+    def test_old_split_release_files_are_gone(self) -> None:
+        names = {path.name for path in workflow_files()}
+        assert "release-please.yml" not in names, "release-please.yml must be merged away"
+        assert "release-build.yml" not in names, "release-build.yml must be merged away"
+
+
+class TestReleaseTriggers:
+    """release.yml triggers on push to main and on a manual workflow_dispatch rebuild."""
+
+    def test_triggers_on_push_to_main(self) -> None:
+        triggers = triggers_of(load_workflow("release.yml"))
+        assert triggers["push"]["branches"] == ["main"]
+
+    def test_has_no_raw_tag_push_build_trigger(self) -> None:
+        # Plan B removes the raw `push: tags: v*` trigger so a human-chosen tag
+        # name can no longer ship artifacts of an unreconciled pyproject version.
+        triggers = triggers_of(load_workflow("release.yml"))
+        assert "tags" not in triggers.get("push", {}), (
+            "raw `push: tags` build trigger must be removed (single version authority)"
+        )
+
+    def test_workflow_dispatch_takes_an_existing_tag(self) -> None:
+        # The manual escape hatch re-builds an existing release; the tag input is
+        # required because dispatch never computes a version of its own.
+        triggers = triggers_of(load_workflow("release.yml"))
+        assert "workflow_dispatch" in triggers, "manual rebuild path must be workflow_dispatch"
+        tag_input = triggers["workflow_dispatch"]["inputs"]["tag"]
+        assert tag_input["required"] is True
+        assert tag_input["type"] == "string"
+
+
+class TestReleasePleaseJob:
+    """Conventional commits on main maintain a Release PR via the release-please action."""
+
+    def test_release_please_runs_only_on_push(self) -> None:
+        # On workflow_dispatch there is no version to compute, so the action is
+        # skipped and the build runs against the dispatched tag instead.
+        job = load_workflow("release.yml")["jobs"]["release-please"]
+        assert "github.event_name == 'push'" in job["if"]
+
+    def test_uses_the_release_please_action(self) -> None:
+        job = load_workflow("release.yml")["jobs"]["release-please"]
+        uses = [step["uses"] for step in job.get("steps", []) if "uses" in step]
+        assert any(entry.startswith("googleapis/release-please-action@") for entry in uses)
+
+    def test_release_please_exposes_the_four_outputs(self) -> None:
+        outputs = load_workflow("release.yml")["jobs"]["release-please"].get("outputs", {})
+        for name in ("release_created", "tag_name", "prs_created", "pr"):
+            assert name in outputs, f"release-please must expose the {name!r} output"
+
+
+class TestReleaseBuildJob:
+    """The build is the back half of a release: a downstream job, never a re-trigger."""
+
+    def _build_job(self) -> dict[str, Any]:
+        job = load_workflow("release.yml")["jobs"]["build"]
+        assert isinstance(job, dict)
+        return job
+
+    def test_build_needs_release_please(self) -> None:
+        needs = self._build_job()["needs"]
+        needs = [needs] if isinstance(needs, str) else needs
+        assert "release-please" in needs, "build must run after release-please in the same run"
+
+    def test_build_gates_on_both_release_created_and_dispatch(self) -> None:
+        # Dual origin: (a) the automatic push path when a release was created, and
+        # (b) workflow_dispatch. `always()` keeps the build reachable even though
+        # release-please is skipped on dispatch.
+        condition = self._build_job()["if"]
+        assert "always()" in condition, "build must stay reachable when release-please is skipped"
+        assert "release_created == 'true'" in condition, "automatic path: gate on release_created"
+        assert "github.event_name == 'push'" in condition, "automatic path is the push event"
+        assert "github.event_name == 'workflow_dispatch'" in condition, "manual rebuild path"
+
+    def test_build_tag_comes_from_dispatch_input_or_release_output(self) -> None:
+        # The tag is the dispatched input on manual rebuilds, else release-please's
+        # computed tag on the automatic path; never a human-typed name on push.
+        dumped = yaml.safe_dump(self._build_job())
+        assert "github.event.inputs.tag" in dumped, "dispatch path must use the input tag"
+        assert "needs.release-please.outputs.tag_name" in dumped, "push path uses the release tag"
+
+    def test_build_checks_out_the_tag_and_builds_with_uv(self) -> None:
+        job = self._build_job()
+        checkout = next(
+            s for s in job["steps"] if str(s.get("uses", "")).startswith("actions/checkout@")
+        )
+        assert "with" in checkout and "ref" in checkout["with"], "build must checkout the tag ref"
+        commands = [step["run"] for step in job["steps"] if "run" in step]
         assert any("uv build" in command for command in commands)
 
     def test_release_creation_and_upload_are_idempotent(self) -> None:
-        joined = "\n".join(run_commands_of(load_workflow("release-build.yml")))
+        joined = "\n".join(step["run"] for step in self._build_job()["steps"] if "run" in step)
         assert "gh release view" in joined, "must check for an existing Release first"
-        assert "gh release create" in joined, "must create the Release for manual tags"
+        assert "gh release create" in joined, "must create the Release if it is missing"
         assert "gh release upload" in joined
         assert "--clobber" in joined, "uploads must be idempotent to guard double-runs"
 
+    def test_build_keeps_least_privilege_write_permission(self) -> None:
+        assert self._build_job().get("permissions") == {"contents": "write"}
 
-class TestReleasePleaseWorkflow:
-    """Conventional commits on main maintain a Release PR; merging hands off to the build."""
-
-    def test_runs_on_push_to_main(self) -> None:
-        triggers = triggers_of(load_workflow("release-please.yml"))
-        assert triggers["push"]["branches"] == ["main"]
-
-    def test_uses_the_release_please_action(self) -> None:
-        workflow = load_workflow("release-please.yml")
-        uses = [
-            step["uses"]
-            for job in workflow["jobs"].values()
-            for step in job.get("steps", [])
-            if "uses" in step
-        ]
-        assert any(entry.startswith("googleapis/release-please-action@") for entry in uses)
-
-    def test_release_creation_hands_off_to_release_build(self) -> None:
-        build_job = load_workflow("release-please.yml")["jobs"]["build"]
-        assert build_job["uses"] == "./.github/workflows/release-build.yml"
-        assert "release_created" in build_job["if"]
+    def test_build_is_serialized_per_tag(self) -> None:
+        # A concurrency group keyed on the tag prevents an automatic build and a
+        # manual rebuild of the same release from racing each other's uploads.
+        group = yaml.safe_dump(self._build_job().get("concurrency", {}))
+        assert "tag" in group, "build concurrency must be keyed on the tag"
 
 
 class TestReleasePleaseLockfileSync:
@@ -137,11 +214,11 @@ class TestReleasePleaseLockfileSync:
     """
 
     def _sync_job(self) -> dict[str, Any]:
-        jobs = load_workflow("release-please.yml")["jobs"]
+        jobs = load_workflow("release.yml")["jobs"]
         sync_jobs = [
             job
             for name, job in jobs.items()
-            if name != "release-please"
+            if name not in ("release-please", "build")
             and any("uv lock" in step.get("run", "") for step in job.get("steps", []))
         ]
         assert len(sync_jobs) == 1, "expected exactly one job that runs `uv lock`"
@@ -154,6 +231,8 @@ class TestReleasePleaseLockfileSync:
         # prs_created is true when a Release PR is created OR updated, so the
         # re-lock fires on the version-bump PR rather than only at release time.
         assert "needs.release-please.outputs.prs_created" in job["if"]
+        # Dispatch never touches a Release PR, so the re-lock is push-only.
+        assert "github.event_name == 'push'" in job["if"]
 
     def test_sync_job_checks_out_the_release_pr_branch(self) -> None:
         job = self._sync_job()
@@ -179,7 +258,7 @@ class TestReleasePleaseLockfileSync:
         assert job.get("permissions") == {"contents": "write"}
 
     def test_release_please_exposes_the_pr_output(self) -> None:
-        release_job = load_workflow("release-please.yml")["jobs"]["release-please"]
+        release_job = load_workflow("release.yml")["jobs"]["release-please"]
         outputs = release_job.get("outputs", {})
         assert "pr" in outputs, "downstream re-lock needs the Release PR JSON"
         assert "prs_created" in outputs, "downstream re-lock needs the touched guard"

@@ -20,40 +20,44 @@ A red gate blocks the PR with a failed check.
 
 ## Releasing
 
-Releases are driven by [Conventional Commits](https://www.conventionalcommits.org/)
-through two co-existing trigger paths that converge on one build workflow.
+The whole release lifecycle lives in one workflow, `release.yml`, with
+release-please as the single version authority (see
+[ADR 0005](adr/0005-release-and-versioning-model.md)). Releases are driven by
+[Conventional Commits](https://www.conventionalcommits.org/).
 
 ### Automatic path (default)
 
-1. Conventional commits land on `main`; `release-please.yml` opens or updates a
-   Release PR with the version bump and the generated `CHANGELOG.md`.
+1. Conventional commits land on `main`; the `release-please` job opens or updates
+   a Release PR with the version bump and the generated `CHANGELOG.md`.
    The `python` release type bumps both `[project].version` in `pyproject.toml`
    and `__version__` in `src/caw/__init__.py`; `.release-please-manifest.json`
-   tracks the released version.
+   tracks the released version. A `sync-lockfile` job re-locks `uv.lock` on the
+   Release PR branch so the PR's `uv sync --locked` gate passes.
 2. Merging the Release PR makes release-please create the `v*` tag and the
    GitHub Release.
-3. The same workflow then calls `release-build.yml` (via `workflow_call`), which
+3. The `build` job — a downstream `needs: release-please` job in the same run —
    builds the sdist and wheel with `uv build` and attaches them to the Release.
 
-The explicit hand-off exists because the tag is created with the default
-`GITHUB_TOKEN`, and GitHub never lets such events trigger other workflows.
+No `workflow_call` indirection is needed: with the raw `push: tags` trigger gone,
+the build is simply the back half of the release run.
 
 ### Manual path (escape hatch)
 
-Pushing a `v*` tag by hand fires the `push: tags` trigger of `release-build.yml`
-directly, with no release-please involvement. The workflow creates the GitHub
-Release if the tag has none, then attaches the same artifacts. Note that the
-manual path does not bump versions or the changelog — the tag releases whatever
-the tagged commit contains.
+A `workflow_dispatch` with a required `tag` input re-builds and re-attaches
+artifacts to an **existing** release — an operations-recovery path for a lost or
+corrupt upload. It computes no version and bumps nothing: no `pyproject`,
+`__init__`, manifest, or new tag. There is deliberately no raw `push: tags`
+trigger, because a human-chosen tag name and the version `uv build` reads from
+`pyproject.toml` are never reconciled, and a manual tag would be invisible to
+release-please's manifest.
 
 ### Double-run guard
 
-Both paths reach `release-build.yml` exactly once: token-created tags cannot fire
-`push: tags`, and manual tags never run release-please. If the paths ever race
-anyway (for example after switching release-please to a PAT), the build is
-idempotent — the Release is only created when missing (`gh release view ||
-gh release create`) and uploads overwrite with `--clobber` — and a concurrency
-group serializes runs per tag.
+The `build` job is the only build trigger, so one release builds exactly once and
+a raw tag push fires nothing. The build is also idempotent in case an automatic
+build and a later manual rebuild of the same release overlap — the Release is only
+created when missing (`gh release view || gh release create`) and uploads overwrite
+with `--clobber` — and a concurrency group keyed on the tag serializes runs.
 
 ## Out of scope
 
