@@ -34,8 +34,17 @@ from typing import Annotated, Any
 import typer
 
 from caw.config import WorkflowConfigError, load_workflow_file
-from caw.executor import NodeResult, ResumeError, RunResult, execute_run, resume_run
-from caw.model import Workflow, execution_order, normalize_workflow
+from caw.executor import (
+    SKIP_ALL_BRANCHES_SKIPPED,
+    SKIP_BLOCKED,
+    SKIP_WHEN_FALSE,
+    NodeResult,
+    ResumeError,
+    RunResult,
+    execute_run,
+    resume_run,
+)
+from caw.model import Node, Predicate, Workflow, execution_order, normalize_workflow
 
 app = typer.Typer(
     name="caw",
@@ -99,7 +108,22 @@ def _json_plan(workflow: Workflow) -> dict[str, Any]:
         "workflow": workflow.name,
         "concurrency": workflow.concurrency,
         "nodes": [
-            {"id": node.id, "kind": node.kind, "needs": list(node.needs)}
+            {
+                "id": node.id,
+                "kind": node.kind,
+                "needs": list(node.needs),
+                # The conditional structure (#7): a Node's `when` predicate and its
+                # `join` policy, so a consumer reads the gating without running it.
+                # `when` is the serialized predicate algebra (None when
+                # unconditional); `exclude_none` keeps each leaf/combinator dict to
+                # only its present fields. `join` is always shown (defaults to all).
+                "when": (
+                    node.when.model_dump(mode="json", exclude_none=True)
+                    if node.when is not None
+                    else None
+                ),
+                "join": node.join,
+            }
             for node in workflow.nodes
         ],
         "edges": [
@@ -128,8 +152,42 @@ def graph(
         f"(concurrency: {workflow.concurrency})"
     )
     for position, node in enumerate(execution_order(workflow), start=1):
-        needs = f"  (needs: {', '.join(node.needs)})" if node.needs else ""
-        typer.echo(f"  {position}. {node.id}{needs}")
+        typer.echo(f"  {position}. {node.id}{_node_annotations(node)}")
+
+
+def _node_annotations(node: Node) -> str:
+    """The text-plan annotations after a Node's id: needs, `when`, non-default join (#7).
+
+    Additive and noise-free: an unconditional default-join Node shows only its
+    needs (or nothing), so the `when` and `join` annotations appear solely where
+    they carry signal — a conditional or skip-tolerant Node.
+    """
+    parts: list[str] = []
+    if node.needs:
+        parts.append(f"needs: {', '.join(node.needs)}")
+    if node.when is not None:
+        parts.append(f"when: {_predicate_summary(node.when)}")
+    if node.join != "all":
+        parts.append(f"join: {node.join}")
+    return f"  ({'; '.join(parts)})" if parts else ""
+
+
+def _predicate_summary(predicate: Predicate) -> str:
+    """A compact one-line rendering of a `when` predicate's structure (#7).
+
+    Mirrors the typed algebra without re-implementing evaluation: a leaf reads
+    ``node.field op value``; a combinator names its shape and renders its children
+    recursively. The JSON plan carries the full serialized predicate, so this stays
+    a human glance, not the authoritative form.
+    """
+    if predicate.ref is not None:
+        return f"{predicate.ref.node}.{predicate.ref.field} {predicate.op} {predicate.value!r}"
+    if predicate.all_of is not None:
+        return f"all_of({', '.join(_predicate_summary(child) for child in predicate.all_of)})"
+    if predicate.any_of is not None:
+        return f"any_of({', '.join(_predicate_summary(child) for child in predicate.any_of)})"
+    assert predicate.not_ is not None, "a non-leaf predicate is exactly one combinator"
+    return f"not({_predicate_summary(predicate.not_)})"
 
 
 def _failure_line(workflow_label: str, node_result: NodeResult) -> str:
@@ -142,6 +200,27 @@ def _failure_line(workflow_label: str, node_result: NodeResult) -> str:
     """
     adapter = f" (adapter {node_result.adapter})" if node_result.adapter else ""
     return f"workflow {workflow_label}: node {node_result.node_id}{adapter} {node_result.status}"
+
+
+def _skip_reason(result: RunResult, node_id: str) -> str:
+    """Render WHY a Node was skipped, distinct per cause (#7).
+
+    AC5: a closed `when` gate, a failure-blocked dependent, and a fully-skipped
+    tolerant join must each read distinctly — and all three distinctly from
+    success and failure. The cause comes from State via ``RunResult``; a
+    ``blocked`` skip also names the blocker that withheld it.
+    """
+    cause = result.skipped_causes.get(node_id)
+    if cause == SKIP_WHEN_FALSE:
+        return "(when false)"
+    if cause == SKIP_ALL_BRANCHES_SKIPPED:
+        return "(all branches skipped)"
+    if cause == SKIP_BLOCKED:
+        blocker = result.skipped_blockers.get(node_id)
+        return f"(blocked by {blocker})" if blocker else "(blocked)"
+    # A skip with no recorded cause is unexpected, but never crash the summary.
+    blocker = result.skipped_blockers.get(node_id)
+    return f"(blocked by {blocker})" if blocker else ""
 
 
 def _report_and_exit(result: RunResult, workflow_label: str) -> None:
@@ -164,9 +243,7 @@ def _report_and_exit(result: RunResult, workflow_label: str) -> None:
             if node_result.stderr:
                 _echo_stderr_excerpt(node_result)
     for node_id in result.skipped_node_ids:
-        blocker = result.skipped_blockers.get(node_id)
-        blocked_by = f" (blocked by {blocker})" if blocker else ""
-        typer.echo(f"node {node_id} skipped{blocked_by}")
+        typer.echo(f"node {node_id} skipped {_skip_reason(result, node_id)}")
     if not result.succeeded:
         typer.echo(f"run {result.run_id} failed")
         raise typer.Exit(code=1)
