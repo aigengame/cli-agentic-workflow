@@ -114,7 +114,10 @@ def graph(
     if format is GraphFormat.json:
         typer.echo(json.dumps(_json_plan(workflow), indent=2))
         return
-    typer.echo(f"workflow {workflow.name}: {len(workflow.nodes)} nodes")
+    typer.echo(
+        f"workflow {workflow.name}: {len(workflow.nodes)} nodes "
+        f"(concurrency: {workflow.concurrency})"
+    )
     for position, node in enumerate(execution_order(workflow), start=1):
         needs = f"  (needs: {', '.join(node.needs)})" if node.needs else ""
         typer.echo(f"  {position}. {node.id}{needs}")
@@ -134,6 +137,10 @@ def run(workflow_file: Path) -> None:
         typer.echo(f"node {node_result.node_id} attempt 1 exited {node_result.exit_status}")
         if not node_result.succeeded and node_result.stderr:
             _echo_stderr_excerpt(node_result)
+    for node_id in result.skipped_node_ids:
+        blocker = result.skipped_blockers.get(node_id)
+        blocked_by = f" (blocked by {blocker})" if blocker else ""
+        typer.echo(f"node {node_id} skipped{blocked_by}")
     if not result.succeeded:
         typer.echo(f"run {result.run_id} failed")
         raise typer.Exit(code=1)

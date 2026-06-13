@@ -4,7 +4,8 @@ import asyncio
 import contextlib
 import json
 import secrets
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -47,11 +48,15 @@ class RunResult:
     fails if any attempted Node failed. A failure does not always coincide with a
     skip: a failed LEAF Node has no dependents to skip, so the Run fails with
     ``skipped_node_ids`` empty.
+
+    ``skipped_blockers`` maps each skipped Node id to the failed Node that blocked
+    it, so a Reporter can tell a user which downstream work was withheld and why.
     """
 
     run_id: str
     node_results: tuple[NodeResult, ...]
     skipped_node_ids: tuple[str, ...] = ()
+    skipped_blockers: Mapping[str, str] = field(default_factory=dict)
 
     @property
     def succeeded(self) -> bool:
@@ -171,6 +176,7 @@ class _Scheduler:
         self._in_flight: dict[asyncio.Task[NodeResult], Node] = {}
         self._results: list[NodeResult] = []
         self._skipped: list[str] = []
+        self._skipped_blockers: dict[str, str] = {}
 
     @property
     def in_flight_node_ids(self) -> tuple[str, ...]:
@@ -239,6 +245,7 @@ class _Scheduler:
                 continue
             seen.add(node_id)
             self._skipped.append(node_id)
+            self._skipped_blockers[node_id] = node.id
             self._state.record_node_skipped(run_id=self._run_id, node_id=node_id)
             self._events.append("node_skipped", {"node_id": node_id, "blocked_by": node.id})
             queue.extend(self._dependents[node_id])
@@ -283,6 +290,7 @@ class _Scheduler:
             run_id=self._run_id,
             node_results=tuple(self._results),
             skipped_node_ids=tuple(self._skipped),
+            skipped_blockers=dict(self._skipped_blockers),
         )
 
     async def _drain_in_flight(self) -> None:
