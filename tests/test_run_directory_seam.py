@@ -79,6 +79,11 @@ def test_snapshot_carries_a_definition_checksum_over_the_normalized_workflow(
         # part of its serialized form.
         "inputs": {"kind": "shell", "command": "echo hello"},
         "needs": [],
+        # The per-Node failure-semantics policy (#6) is part of the persisted
+        # snapshot so a resume reconstructs the SAME retry/timeout budgets it ran
+        # under; the defaults round-trip explicitly.
+        "retries": 0,
+        "timeout": None,
     }
     canonical = json.dumps(workflow, sort_keys=True, separators=(",", ":")).encode("utf-8")
     expected = f"sha256:{hashlib.sha256(canonical).hexdigest()}"

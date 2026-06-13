@@ -187,6 +187,14 @@ class Node(BaseModel):
     kind: Literal["shell", "agent"]
     inputs: ShellNodeInputs | AgentNodeInputs
     needs: tuple[str, ...] = ()
+    # Failure-semantics policy lives per-Node (#6): `retries` counts the
+    # ADDITIONAL Attempts the executor makes after the first on a retryable
+    # failure, so total Attempts = retries + 1 and the default 0 keeps the
+    # pre-#6 single-attempt behavior. `timeout` is a per-Node wall-clock budget
+    # in seconds (gt=0 so a meaningless 0/negative budget fails validation
+    # rather than silently disabling the timeout); None means no budget.
+    retries: int = Field(default=0, ge=0)
+    timeout: float | None = Field(default=None, gt=0)
 
     @model_validator(mode="before")
     @classmethod
