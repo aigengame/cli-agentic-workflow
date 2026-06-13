@@ -97,6 +97,130 @@ async def test_a_join_node_runs_only_after_both_of_its_branches_complete(
     assert completions.index("join") > completions.index("right")
 
 
+def barrier_command(own_marker: Path, barrier_dir: Path, party: int, timeout_s: int = 30) -> str:
+    """A shell command that touches its own marker, then blocks until ``party`` exist.
+
+    This is a filesystem barrier: a branch only gets past it once every branch
+    has reached it, so all branches reaching the barrier proves they ran
+    genuinely concurrently — no wall-clock sleep is asserted. If fewer than
+    ``party`` branches can run at once (e.g. concurrency 1), a waiting branch
+    never sees the full party and exits non-zero at the timeout failsafe, which
+    is what makes a serialized run observably fail instead of hang forever.
+    """
+    return (
+        f"touch {own_marker}; "
+        f"for _ in $(seq 1 {timeout_s * 10}); do "
+        f"  count=$(ls {barrier_dir} | wc -l); "
+        f'  if [ "$count" -ge {party} ]; then exit 0; fi; '
+        f"  sleep 0.1; "
+        f"done; "
+        f"exit 1"
+    )
+
+
+@pytest.mark.asyncio
+async def test_three_branches_run_concurrently_and_the_join_runs_after_all(tmp_path: Path) -> None:
+    # The acceptance criterion (#4): a three-branch parallel workflow completes
+    # with all branches AND the join executed, and the branches genuinely
+    # overlap. The filesystem barrier is the deterministic proof: each branch
+    # only finishes once all three have reached the barrier, so the run can only
+    # succeed if the three ran at once. The default concurrency (4) permits it.
+    barrier_dir = tmp_path / "barrier"
+    barrier_dir.mkdir()
+    log = tmp_path / "join.log"
+    workflow = shell_workflow(
+        ("a", barrier_command(barrier_dir / "a", barrier_dir, party=3), []),
+        ("b", barrier_command(barrier_dir / "b", barrier_dir, party=3), []),
+        ("c", barrier_command(barrier_dir / "c", barrier_dir, party=3), []),
+        ("join", f"echo join >> {log}", ["a", "b", "c"]),
+    )
+
+    result = await execute_run(workflow, tmp_path / "runs")
+
+    assert result.succeeded, "all three branches reached the barrier, so the run succeeded"
+    attempted = {node_result.node_id for node_result in result.node_results}
+    assert attempted == {"a", "b", "c", "join"}, "every branch and the join executed"
+    assert log.read_text(encoding="utf-8").split() == ["join"], "the join ran after all branches"
+
+
+@pytest.mark.asyncio
+async def test_concurrency_limit_one_serializes_branches_so_the_barrier_cannot_be_met(
+    tmp_path: Path,
+) -> None:
+    # The teeth of the concurrency proof (#4): with the limit pinned to 1 the
+    # scheduler runs one branch at a time, so the first branch to reach the
+    # three-party barrier can never see its siblings — they cannot start until
+    # it finishes — and exits non-zero at its (short) timeout. A run that
+    # genuinely honors the limit therefore fails here, while an unbounded
+    # scheduler would pass. This is what makes the concurrent run a real proof.
+    barrier_dir = tmp_path / "barrier"
+    barrier_dir.mkdir()
+    raw = {
+        "name": "sample",
+        "version": 1,
+        "concurrency": 1,
+        "nodes": [
+            {
+                "id": node_id,
+                "kind": "shell",
+                "needs": [],
+                "inputs": {
+                    "command": barrier_command(barrier_dir / node_id, barrier_dir, 3, timeout_s=2)
+                },
+            }
+            for node_id in ("a", "b", "c")
+        ],
+    }
+    workflow = normalize_workflow(raw, source="<test>")
+
+    result = await execute_run(workflow, tmp_path / "runs")
+
+    assert not result.succeeded, "a serialized run cannot meet a three-party barrier"
+
+
+@pytest.mark.asyncio
+async def test_concurrency_limit_caps_simultaneous_attempts(tmp_path: Path) -> None:
+    # The limit is an upper bound on simultaneity, observed without sleeps: each
+    # node records the peak number of concurrent peers it saw via a shared
+    # counter file. With four independent nodes and a limit of 2, the peak must
+    # never exceed 2. (Each node bumps a live-count file on entry and decrements
+    # on exit; the recorded maximum is the observed concurrency.)
+    live = tmp_path / "live"
+    peak = tmp_path / "peak"
+    live.write_text("0", encoding="utf-8")
+    peak.write_text("0", encoding="utf-8")
+    # A small Python helper keeps the read-modify-write of the counter atomic
+    # enough for the assertion: the event loop is single-threaded, but the
+    # subprocesses are not, so each uses an O_EXCL lock directory as a mutex.
+    bump = (
+        f"lock={tmp_path}/lock; "
+        f"while ! mkdir $lock 2>/dev/null; do sleep 0.01; done; "
+        f"n=$(cat {live}); n=$((n+1)); echo $n > {live}; "
+        f"p=$(cat {peak}); if [ $n -gt $p ]; then echo $n > {peak}; fi; "
+        f"rmdir $lock; "
+        f"sleep 0.2; "
+        f"while ! mkdir $lock 2>/dev/null; do sleep 0.01; done; "
+        f"n=$(cat {live}); n=$((n-1)); echo $n > {live}; rmdir $lock"
+    )
+    raw = {
+        "name": "sample",
+        "version": 1,
+        "concurrency": 2,
+        "nodes": [
+            {"id": node_id, "kind": "shell", "needs": [], "inputs": {"command": bump}}
+            for node_id in ("a", "b", "c", "d")
+        ],
+    }
+    workflow = normalize_workflow(raw, source="<test>")
+
+    result = await execute_run(workflow, tmp_path / "runs")
+
+    assert result.succeeded
+    assert int(peak.read_text(encoding="utf-8")) <= 2, (
+        "no more than `concurrency` nodes run at once"
+    )
+
+
 @pytest.mark.asyncio
 async def test_transitive_dependents_of_a_failed_node_never_run(tmp_path: Path) -> None:
     # Branch-failure isolation (#4): a node failure prevents only its transitive
@@ -114,6 +238,30 @@ async def test_transitive_dependents_of_a_failed_node_never_run(tmp_path: Path) 
     assert not marker.exists(), "a dependent of a failed node never runs"
     attempted = {node_result.node_id for node_result in result.node_results}
     assert attempted == {"build"}, "only the failed node was attempted; its dependent was not"
+
+
+@pytest.mark.asyncio
+async def test_a_failing_branch_prevents_the_join_and_marks_the_run_failed(
+    tmp_path: Path,
+) -> None:
+    # The acceptance criterion (#4): in a fan-in, a failing branch prevents the
+    # join from running and marks the run failed. `left` succeeds, `right`
+    # fails, and the join needs both — so the join is skipped, never executed,
+    # and the run as a whole fails.
+    joined = tmp_path / "joined.txt"
+    workflow = shell_workflow(
+        ("left", "echo left", []),
+        ("right", "exit 7", []),
+        ("join", f"touch {joined}", ["left", "right"]),
+    )
+
+    result = await execute_run(workflow, tmp_path / "runs")
+
+    assert not result.succeeded, "a failing branch fails the run"
+    assert not joined.exists(), "the join never runs when a branch it needs fails"
+    attempted = {node_result.node_id for node_result in result.node_results}
+    assert attempted == {"left", "right"}, "both branches were attempted; the join was not"
+    assert result.skipped_node_ids == ("join",), "the join is recorded skipped"
 
 
 @pytest.mark.asyncio
