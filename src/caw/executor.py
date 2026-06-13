@@ -44,7 +44,9 @@ class RunResult:
 
     ``node_results`` holds every attempted Node; ``skipped_node_ids`` names the
     transitive dependents of a failed Node that were never attempted (#4). A Run
-    fails if any Node failed, which is also exactly when some Node was skipped.
+    fails if any attempted Node failed. A failure does not always coincide with a
+    skip: a failed LEAF Node has no dependents to skip, so the Run fails with
+    ``skipped_node_ids`` empty.
     """
 
     run_id: str
@@ -53,7 +55,10 @@ class RunResult:
 
     @property
     def succeeded(self) -> bool:
-        return all(result.succeeded for result in self.node_results) and not self.skipped_node_ids
+        # A skipped Node is always the transitive dependent of a failed Node, so
+        # an all-succeeded `node_results` already implies nothing was skipped; the
+        # failed Node that caused the skip is itself in `node_results`.
+        return all(result.succeeded for result in self.node_results)
 
     @property
     def status(self) -> str:
@@ -67,6 +72,15 @@ def _new_run_id() -> str:
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _task_crash(task: "asyncio.Task[NodeResult]") -> BaseException:
+    """The exception that crashed a completed task: its error, or CancelledError."""
+    if task.cancelled():
+        return asyncio.CancelledError()
+    exception = task.exception()
+    assert exception is not None, "caller guarantees the task raised"
+    return exception
 
 
 async def _execute_shell_node(node: Node) -> NodeResult:
@@ -109,7 +123,9 @@ def _finalize_crashed_run(
     SystemExit arriving mid-finalization must not replace the crash being reported.
 
     Every Node still in flight when the Run crashed is marked ``errored`` so no
-    Node is left recorded as ``running``.
+    Node is left recorded as ``running``. The ``run_errored`` event names every
+    one of those Nodes so the Event trace and State agree on the crash's blast
+    radius for a multi-node concurrent crash (#54).
     """
     for node_id in in_flight_node_ids:
         with contextlib.suppress(BaseException):
@@ -117,8 +133,7 @@ def _finalize_crashed_run(
     with contextlib.suppress(BaseException):
         state.record_run_errored(run_id=run_id, error=error, finished_at=_now())
     with contextlib.suppress(BaseException):
-        first_node_id = in_flight_node_ids[0] if in_flight_node_ids else None
-        events.append("run_errored", {"error": error, "node_id": first_node_id})
+        events.append("run_errored", {"error": error, "node_ids": list(in_flight_node_ids)})
 
 
 class _Scheduler:
@@ -235,21 +250,31 @@ class _Scheduler:
                 done, _ = await asyncio.wait(
                     self._in_flight.keys(), return_when=asyncio.FIRST_COMPLETED
                 )
+                # Record every completed task in the batch before propagating any
+                # raise. A task that raised (e.g. a subprocess that could not be
+                # spawned, or cancellation) crashes the whole Run, but a PEER in
+                # the same batch that finished with a non-zero exit is an ordinary
+                # Node failure whose transitive dependents must still be skipped:
+                # processing the whole batch first keeps the failed-node-skips-its-
+                # dependents invariant intact even on the crash path (#54). The
+                # first raised task's exception is re-raised after the batch is
+                # fully recorded so execute_run can finalize the crash.
+                crash: BaseException | None = None
                 for task in done:
                     node = self._in_flight[task]
-                    # A task that raised (e.g. a subprocess that could not be
-                    # spawned, or cancellation) crashes the whole Run: leave it in
-                    # flight and re-raise so execute_run finalizes it as errored. A
-                    # non-zero exit is an ordinary Node failure, not a raise —
-                    # handled below, not here.
-                    result = task.result()
+                    if task.cancelled() or task.exception() is not None:
+                        crash = crash or _task_crash(task)
+                        continue
                     self._in_flight.pop(task)
+                    result = task.result()
                     self._record_finished(node, result)
                     self._results.append(result)
                     if result.succeeded:
                         self._on_success(node)
                     else:
                         self._skip_transitive_dependents(node)
+                if crash is not None:
+                    raise crash
                 self._launch_ready()
         except BaseException:
             await self._drain_in_flight()
@@ -283,6 +308,16 @@ class _Scheduler:
 
 async def execute_run(workflow: Workflow, runs_root: Path) -> RunResult:
     """Materialize a run directory, execute the Workflow's Nodes, and persist the Run."""
+    # A normally constructed Workflow is validated `concurrency >= 1`; a Workflow
+    # that bypassed validation (model_construct, model_copy(update=...)) could
+    # reach the scheduler with concurrency < 1, which would launch nothing and
+    # report a vacuous `succeeded`. Fail loud before any run-directory side
+    # effects, mirroring the ordering layer's bypass guard (model.execution_order).
+    if workflow.concurrency < 1:
+        raise ValueError(
+            f"workflow {workflow.name!r} has concurrency {workflow.concurrency} "
+            f"(must be >= 1; was validation bypassed?)"
+        )
     run_id = _new_run_id()
     run_dir = runs_root / run_id
     run_dir.mkdir(parents=True)

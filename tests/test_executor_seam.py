@@ -391,6 +391,158 @@ async def test_a_mid_run_crash_finalizes_state_and_appends_a_terminal_event(
     assert "forced spawn failure" in last_event["data"]["error"]
 
 
+class _FakeProcess:
+    """A subprocess stand-in that resolves communicate() to a fixed exit status.
+
+    Used to drop a node into the same FIRST_COMPLETED batch as a peer that
+    raises, without spawning a real subprocess, so the crash-drain path is
+    exercised deterministically.
+    """
+
+    def __init__(self, returncode: int, on_communicate: Callable[[], None]) -> None:
+        self.returncode = returncode
+        self._on_communicate = on_communicate
+
+    async def communicate(self) -> tuple[bytes, bytes]:
+        self._on_communicate()
+        return b"", b""
+
+    async def wait(self) -> int:
+        return self.returncode
+
+    def kill(self) -> None:
+        self.returncode = -1
+
+
+@pytest.mark.asyncio
+async def test_a_failed_peer_skips_its_dependents_even_when_a_sibling_crashes_the_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Crash-path branch-failure consistency (#54.1): `flaky` and `crash` are two
+    # independent nodes launched together; `flaky` finishes with a non-zero exit
+    # (an ordinary node failure) while `crash` raises (a spawn error) in the SAME
+    # FIRST_COMPLETED batch. The raise crashes the run, but the invariant a failed
+    # node ALWAYS skips its transitive dependents must still hold: `gated`, which
+    # needs `flaky`, must be recorded `skipped` in State — never left absent.
+    workflow = shell_workflow(
+        ("flaky", "ignored: faked non-zero exit", []),
+        ("crash", "ignored: forced spawn failure", []),
+        ("gated", "echo never", ["flaky"]),
+    )
+    crash_may_raise = asyncio.Event()
+
+    async def fake_create(command: str, **kwargs: Any) -> Any:
+        if "non-zero exit" in command:
+            # The failing peer: when its communicate() runs, release the crasher
+            # so both land in the same completion batch.
+            return _FakeProcess(returncode=7, on_communicate=crash_may_raise.set)
+        # The crasher: wait until the failing peer has finished, then raise so the
+        # raise and the non-zero exit are handled in one asyncio.wait batch.
+        await crash_may_raise.wait()
+        raise OSError("forced spawn failure")
+
+    real_wait = asyncio.wait
+
+    async def crash_first_wait(tasks: Any, **kwargs: Any) -> Any:
+        # The bug surfaces only when the crashing task is processed before the
+        # failed peer in the same `done` batch; `done` is a set, so its iteration
+        # order is otherwise incidental (~50% repro). Return `done` as a list with
+        # any raised task first to pin the worst case and make the RED determinate.
+        done, pending = await real_wait(tasks, **kwargs)
+        ordered = sorted(done, key=lambda task: 0 if _raised(task) else 1)
+        return ordered, pending
+
+    def _raised(task: asyncio.Future[Any]) -> bool:
+        return task.done() and not task.cancelled() and task.exception() is not None
+
+    monkeypatch.setattr("caw.executor.asyncio.create_subprocess_shell", fake_create)
+    monkeypatch.setattr("caw.executor.asyncio.wait", crash_first_wait)
+
+    with pytest.raises(OSError, match="forced spawn failure"):
+        await execute_run(workflow, tmp_path / "runs")
+
+    run_dir = single_run_dir(tmp_path / "runs")
+    nodes = {row["node_id"]: row["status"] for row in state_rows(run_dir, "SELECT * FROM node")}
+    assert nodes.get("flaky") == "failed", "the non-zero-exit peer is recorded failed"
+    assert "gated" in nodes, "the failed peer's dependent must not be left with no State row"
+    assert nodes["gated"] == "skipped", "a failed node always skips its transitive dependents"
+
+
+@pytest.mark.asyncio
+async def test_a_single_failing_leaf_node_with_no_dependents_fails_the_run(tmp_path: Path) -> None:
+    # RunResult.succeeded correctness for a failed LEAF (#54.4): a failed Node
+    # with no dependents skips nothing, so `skipped_node_ids` stays empty. The Run
+    # must still be `failed` — driven by the failed Node alone, not by any skip.
+    workflow = shell_workflow(("leaf", "exit 7", []))
+
+    result = await execute_run(workflow, tmp_path / "runs")
+
+    assert not result.succeeded, "a failed leaf fails the run with no node skipped"
+    assert result.skipped_node_ids == (), "a leaf has no dependents to skip"
+
+
+@pytest.mark.asyncio
+async def test_a_workflow_with_concurrency_below_one_fails_loud_instead_of_vacuously_succeeding(
+    tmp_path: Path,
+) -> None:
+    # Vacuous-success guard (#54.3): a Workflow that bypassed the `ge=1` validator
+    # (model_construct / model_copy) reaches the scheduler with concurrency 0,
+    # which would launch nothing and report a vacuous `succeeded` having executed
+    # no Node. The scheduler must refuse it, mirroring the ordering layer's
+    # bypass guard, rather than silently report success.
+    valid = shell_workflow("echo hello")
+    bypassed = valid.model_copy(update={"concurrency": 0})
+
+    with pytest.raises(ValueError, match="concurrency"):
+        await execute_run(bypassed, tmp_path / "runs")
+
+
+@pytest.mark.asyncio
+async def test_a_multi_node_concurrent_crash_records_every_in_flight_node_in_state_and_events(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Crash blast-radius consistency (#54.2): when several nodes are in flight as
+    # the run crashes, State marks every one `errored`. The run_errored event must
+    # agree — it must name every errored node, not just the first — so the Event
+    # trace and State do not disagree on which nodes the crash hit.
+    workflow = shell_workflow(
+        ("blocker", "ignored: blocks until cancelled", []),
+        ("crash", "ignored: forced spawn failure", []),
+    )
+    blocker_started = asyncio.Event()
+
+    class _BlockingProcess(_FakeProcess):
+        async def communicate(self) -> tuple[bytes, bytes]:
+            await asyncio.Event().wait()  # blocks forever until the task is cancelled
+            return b"", b""
+
+    async def fake_create(command: str, **kwargs: Any) -> Any:
+        if "blocks until cancelled" in command:
+            blocker_started.set()
+            return _BlockingProcess(returncode=0, on_communicate=lambda: None)
+        # The crasher raises only after the blocker is in flight, so both nodes
+        # are concurrently in flight when the run crashes.
+        await blocker_started.wait()
+        raise OSError("forced spawn failure")
+
+    monkeypatch.setattr("caw.executor.asyncio.create_subprocess_shell", fake_create)
+
+    with pytest.raises(OSError, match="forced spawn failure"):
+        await execute_run(workflow, tmp_path / "runs")
+
+    run_dir = single_run_dir(tmp_path / "runs")
+    nodes = {row["node_id"]: row["status"] for row in state_rows(run_dir, "SELECT * FROM node")}
+    assert nodes == {"blocker": "errored", "crash": "errored"}, (
+        "every node in flight at the crash is marked errored in State"
+    )
+    last_event = read_events(run_dir)[-1]
+    assert last_event["type"] == "run_errored"
+    errored_in_event = set(last_event["data"]["node_ids"])
+    assert errored_in_event == {"blocker", "crash"}, (
+        "the run_errored event names every errored node, consistent with State"
+    )
+
+
 @pytest.mark.asyncio
 async def test_crash_finalization_never_masks_the_original_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
