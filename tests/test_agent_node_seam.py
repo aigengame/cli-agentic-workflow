@@ -437,7 +437,9 @@ async def test_a_generic_adapter_exception_fails_the_node_not_the_run(tmp_path: 
     marker = tmp_path / "side.txt"
     raw = agent_plus_independent_shell({"prompt": "p"}, marker)
     raw["nodes"][0]["inputs"]["adapter"] = "explode"
-    workflow = normalize_workflow(raw, source="<test>")
+    # A runtime-injected adapter is not in the built-in set, so its name is passed
+    # through the validation context (#64).
+    workflow = normalize_workflow(raw, source="<test>", known_adapters=frozenset({"explode"}))
 
     result = await execute_run(workflow, tmp_path / "runs", registry=registry)
 

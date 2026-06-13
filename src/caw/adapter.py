@@ -15,6 +15,14 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
+# The adapter names the built-in registry resolves with no runtime injection.
+# Validation checks an agent Node's `adapter` against this set at normalize time
+# so a typo fails `caw validate` fast (#64), before any run directory. Adapters
+# injected at run time (a populated AdapterRegistry passed to execute_run) are not
+# known at validate time; their unknown-name check stays the run-time registry
+# resolve. Real CLIs (#9 claude, #11 codex) add their names here as they land.
+BUILTIN_ADAPTER_NAMES: frozenset[str] = frozenset({"mock"})
+
 
 class AdapterError(Exception):
     """Raised when an Adapter cannot produce a normalized result.

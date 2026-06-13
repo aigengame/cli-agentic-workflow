@@ -857,6 +857,82 @@ def test_run_invalid_workflow_definition_fails_before_executing_anything(
     assert not (tmp_path / ".caw").exists(), "no run directory is created for invalid input"
 
 
+def test_validate_unknown_adapter_name_is_a_config_error_naming_the_node(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #64a: a typo'd / unknown adapter name must fail `caw validate` (exit 2, one
+    # error line naming the node) against the built-in adapter set, before any run
+    # directory is created — fail-fast rather than spending upstream tokens then
+    # failing the node at run time.
+    workflow_file = tmp_path / "agent.yaml"
+    workflow_file.write_text(
+        "name: sample\n"
+        "version: 1\n"
+        "nodes:\n"
+        "  - id: summarize\n"
+        "    kind: agent\n"
+        "    inputs:\n"
+        "      adapter: claued\n"  # typo for a built-in
+        "      prompt: do it\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["validate", str(workflow_file)])
+
+    assert result.exit_code == 2
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    lines = [line for line in result.output.splitlines() if line.strip()]
+    assert len(lines) == 1
+    assert lines[0].startswith("error:")
+    assert "summarize" in lines[0], "the error names the node"
+    assert "claued" in lines[0], "the error names the unknown adapter"
+    assert not (tmp_path / ".caw").exists(), "no run directory is created"
+
+
+def test_run_relative_schema_and_fixture_paths_resolve_against_the_workflow_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #64b: relative output_schema / fixture paths resolve relative to the workflow
+    # FILE's directory, not the process CWD, so the same definition runs identically
+    # regardless of the invocation directory. Author the workflow and its sidecar
+    # files under `project/`, then run from an UNRELATED cwd.
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "fixture.json").write_text(
+        json.dumps({"exit_status": 0, "structured_output": {"summary": "s"}}),
+        encoding="utf-8",
+    )
+    (project / "schema.json").write_text(
+        json.dumps({"type": "object", "required": ["summary"]}), encoding="utf-8"
+    )
+    workflow_file = project / "workflow.yaml"
+    workflow_file.write_text(
+        "name: sample\n"
+        "version: 1\n"
+        "nodes:\n"
+        "  - id: summarize\n"
+        "    kind: agent\n"
+        "    inputs:\n"
+        "      adapter: mock\n"
+        "      prompt: do it\n"
+        "      fixture: fixture.json\n"  # relative to the workflow file
+        "      output_schema: schema.json\n",
+        encoding="utf-8",
+    )
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+
+    result = runner.invoke(app, ["run", str(workflow_file)])
+
+    assert result.exit_code == 0, result.output
+    assert "succeeded" in result.output
+    # The run directory is rooted at the invocation cwd, not the workflow dir.
+    assert (elsewhere / ".caw").exists()
+    assert not (project / ".caw").exists()
+
+
 def test_run_malformed_agent_node_is_a_config_error_before_executing_anything(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
