@@ -137,6 +137,49 @@ class StateStore:
             (run_id, node_id, attempt, started_at, finished_at, exit_status, json.dumps(output)),
         )
 
+    def run_status(self, run_id: str) -> str | None:
+        """The recorded status of a Run, or ``None`` if no such Run exists.
+
+        Resume reads this to gate eligibility: a Run that already ``succeeded``
+        has nothing to do, an unknown Run id (``None``) is refused, and any other
+        terminal/interrupted status is resumable (#6). Returning ``None`` rather
+        than raising lets the resume entry point own the error message.
+        """
+        row = self._connection.execute(
+            "SELECT status FROM run WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        return None if row is None else str(row[0])
+
+    def node_statuses(self, run_id: str) -> dict[str, str]:
+        """Map each recorded Node of a Run to its status.
+
+        Resume classifies from this map: a ``succeeded`` Node is done (seeded
+        satisfied so its dependents can run); every other recorded Node — and any
+        Node with no row at all (never started) — is eligible to (re-)run (#6).
+        """
+        return {
+            str(node_id): str(status)
+            for node_id, status in self._connection.execute(
+                "SELECT node_id, status FROM node WHERE run_id = ?", (run_id,)
+            )
+        }
+
+    def max_attempt_per_node(self, run_id: str) -> dict[str, int]:
+        """Map each Node of a Run to the highest Attempt number it has recorded.
+
+        Resume continues numbering a re-run Node from ``max + 1`` so a fresh
+        Attempt never collides with one already in the ``attempt`` table for that
+        Node (the ``(run_id, node_id, attempt)`` PK); a Node with no Attempt is
+        simply absent and starts at Attempt 1 (#6).
+        """
+        return {
+            str(node_id): int(highest)
+            for node_id, highest in self._connection.execute(
+                "SELECT node_id, MAX(attempt) FROM attempt WHERE run_id = ? GROUP BY node_id",
+                (run_id,),
+            )
+        }
+
     def _execute(self, query: str, parameters: tuple[Any, ...]) -> None:
         self._connection.execute(query, parameters)
         self._connection.commit()
