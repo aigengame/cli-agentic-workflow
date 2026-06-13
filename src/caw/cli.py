@@ -88,6 +88,7 @@ def _json_plan(workflow: Workflow) -> dict[str, Any]:
     """
     return {
         "workflow": workflow.name,
+        "concurrency": workflow.concurrency,
         "nodes": [
             {"id": node.id, "kind": node.kind, "needs": list(node.needs)}
             for node in workflow.nodes

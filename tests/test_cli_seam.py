@@ -181,6 +181,58 @@ def test_graph_renders_a_json_plan_with_nodes_edges_and_order(
     assert not (tmp_path / ".caw").exists()
 
 
+def test_graph_json_plan_surfaces_the_concurrency_limit(
+    write_workflow_data: Callable[[dict[str, Any]], Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan_input = linear_pipeline()
+    plan_input["concurrency"] = 3
+    workflow_file = write_workflow_data(plan_input)
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["graph", str(workflow_file), "--format", "json"])
+
+    assert result.exit_code == 0, result.output
+    plan = json.loads(result.output)
+    assert plan["concurrency"] == 3, "the machine-readable plan exposes the concurrency limit"
+
+
+def test_graph_json_plan_defaults_concurrency_when_unspecified(
+    write_workflow_data: Callable[[dict[str, Any]], Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow_file = write_workflow_data(linear_pipeline())
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["graph", str(workflow_file), "--format", "json"])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["concurrency"] == 4, "the plan shows the conservative default"
+
+
+def test_run_rejects_a_concurrency_below_one_with_a_single_error_line(
+    write_workflow_data: Callable[[dict[str, Any]], Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bad = linear_pipeline()
+    bad["concurrency"] = 0
+    workflow_file = write_workflow_data(bad)
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["run", str(workflow_file)])
+
+    assert result.exit_code == 2, "a concurrency below 1 is a config error"
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    lines = [line for line in result.output.splitlines() if line.strip()]
+    assert len(lines) == 1
+    assert lines[0].startswith("error:")
+    assert "concurrency" in lines[0], "the error names the offending field"
+    assert not (tmp_path / ".caw").exists(), "no run directory is created for invalid config"
+
+
 def test_graph_invalid_workflow_exits_two_with_a_single_error_line(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
