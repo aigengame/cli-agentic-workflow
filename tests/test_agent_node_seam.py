@@ -78,6 +78,50 @@ async def test_agent_node_runs_through_mock_adapter_replaying_a_fixture(
 
 
 @pytest.mark.asyncio
+async def test_agent_node_structured_output_and_artifacts_are_indexed_in_state(
+    tmp_path: Path,
+) -> None:
+    artifact = tmp_path / "report.md"
+    artifact.write_text("# report\n", encoding="utf-8")
+    fixture = write_fixture(
+        tmp_path / "fixture.json",
+        exit_status=0,
+        stdout="ok",
+        structured_output={"summary": "s"},
+        artifacts=[str(artifact)],
+    )
+    workflow = agent_workflow(fixture)
+
+    await execute_run(workflow, tmp_path / "runs")
+
+    run_dir = single_run_dir(tmp_path / "runs")
+    (attempt,) = state_rows(run_dir, "SELECT output_json FROM attempt")
+    output = json.loads(attempt["output_json"])
+    assert output["structured_output"] == {"summary": "s"}
+    assert output["artifacts"] == [str(artifact)]
+
+
+@pytest.mark.asyncio
+async def test_agent_node_records_an_attempt_and_node_events_like_a_shell_node(
+    tmp_path: Path,
+) -> None:
+    fixture = write_fixture(tmp_path / "fixture.json", exit_status=0, stdout="hi")
+    workflow = agent_workflow(fixture)
+
+    await execute_run(workflow, tmp_path / "runs")
+
+    run_dir = single_run_dir(tmp_path / "runs")
+    assert [event["type"] for event in read_events(run_dir)] == [
+        "run_started",
+        "node_started",
+        "node_finished",
+        "run_finished",
+    ]
+    (node_row,) = state_rows(run_dir, "SELECT status FROM node")
+    assert node_row["status"] == "succeeded"
+
+
+@pytest.mark.asyncio
 async def test_only_declared_env_vars_reach_the_node_process(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
