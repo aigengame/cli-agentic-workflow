@@ -2,13 +2,16 @@
 
 Exit code contract:
 
-- 0: success (`caw run`: the Run succeeded; `caw validate`: the workflow
-  is valid; `caw graph`: the plan was rendered)
-- 1: the Run finished with a failed Node (`caw run` only)
+- 0: success (`caw run` / `caw resume`: the Run succeeded; `caw validate`:
+  the workflow is valid; `caw graph`: the plan was rendered)
+- 1: the Run finished with a failed Node (`caw run`, `caw resume`)
 - 2: config error (unreadable file or invalid workflow definition);
-  config errors print exactly one `error:` line
+  config errors print exactly one `error:` line. `caw resume` also exits 2
+  when the run id is unknown or the Run is not resume-eligible (it already
+  succeeded) — a refusal, with one `error:` line and no re-execution.
 - 3: infrastructure error (e.g. unwritable runs root, State database
-  failure) — the Run could not be executed or completed (`caw run` only)
+  failure) — the Run could not be executed or completed (`caw run`,
+  `caw resume`)
 
 Carve-out: command-line usage errors (unknown options, invalid option
 values) also exit 2, but render the framework's multi-line usage message
@@ -16,7 +19,9 @@ without an `error:` prefix. Only workflow config errors are guaranteed
 the single `error:` line.
 
 `caw validate` and `caw graph` never execute anything: no run directory
-is created and no subprocess is spawned.
+is created and no subprocess is spawned. `caw resume` reopens an EXISTING
+run directory and re-runs only its incomplete Nodes, reusing the same run
+id, State, and Events trace.
 """
 
 import asyncio
@@ -29,7 +34,7 @@ from typing import Annotated, Any
 import typer
 
 from caw.config import WorkflowConfigError, load_workflow_file
-from caw.executor import NodeResult, execute_run
+from caw.executor import NodeResult, ResumeError, RunResult, execute_run, resume_run
 from caw.model import Workflow, execution_order, normalize_workflow
 
 app = typer.Typer(
@@ -127,16 +132,14 @@ def graph(
         typer.echo(f"  {position}. {node.id}{needs}")
 
 
-@app.command()
-def run(workflow_file: Path) -> None:
-    """Run a workflow file and print a plain-text result."""
-    workflow = _load_normalized_workflow(workflow_file)
-    runs_root = Path.cwd() / ".caw" / "runs"
-    try:
-        result = asyncio.run(execute_run(workflow, runs_root))
-    except (OSError, sqlite3.Error) as exc:
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(code=3) from exc
+def _report_and_exit(result: RunResult) -> None:
+    """Print a Run's plain-text result and exit on the Run's success contract.
+
+    Shared by ``run`` and ``resume`` so a resumed Run reports identically: each
+    attempted Node's terminal status, a failed Node's stderr excerpt, the withheld
+    skipped Nodes and their blockers, then the run-level success/failure line. A
+    failed Run exits 1; a succeeded Run returns 0 by falling through.
+    """
     for node_result in result.node_results:
         typer.echo(f"node {node_result.node_id} attempt 1 exited {node_result.exit_status}")
         if not node_result.succeeded and node_result.stderr:
@@ -149,3 +152,37 @@ def run(workflow_file: Path) -> None:
         typer.echo(f"run {result.run_id} failed")
         raise typer.Exit(code=1)
     typer.echo(f"run {result.run_id} succeeded")
+
+
+@app.command()
+def run(workflow_file: Path) -> None:
+    """Run a workflow file and print a plain-text result."""
+    workflow = _load_normalized_workflow(workflow_file)
+    runs_root = Path.cwd() / ".caw" / "runs"
+    try:
+        result = asyncio.run(execute_run(workflow, runs_root))
+    except (OSError, sqlite3.Error) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=3) from exc
+    _report_and_exit(result)
+
+
+@app.command()
+def resume(run_id: str) -> None:
+    """Resume an interrupted or failed run, re-running only its incomplete nodes.
+
+    Mirrors ``run``'s output and exit-code contract: 0 on success, 1 on a failed
+    node, 3 on an infrastructure error. An unknown run id or a run that already
+    succeeded is not resumable and is refused as a config-class error (exit 2)
+    with a single ``error:`` line, never re-executing it.
+    """
+    runs_root = Path.cwd() / ".caw" / "runs"
+    try:
+        result = asyncio.run(resume_run(run_id, runs_root))
+    except ResumeError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    except (OSError, sqlite3.Error) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=3) from exc
+    _report_and_exit(result)
