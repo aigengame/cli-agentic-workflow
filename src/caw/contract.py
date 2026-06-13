@@ -13,6 +13,16 @@ from pathlib import Path
 
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError, ValidationError
+from referencing import Registry
+from referencing.exceptions import Unresolvable
+
+# An empty registry with no retrieval callback: a `$ref` the schema does not
+# define locally is Unresolvable rather than fetched. This disables the
+# deprecated default behavior where jsonschema retrieves a remote `$ref` over the
+# network during validation, so an offline Run can neither egress nor stall its
+# event loop on a fixture-controlled URL (#61). A remote `$ref` becomes a contract
+# error, not network I/O.
+_OFFLINE_REGISTRY: Registry = Registry()
 
 
 class OutputContractError(Exception):
@@ -51,10 +61,18 @@ def validate_output_contract(schema_path: Path, structured_output: object) -> No
         )
 
     try:
-        Draft202012Validator(schema).validate(structured_output)
+        Draft202012Validator(schema, registry=_OFFLINE_REGISTRY).validate(structured_output)
     except ValidationError as exc:
         location = exc.json_path or "$"
         reason = " ".join(str(exc.message).split())
         raise OutputContractError(
             f"output contract {schema_path} violated at {location}: {reason}"
+        ) from exc
+    except Unresolvable as exc:
+        # A `$ref` the schema does not resolve locally (e.g. a remote URL):
+        # remote retrieval is disabled by the offline registry, so this is a
+        # contract error naming the unresolved reference, never network I/O.
+        reason = " ".join(str(exc).split())
+        raise OutputContractError(
+            f"output contract {schema_path} has an unresolvable reference: {reason}"
         ) from exc

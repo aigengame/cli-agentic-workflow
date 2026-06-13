@@ -77,3 +77,16 @@ def test_a_missing_schema_file_is_reported_naming_the_contract(tmp_path: Path) -
         validate_output_contract(schema, {"x": 1})
 
     assert str(schema) in str(excinfo.value)
+
+
+def test_a_remote_ref_schema_fails_as_a_contract_error_without_network(tmp_path: Path) -> None:
+    # A schema with a remote `$ref` must fail the contract (naming it) and must NOT
+    # attempt to retrieve the remote resource over the network: an otherwise-offline
+    # run cannot egress or stall its event loop on a fixture-controlled URL (#61).
+    schema = write_schema(tmp_path / "s.json", {"$ref": "https://example.com/remote.json"})
+
+    with pytest.raises(OutputContractError) as excinfo:
+        validate_output_contract(schema, {"x": 1})
+
+    message = str(excinfo.value)
+    assert str(schema) in message, "the error names the failed contract"

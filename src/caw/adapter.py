@@ -116,7 +116,7 @@ class MockAdapter(Adapter):
         echo_env_to = raw.get("echo_env_to")
         if isinstance(echo_env_to, str):
             Path(echo_env_to).write_text(json.dumps(dict(invocation.env)), encoding="utf-8")
-        artifacts = tuple(Path(entry) for entry in raw.get("artifacts", ()))
+        artifacts = MockAdapter._parse_artifacts(raw.get("artifacts", ()), fixture, node_id)
         return AgentResult(
             exit_status=exit_status,
             stdout=str(raw.get("stdout", "")),
@@ -124,6 +124,30 @@ class MockAdapter(Adapter):
             structured_output=raw.get("structured_output"),
             artifacts=artifacts,
         )
+
+    @staticmethod
+    def _parse_artifacts(raw: object, fixture: Path, node_id: str) -> tuple[Path, ...]:
+        """Coerce a fixture's ``artifacts`` value into a tuple of paths, or fail cleanly.
+
+        A malformed ``artifacts`` shape (not a list, or an entry that is not a path
+        string) is a fixture-authoring error: it must raise a node-level
+        :class:`AdapterError` naming the fixture, never a raw ``TypeError`` that
+        escapes the Adapter and crashes the Run (#61).
+        """
+        if not isinstance(raw, list | tuple):
+            raise AdapterError(
+                f"fixture {fixture} for node {node_id!r} has a malformed 'artifacts': "
+                f"expected a list of path strings, got {type(raw).__name__}"
+            )
+        artifacts: list[Path] = []
+        for entry in raw:
+            if not isinstance(entry, str):
+                raise AdapterError(
+                    f"fixture {fixture} for node {node_id!r} has a malformed 'artifacts' "
+                    f"entry: expected a path string, got {type(entry).__name__}"
+                )
+            artifacts.append(Path(entry))
+        return tuple(artifacts)
 
 
 class AdapterRegistry:

@@ -11,7 +11,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from caw.adapter import AdapterError, AdapterRegistry, AgentInvocation
+from caw.adapter import AdapterRegistry, AgentInvocation
 from caw.contract import OutputContractError, validate_output_contract
 from caw.events import EventLog
 from caw.model import (
@@ -218,13 +218,25 @@ async def _execute_node(node: Node, registry: AdapterRegistry) -> NodeResult:
         return await _execute_shell_node(node)
     try:
         return await _execute_agent_node(node, registry)
-    except AdapterError as exc:
+    except Exception as exc:
+        # ANY Exception from the agent path — an AdapterError (unknown adapter,
+        # unreadable/malformed fixture), an OutputContractError, or an arbitrary
+        # exception a real Agent CLI Adapter raises inside invoke() (parse,
+        # subprocess, timeout) — is normalized into a failed Node here so the
+        # scheduler skips its dependents uniformly rather than the exception
+        # escaping and crashing the whole Run (#61, ADR 0006's own contract).
+        #
+        # Only Exception is caught, never BaseException: asyncio.CancelledError
+        # (a BaseException since 3.8), KeyboardInterrupt, and SystemExit must
+        # still propagate so the #4 crash/cancel path and #22/#54 finalization
+        # tear down siblings and record the Run errored.
         now = _now()
+        cause = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
         return NodeResult(
             node_id=node.id,
             exit_status=1,
             stdout="",
-            stderr=str(exc),
+            stderr=cause,
             started_at=now,
             finished_at=now,
         )

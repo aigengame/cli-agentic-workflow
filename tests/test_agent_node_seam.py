@@ -344,6 +344,98 @@ def test_agent_node_with_shell_command_input_is_a_config_error() -> None:
         normalize_workflow(raw, source="workflow.yaml")
 
 
+def agent_plus_independent_shell(agent_inputs: dict[str, Any], marker: Path) -> dict[str, Any]:
+    """An agent Node and an INDEPENDENT shell Node with no edge between them.
+
+    Used to assert that a failure on the agent branch fails only that node while
+    the independent shell branch still completes (the scheduler never tears down
+    a peer for another node's failure) — #61's whole-Run-crash guard.
+    """
+    return {
+        "name": "sample",
+        "version": 1,
+        "nodes": [
+            {"id": "agent", "kind": "agent", "inputs": {"adapter": "mock", **agent_inputs}},
+            {"id": "side", "kind": "shell", "inputs": {"command": f"touch {marker}"}},
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_malformed_fixture_artifacts_fail_the_node_not_the_run(tmp_path: Path) -> None:
+    # A fixture whose `artifacts` is not a list of path strings must fail the agent
+    # Node as a clean adapter error, never crash the whole Run with a raw TypeError;
+    # the independent shell branch still completes (#61).
+    bad = write_fixture(tmp_path / "bad.json", exit_status=0, artifacts=[123, 456])
+    marker = tmp_path / "side.txt"
+    workflow = normalize_workflow(
+        agent_plus_independent_shell({"prompt": "p", "fixture": str(bad)}, marker),
+        source="<test>",
+    )
+
+    result = await execute_run(workflow, tmp_path / "runs")
+
+    assert not result.succeeded
+    statuses = {r.node_id: r.exit_status for r in result.node_results}
+    assert statuses["agent"] != 0, "the malformed fixture fails the agent node"
+    assert statuses["side"] == 0, "the independent branch still completes"
+    assert marker.exists(), "the independent shell node ran to completion"
+
+
+@pytest.mark.asyncio
+async def test_a_generic_adapter_exception_fails_the_node_not_the_run(tmp_path: Path) -> None:
+    # An Adapter whose invoke() raises an arbitrary (non-AdapterError) Exception
+    # must be normalized into a failed Node so the scheduler skips dependents,
+    # never escape and crash the whole Run; the independent branch still completes.
+    from caw.adapter import Adapter, AdapterRegistry, AgentInvocation, AgentResult
+
+    class ExplodingAdapter(Adapter):
+        async def invoke(self, invocation: AgentInvocation) -> AgentResult:
+            raise RuntimeError("boom from a real CLI parse/subprocess/timeout")
+
+    registry = AdapterRegistry({"explode": ExplodingAdapter()})
+    marker = tmp_path / "side.txt"
+    raw = agent_plus_independent_shell({"prompt": "p"}, marker)
+    raw["nodes"][0]["inputs"]["adapter"] = "explode"
+    workflow = normalize_workflow(raw, source="<test>")
+
+    result = await execute_run(workflow, tmp_path / "runs", registry=registry)
+
+    assert not result.succeeded
+    statuses = {r.node_id: r.exit_status for r in result.node_results}
+    assert statuses["agent"] != 0, "the generic exception fails the agent node"
+    assert "boom" in next(r for r in result.node_results if r.node_id == "agent").stderr
+    assert statuses["side"] == 0, "the independent branch still completes"
+    assert marker.exists()
+
+
+@pytest.mark.asyncio
+async def test_remote_ref_output_schema_fails_the_node_not_the_run(tmp_path: Path) -> None:
+    # An output_schema with a remote `$ref` must fail the agent Node as a contract
+    # error WITHOUT network resolution, never crash the Run; the independent branch
+    # still completes (#61).
+    schema = write_schema(
+        tmp_path / "remote.schema.json", {"$ref": "https://example.com/remote.json"}
+    )
+    fixture = write_fixture(tmp_path / "fixture.json", exit_status=0, structured_output={"x": 1})
+    marker = tmp_path / "side.txt"
+    raw = agent_plus_independent_shell(
+        {"prompt": "p", "fixture": str(fixture), "output_schema": str(schema)}, marker
+    )
+    workflow = normalize_workflow(raw, source="<test>")
+
+    result = await execute_run(workflow, tmp_path / "runs")
+
+    assert not result.succeeded
+    statuses = {r.node_id: r.exit_status for r in result.node_results}
+    assert statuses["agent"] != 0, "the remote-$ref schema fails the agent node"
+    assert str(schema) in next(r for r in result.node_results if r.node_id == "agent").stderr, (
+        "the failure names the failed contract"
+    )
+    assert statuses["side"] == 0, "the independent branch still completes"
+    assert marker.exists()
+
+
 @pytest.mark.asyncio
 async def test_parallel_agent_and_shell_nodes_run_fully_offline(tmp_path: Path) -> None:
     left = write_fixture(tmp_path / "left.json", exit_status=0, stdout="left agent")
