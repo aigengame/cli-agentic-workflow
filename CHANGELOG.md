@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.0](https://github.com/aigengame/cli-agentic-workflow/compare/v0.5.1...v0.6.0) (2026-06-13)
+
+
+### Features
+
+* node `when` predicates and skip semantics ([#7](https://github.com/aigengame/cli-agentic-workflow/issues/7)) ([#74](https://github.com/aigengame/cli-agentic-workflow/issues/74)) ([7e84822](https://github.com/aigengame/cli-agentic-workflow/commit/7e84822de8a9401386d3324af375c2a5e0ebfcf6))
+
 ## [0.5.1](https://github.com/aigengame/cli-agentic-workflow/compare/v0.5.0...v0.5.1) (2026-06-13)
 
 
