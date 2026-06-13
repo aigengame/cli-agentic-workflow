@@ -77,6 +77,105 @@ async def test_agent_node_runs_through_mock_adapter_replaying_a_fixture(
     assert agent_result.stdout == "a one-line summary"
 
 
+def write_schema(path: Path, schema: dict[str, Any]) -> Path:
+    path.write_text(json.dumps(schema), encoding="utf-8")
+    return path
+
+
+@pytest.mark.asyncio
+async def test_output_contract_violation_fails_the_node_naming_the_contract(
+    tmp_path: Path,
+) -> None:
+    schema = write_schema(
+        tmp_path / "summary.schema.json",
+        {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {"summary": {"type": "string"}},
+            "required": ["summary"],
+        },
+    )
+    # The Agent CLI itself exited 0, but its structured output omits the required
+    # `summary`: the Output Contract must still fail the Node.
+    fixture = write_fixture(
+        tmp_path / "fixture.json", exit_status=0, structured_output={"title": "no summary"}
+    )
+    workflow = agent_workflow(fixture, output_schema=str(schema))
+
+    result = await execute_run(workflow, tmp_path / "runs")
+
+    assert not result.succeeded
+    (agent_result,) = result.node_results
+    assert agent_result.exit_status != 0
+    assert str(schema) in agent_result.stderr, "the error names the failed contract"
+
+
+@pytest.mark.asyncio
+async def test_output_contract_satisfied_lets_the_node_succeed(tmp_path: Path) -> None:
+    schema = write_schema(
+        tmp_path / "summary.schema.json",
+        {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {"summary": {"type": "string"}},
+            "required": ["summary"],
+        },
+    )
+    fixture = write_fixture(
+        tmp_path / "fixture.json", exit_status=0, structured_output={"summary": "all good"}
+    )
+    workflow = agent_workflow(fixture, output_schema=str(schema))
+
+    result = await execute_run(workflow, tmp_path / "runs")
+
+    assert result.succeeded
+    (agent_result,) = result.node_results
+    assert agent_result.exit_status == 0
+
+
+@pytest.mark.asyncio
+async def test_output_contract_failure_skips_the_failed_nodes_dependents(
+    tmp_path: Path,
+) -> None:
+    schema = write_schema(
+        tmp_path / "schema.json",
+        {"type": "object", "required": ["summary"]},
+    )
+    upstream = write_fixture(
+        tmp_path / "up.json", exit_status=0, structured_output={"wrong": True}
+    )
+    downstream = write_fixture(tmp_path / "down.json", exit_status=0, stdout="should not run")
+    raw: dict[str, Any] = {
+        "name": "sample",
+        "version": 1,
+        "nodes": [
+            {
+                "id": "up",
+                "kind": "agent",
+                "inputs": {
+                    "adapter": "mock",
+                    "prompt": "up",
+                    "fixture": str(upstream),
+                    "output_schema": str(schema),
+                },
+            },
+            {
+                "id": "down",
+                "kind": "agent",
+                "needs": ["up"],
+                "inputs": {"adapter": "mock", "prompt": "down", "fixture": str(downstream)},
+            },
+        ],
+    }
+    workflow = normalize_workflow(raw, source="<test>")
+
+    result = await execute_run(workflow, tmp_path / "runs")
+
+    assert not result.succeeded
+    assert result.skipped_node_ids == ("down",)
+    assert {r.node_id for r in result.node_results} == {"up"}
+
+
 def test_agent_node_missing_adapter_is_a_config_error() -> None:
     raw: dict[str, Any] = {
         "name": "sample",
