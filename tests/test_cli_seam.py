@@ -461,6 +461,45 @@ def test_resume_an_unknown_run_id_is_refused_with_one_error_line(
     assert "no-such-run" in lines[0], "the error names the unknown run id"
 
 
+def test_run_failure_message_names_the_workflow_file_node_id_and_adapter(
+    write_workflow_data: Callable[[dict[str, Any]], Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Acceptance criterion #6.5: a node failure's surfaced message names the
+    # workflow file, the node id, and (for an agent node) the adapter, so a user
+    # can locate the failure across definition, graph, and integration without
+    # cross-referencing. The mock agent node fails (fixture exit_status 7); the
+    # run output must mention all three identifiers.
+    fixture = tmp_path / "fixture.json"
+    fixture.write_text(json.dumps({"exit_status": 7, "stderr": "agent blew up"}), encoding="utf-8")
+    workflow_file = write_workflow_data(
+        {
+            "name": "sample",
+            "version": 1,
+            "nodes": [
+                {
+                    "id": "summarize",
+                    "kind": "agent",
+                    "inputs": {
+                        "adapter": "mock",
+                        "prompt": "do it",
+                        "fixture": str(fixture),
+                    },
+                }
+            ],
+        }
+    )
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["run", str(workflow_file)])
+
+    assert result.exit_code == 1, result.output
+    assert "workflow.yaml" in result.output, "the failure names the workflow file"
+    assert "summarize" in result.output, "the failure names the node id"
+    assert "mock" in result.output, "the failure names the adapter"
+
+
 def test_run_failing_node_prints_its_stderr_excerpt(
     write_workflow: Callable[[str], Path],
     tmp_path: Path,

@@ -74,6 +74,9 @@ class NodeResult:
     structured_output: object | None = None
     artifacts: tuple[Path, ...] = ()
     failure_kind: str | None = None
+    # The Adapter that ran an agent Node, threaded so a failure message can name
+    # it (#6.5); ``None`` for a shell Node, which has no Adapter.
+    adapter: str | None = None
 
     @property
     def succeeded(self) -> bool:
@@ -279,6 +282,7 @@ async def _execute_agent_node(node: Node, registry: AdapterRegistry) -> NodeResu
             started_at=started_at,
             finished_at=_now(),
             failure_kind=TIMED_OUT,
+            adapter=inputs.adapter,
         )
     exit_status = result.exit_status
     stderr = result.stderr
@@ -298,6 +302,7 @@ async def _execute_agent_node(node: Node, registry: AdapterRegistry) -> NodeResu
         structured_output=result.structured_output,
         artifacts=result.artifacts,
         failure_kind=None if exit_status == 0 else FAILED,
+        adapter=inputs.adapter,
     )
 
 
@@ -329,6 +334,9 @@ async def _execute_node(node: Node, registry: AdapterRegistry) -> NodeResult:
         # tear down siblings and record the Run errored.
         now = _now()
         cause = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+        # This path runs only for the agent branch (shell Nodes return directly),
+        # so the Adapter name is available to name in the failure message (#6.5).
+        adapter = node.inputs.adapter if isinstance(node.inputs, AgentNodeInputs) else None
         return NodeResult(
             node_id=node.id,
             exit_status=1,
@@ -337,6 +345,7 @@ async def _execute_node(node: Node, registry: AdapterRegistry) -> NodeResult:
             started_at=now,
             finished_at=now,
             failure_kind=ERRORED,
+            adapter=adapter,
         )
 
 

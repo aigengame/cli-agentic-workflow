@@ -132,18 +132,34 @@ def graph(
         typer.echo(f"  {position}. {node.id}{needs}")
 
 
-def _report_and_exit(result: RunResult) -> None:
+def _failure_line(workflow_label: str, node_result: NodeResult) -> str:
+    """Name the workflow file, node id, and adapter of a failed Node (#6.5).
+
+    A failure's surfaced message must locate it across the definition, the graph,
+    and the integration, so a user need not cross-reference to find the source.
+    The Adapter is named only for an agent Node (a shell Node has none); the
+    classification (failed / timed_out / errored) tells WHY it failed.
+    """
+    adapter = f" (adapter {node_result.adapter})" if node_result.adapter else ""
+    return f"workflow {workflow_label}: node {node_result.node_id}{adapter} {node_result.status}"
+
+
+def _report_and_exit(result: RunResult, workflow_label: str) -> None:
     """Print a Run's plain-text result and exit on the Run's success contract.
 
     Shared by ``run`` and ``resume`` so a resumed Run reports identically: each
-    attempted Node's terminal status, a failed Node's stderr excerpt, the withheld
-    skipped Nodes and their blockers, then the run-level success/failure line. A
-    failed Run exits 1; a succeeded Run returns 0 by falling through.
+    attempted Node's terminal status, a failed Node's locating message and stderr
+    excerpt, the withheld skipped Nodes and their blockers, then the run-level
+    success/failure line. ``workflow_label`` is the workflow file path for ``run``
+    and the run id for ``resume``, so the failure message can name its source in
+    both. A failed Run exits 1; a succeeded Run returns 0 by falling through.
     """
     for node_result in result.node_results:
         typer.echo(f"node {node_result.node_id} attempt 1 exited {node_result.exit_status}")
-        if not node_result.succeeded and node_result.stderr:
-            _echo_stderr_excerpt(node_result)
+        if not node_result.succeeded:
+            typer.echo(_failure_line(workflow_label, node_result))
+            if node_result.stderr:
+                _echo_stderr_excerpt(node_result)
     for node_id in result.skipped_node_ids:
         blocker = result.skipped_blockers.get(node_id)
         blocked_by = f" (blocked by {blocker})" if blocker else ""
@@ -164,7 +180,7 @@ def run(workflow_file: Path) -> None:
     except (OSError, sqlite3.Error) as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=3) from exc
-    _report_and_exit(result)
+    _report_and_exit(result, workflow_label=str(workflow_file))
 
 
 @app.command()
@@ -185,4 +201,4 @@ def resume(run_id: str) -> None:
     except (OSError, sqlite3.Error) as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=3) from exc
-    _report_and_exit(result)
+    _report_and_exit(result, workflow_label=run_id)
