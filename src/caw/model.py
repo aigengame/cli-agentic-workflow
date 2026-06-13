@@ -7,7 +7,14 @@ import json
 from collections.abc import Sequence
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, ValidationError, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from caw.config import WorkflowConfigError
 
@@ -68,6 +75,11 @@ class Workflow(BaseModel):
     name: str
     version: int
     nodes: tuple[Node, ...]
+    # The maximum number of node Attempts the executor runs concurrently. The
+    # default leans conservative (4): enough to run a typical fan-out — including
+    # the canonical three-branch parallel — without serializing it, while
+    # staying well below OS subprocess and file-descriptor pressure (ADR 0003).
+    concurrency: int = Field(default=4, ge=1)
 
     _name_non_blank = field_validator("name")(_require_non_blank)
 
