@@ -272,6 +272,110 @@ async def test_resume_completes_an_interrupted_run_without_rerunning_completed_n
 
 
 @pytest.mark.asyncio
+async def test_resuming_a_run_whose_blocker_fails_again_re_skips_its_dependent_cleanly(
+    tmp_path: Path,
+) -> None:
+    # Resume idempotency for the skip path (#6 review): on the first run `build`
+    # fails and its dependent `deploy` is recorded `skipped` — so a `node` row for
+    # `deploy` already exists. When the run is resumed and `build` fails AGAIN, the
+    # scheduler re-skips `deploy`; that re-skip must flip the EXISTING row to
+    # `skipped` (an UPDATE) rather than re-INSERT it, which would breach the
+    # `(run_id, node_id)` PK and crash the resume with an IntegrityError instead of
+    # returning a clean failed RunResult. The blocker stays a hard failure
+    # (`exit 7` every time), so the resumed run must end failed, not crash.
+    runs_root = tmp_path / "runs"
+    raw: dict[str, Any] = {
+        "name": "sample",
+        "version": 1,
+        "nodes": [
+            {"id": "build", "kind": "shell", "inputs": {"command": "exit 7"}},
+            {
+                "id": "deploy",
+                "kind": "shell",
+                "needs": ["build"],
+                "inputs": {"command": "echo deployed"},
+            },
+        ],
+    }
+    workflow = normalize_workflow(raw, source="<test>")
+
+    first = await execute_run(workflow, runs_root)
+    assert not first.succeeded, "the first run fails because `build` fails"
+    run_dir = single_run_dir(runs_root)
+    first_nodes = {
+        row["node_id"]: row["status"] for row in state_rows(run_dir, "SELECT * FROM node")
+    }
+    assert first_nodes == {"build": "failed", "deploy": "skipped"}, (
+        "the first run leaves a `deploy` row already present, the precondition for the bug"
+    )
+
+    # Resuming must NOT crash with an IntegrityError when `build` fails again and
+    # `deploy` is re-skipped over its pre-existing row.
+    resumed = await resume_run(first.run_id, runs_root)
+
+    assert not resumed.succeeded, "the blocker fails again, so the resumed run is still failed"
+    assert resumed.run_id == first.run_id, "resume reuses the same run id"
+    nodes = {row["node_id"]: row["status"] for row in state_rows(run_dir, "SELECT * FROM node")}
+    assert nodes == {"build": "failed", "deploy": "skipped"}, (
+        "the blocker is recorded failed again and the dependent is re-recorded skipped"
+    )
+
+
+@pytest.mark.asyncio
+async def test_resuming_a_run_whose_blocker_now_succeeds_runs_the_previously_skipped_dependent(
+    tmp_path: Path,
+) -> None:
+    # The happy sibling of the re-skip case (#6 review): when the blocker now
+    # SUCCEEDS on resume, the previously-skipped dependent must re-run to
+    # completion. `build` fails the first run (no marker), so `deploy` is skipped;
+    # on resume the marker exists, `build` succeeds, and `deploy` — whose row
+    # exists from the first run — flips to running via record_node_running and then
+    # runs its command. The marker file proves the previously-skipped node ran.
+    runs_root = tmp_path / "runs"
+    build_marker = tmp_path / "build.marker"
+    deployed = tmp_path / "deployed"
+    raw: dict[str, Any] = {
+        "name": "sample",
+        "version": 1,
+        "nodes": [
+            {
+                "id": "build",
+                "kind": "shell",
+                "inputs": {
+                    "command": (
+                        f"if [ -e {build_marker} ]; then exit 0; "
+                        f"else touch {build_marker}; exit 7; fi"
+                    )
+                },
+            },
+            {
+                "id": "deploy",
+                "kind": "shell",
+                "needs": ["build"],
+                "inputs": {"command": f"touch {deployed}"},
+            },
+        ],
+    }
+    workflow = normalize_workflow(raw, source="<test>")
+
+    first = await execute_run(workflow, runs_root)
+    assert not first.succeeded, "the first run fails because `build` fails"
+    assert not deployed.exists(), "deploy is skipped on the first run"
+    run_dir = single_run_dir(runs_root)
+    first_nodes = {
+        row["node_id"]: row["status"] for row in state_rows(run_dir, "SELECT * FROM node")
+    }
+    assert first_nodes == {"build": "failed", "deploy": "skipped"}
+
+    resumed = await resume_run(first.run_id, runs_root)
+
+    assert resumed.succeeded, "the blocker now succeeds, so the resumed run completes"
+    assert deployed.exists(), "the previously-skipped dependent re-runs once its blocker succeeds"
+    nodes = {row["node_id"]: row["status"] for row in state_rows(run_dir, "SELECT * FROM node")}
+    assert nodes == {"build": "succeeded", "deploy": "succeeded"}
+
+
+@pytest.mark.asyncio
 async def test_resuming_an_already_succeeded_run_is_refused(tmp_path: Path) -> None:
     # Resume eligibility (#6): a Run that already succeeded has nothing to do, so
     # resuming it is refused with a clear error rather than re-running it or

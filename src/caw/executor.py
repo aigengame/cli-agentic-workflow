@@ -582,6 +582,15 @@ class _Scheduler:
         Independent branches are untouched: only Nodes reachable from the failed
         Node by ``needs`` edges are skipped, recorded ``skipped`` in both State
         and Events so they are distinguishable from Nodes that ran.
+
+        The ``node`` row is INSERTed the first time a Node is skipped; a Node whose
+        row already exists (the normal case on resume, where a prior run already
+        recorded it ``skipped``) is flipped with an UPDATE instead, so re-skipping
+        it never breaches the ``(run_id, node_id)`` PK. This mirrors the launch
+        path's INSERT-vs-UPDATE distinction (``_launch_ready``): ``_started`` is the
+        single source of truth for whether a Node already has a row, so a newly
+        skipped Node is added to it — letting a deeper transitive re-skip in the
+        same pass also take the UPDATE branch.
         """
         already = {result.node_id for result in self._results} | set(self._skipped)
         queue = list(self._dependents[node.id])
@@ -593,7 +602,13 @@ class _Scheduler:
             seen.add(node_id)
             self._skipped.append(node_id)
             self._skipped_blockers[node_id] = node.id
-            self._state.record_node_skipped(run_id=self._run_id, node_id=node_id)
+            if node_id in self._started:
+                self._state.record_node_finished(
+                    run_id=self._run_id, node_id=node_id, status="skipped"
+                )
+            else:
+                self._state.record_node_skipped(run_id=self._run_id, node_id=node_id)
+                self._started.add(node_id)
             self._events.append("node_skipped", {"node_id": node_id, "blocked_by": node.id})
             queue.extend(self._dependents[node_id])
 
