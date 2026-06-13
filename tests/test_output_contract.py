@@ -79,6 +79,26 @@ def test_a_missing_schema_file_is_reported_naming_the_contract(tmp_path: Path) -
     assert str(schema) in str(excinfo.value)
 
 
+def test_a_schema_permitting_null_accepts_null_structured_output(tmp_path: Path) -> None:
+    # #63: a schema that legitimately permits null (e.g. type [object, null]) and a
+    # null structured output must PASS — null is validated against the schema
+    # rather than special-cased as an automatic violation.
+    schema = write_schema(tmp_path / "s.json", {"type": ["object", "null"]})
+
+    validate_output_contract(schema, None)
+
+
+def test_a_schema_requiring_content_still_fails_on_null(tmp_path: Path) -> None:
+    # #63: a schema that requires content (here, an object) and a null structured
+    # output must still FAIL, naming the contract.
+    schema = write_schema(tmp_path / "s.json", {"type": "object", "required": ["summary"]})
+
+    with pytest.raises(OutputContractError) as excinfo:
+        validate_output_contract(schema, None)
+
+    assert str(schema) in str(excinfo.value), "the error names the failed contract"
+
+
 def test_a_remote_ref_schema_fails_as_a_contract_error_without_network(tmp_path: Path) -> None:
     # A schema with a remote `$ref` must fail the contract (naming it) and must NOT
     # attempt to retrieve the remote resource over the network: an otherwise-offline

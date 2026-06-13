@@ -55,11 +55,12 @@ def validate_output_contract(schema_path: Path, structured_output: object) -> No
             f"output contract {schema_path} is not a valid JSON Schema: {reason}"
         ) from exc
 
-    if structured_output is None:
-        raise OutputContractError(
-            f"output contract {schema_path} violated: node produced no structured output"
-        )
-
+    # `structured_output` is validated as-is — including ``None`` (JSON null) —
+    # against the declared schema. A schema permitting null (e.g. type
+    # [object, null]) passes; a schema requiring content still fails when the
+    # output is null. The kernel does not special-case None as an automatic
+    # violation, so the schema is the sole arbiter of what the contract allows
+    # (#63), and the None-vs-absent distinction is left to the schema author.
     try:
         Draft202012Validator(schema, registry=_OFFLINE_REGISTRY).validate(structured_output)
     except ValidationError as exc:

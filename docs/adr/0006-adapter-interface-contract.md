@@ -35,7 +35,13 @@ Three contract rules bind every Adapter:
 - The Output Contract is the kernel's job, not the Adapter's: the kernel validates
   `structured_output` against `output_schema` after `invoke` returns and before dependents
   run. An Adapter may pass the schema to a CLI's structured-output feature, but the kernel
-  re-validates regardless.
+  re-validates regardless. The contract is evaluated only when the Agent CLI exited zero: it
+  guards a successful invocation's output, and a non-zero exit is already a node failure, so
+  re-checking would only risk masking the agent's own failure cause (#63). The structured
+  output is validated as-is, including JSON null — the schema is the sole arbiter of whether
+  null is allowed; the kernel never special-cases a `None` output as an automatic violation.
+  Remote `$ref` resolution is disabled during validation, so an offline Run cannot egress on
+  a fixture-controlled schema URL; an unresolvable reference is a contract error (#61).
 - The `env` in `AgentInvocation` is the allow-list the kernel already filtered to declared,
   present names; the Adapter passes exactly that to the Agent CLI process and the kernel
   never persists its values (#5).

@@ -232,6 +232,46 @@ async def test_output_contract_violation_fails_the_node_naming_the_contract(
 
 
 @pytest.mark.asyncio
+async def test_output_contract_permitting_null_lets_a_null_output_succeed(tmp_path: Path) -> None:
+    # #63: a schema that permits null and a null structured output passes the
+    # contract end-to-end (no special-casing of None as an automatic violation).
+    schema = write_schema(tmp_path / "nullable.schema.json", {"type": ["object", "null"]})
+    fixture = write_fixture(tmp_path / "fixture.json", exit_status=0, structured_output=None)
+    workflow = agent_workflow(fixture, output_schema=str(schema))
+
+    result = await execute_run(workflow, tmp_path / "runs")
+
+    assert result.succeeded
+    (agent_result,) = result.node_results
+    assert agent_result.exit_status == 0
+
+
+@pytest.mark.asyncio
+async def test_output_contract_is_not_evaluated_when_the_agent_exited_non_zero(
+    tmp_path: Path,
+) -> None:
+    # #63 exit-status gating (documented in the executor and ADR 0006): the Output
+    # Contract guards a SUCCESSFUL invocation's structured output. A non-zero exit
+    # is already a node failure, so the contract is not evaluated — the failure
+    # reflects the agent's own exit, not a contract message that would mask it.
+    schema = write_schema(tmp_path / "summary.schema.json", {"type": "object", "required": ["x"]})
+    # exit_status 3 with a structured output that WOULD violate the schema:
+    fixture = write_fixture(
+        tmp_path / "fixture.json", exit_status=3, structured_output={"wrong": True}
+    )
+    workflow = agent_workflow(fixture, output_schema=str(schema))
+
+    result = await execute_run(workflow, tmp_path / "runs")
+
+    assert not result.succeeded
+    (agent_result,) = result.node_results
+    assert agent_result.exit_status == 3, "the node fails by the agent's own exit status"
+    assert str(schema) not in agent_result.stderr, (
+        "the contract is not evaluated on a non-zero exit, so it cannot mask the real cause"
+    )
+
+
+@pytest.mark.asyncio
 async def test_output_contract_satisfied_lets_the_node_succeed(tmp_path: Path) -> None:
     schema = write_schema(
         tmp_path / "summary.schema.json",

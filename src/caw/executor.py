@@ -169,6 +169,14 @@ async def _execute_agent_node(node: Node, registry: AdapterRegistry) -> NodeResu
     Output Contract is validated AFTER the Adapter returns and BEFORE the result
     is reported, so a contract breach fails the Node even when the Agent CLI
     itself exited zero.
+
+    Exit-status gating (#63): the Output Contract is evaluated ONLY when the Agent
+    CLI exited zero. The contract is a guarantee about a successful invocation's
+    structured output; a non-zero exit is already a node failure, so re-checking
+    the contract would be redundant and could mask the agent's own failure cause
+    with a contract message. The structured output is validated as-is, including
+    JSON null — a schema permitting null passes, one requiring content fails — so
+    the schema is the sole arbiter and None is never special-cased.
     """
     assert isinstance(node.inputs, AgentNodeInputs)
     inputs = node.inputs
