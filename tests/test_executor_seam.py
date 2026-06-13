@@ -13,7 +13,7 @@ from typing import Any
 
 import pytest
 
-from caw.executor import execute_run
+from caw.executor import ResumeError, execute_run, resume_run
 from caw.model import Workflow, normalize_workflow
 
 ShellNodeSpec = str | tuple[str, str, list[str]]
@@ -179,6 +179,141 @@ async def test_an_errored_adapter_failure_is_not_retried(tmp_path: Path) -> None
     assert node["status"] == "errored", "an adapter fault is classified errored, not failed"
     attempts = state_rows(run_dir, "SELECT * FROM attempt WHERE node_id = 'summarize'")
     assert len(attempts) == 1, "an errored failure is not retried even with retries set"
+
+
+@pytest.mark.asyncio
+async def test_resume_completes_an_interrupted_run_without_rerunning_completed_nodes(
+    tmp_path: Path,
+) -> None:
+    # Acceptance criterion #6.4: `caw resume` completes an interrupted workflow
+    # without re-running completed Nodes. `build` succeeds and `test` fails on the
+    # first run (its marker is absent), so `deploy` is skipped and the run fails.
+    # `build` appends to a counter on every run; `test` succeeds once its marker
+    # exists. On resume, the already-succeeded `build` must NOT run again (the
+    # counter stays at one), `test` re-runs and now succeeds, and `deploy` runs —
+    # so the resumed run succeeds, reusing the SAME run id and run directory.
+    runs_root = tmp_path / "runs"
+    build_count = tmp_path / "build.count"
+    test_marker = tmp_path / "test.marker"
+    deployed = tmp_path / "deployed"
+    raw: dict[str, Any] = {
+        "name": "sample",
+        "version": 1,
+        "nodes": [
+            {"id": "build", "kind": "shell", "inputs": {"command": f"echo x >> {build_count}"}},
+            {
+                "id": "test",
+                "kind": "shell",
+                "needs": ["build"],
+                "inputs": {
+                    "command": (
+                        f"if [ -e {test_marker} ]; then exit 0; "
+                        f"else touch {test_marker}; exit 7; fi"
+                    )
+                },
+            },
+            {
+                "id": "deploy",
+                "kind": "shell",
+                "needs": ["test"],
+                "inputs": {"command": f"touch {deployed}"},
+            },
+        ],
+    }
+    workflow = normalize_workflow(raw, source="<test>")
+
+    first = await execute_run(workflow, runs_root)
+    assert not first.succeeded, "the first run fails because `test` fails"
+    assert build_count.read_text(encoding="utf-8").split() == ["x"], "build ran once"
+    assert not deployed.exists(), "deploy is skipped on the first run"
+
+    resumed = await resume_run(first.run_id, runs_root)
+
+    assert resumed.succeeded, "the resumed run completes the interrupted workflow"
+    assert resumed.run_id == first.run_id, "resume reuses the same run id"
+    assert build_count.read_text(encoding="utf-8").split() == ["x"], (
+        "the already-succeeded build node is NOT re-run on resume"
+    )
+    assert deployed.exists(), "deploy runs on resume once test succeeds"
+
+    # The same run directory is reused, and the run's final status is succeeded.
+    run_dir = single_run_dir(runs_root)
+    assert run_dir.name == first.run_id
+    (run,) = state_rows(run_dir, "SELECT * FROM run")
+    assert run["status"] == "succeeded"
+    nodes = {row["node_id"]: row["status"] for row in state_rows(run_dir, "SELECT * FROM node")}
+    assert nodes == {"build": "succeeded", "test": "succeeded", "deploy": "succeeded"}
+
+
+@pytest.mark.asyncio
+async def test_resuming_an_already_succeeded_run_is_refused(tmp_path: Path) -> None:
+    # Resume eligibility (#6): a Run that already succeeded has nothing to do, so
+    # resuming it is refused with a clear error rather than re-running it or
+    # silently no-opping. Unknown and succeeded ids are the two refusal cases.
+    runs_root = tmp_path / "runs"
+    workflow = shell_workflow("echo ok")
+    first = await execute_run(workflow, runs_root)
+    assert first.succeeded
+
+    with pytest.raises(ResumeError, match="not resumable"):
+        await resume_run(first.run_id, runs_root)
+
+
+@pytest.mark.asyncio
+async def test_resuming_an_unknown_run_id_is_refused(tmp_path: Path) -> None:
+    with pytest.raises(ResumeError, match="no run directory"):
+        await resume_run("no-such-run", tmp_path / "runs")
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_run_is_consistent_and_resumes_to_completion(tmp_path: Path) -> None:
+    # Acceptance criterion #6.3: cancelling a run mid-flight leaves State
+    # consistent (the run errored, the in-flight node errored — never left
+    # `running`) and the run resumable. A gate file blocks the node until the
+    # resume releases it; cancelling the first run interrupts it, and resume
+    # re-runs the interrupted node, which now completes because the gate is open.
+    runs_root = tmp_path / "runs"
+    gate = tmp_path / "gate"
+    done = tmp_path / "done"
+    workflow = policy_shell_workflow(
+        "blocked",
+        f"while [ ! -e {gate} ]; do sleep 0.05; done; touch {done}",
+    )
+
+    run_task = asyncio.create_task(execute_run(workflow, runs_root))
+    run_dir = None
+    for _ in range(200):
+        if runs_root.exists() and list(runs_root.iterdir()):
+            run_dir = single_run_dir(runs_root)
+            nodes = state_rows(run_dir, "SELECT status FROM node")
+            if nodes and nodes[0]["status"] == "running":
+                break
+        await asyncio.sleep(0.05)
+    else:
+        run_task.cancel()
+        pytest.fail("the node never reached running before cancellation")
+
+    run_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await run_task
+
+    # State is consistent after cancellation: the run and its in-flight node are
+    # errored, not left running — the precondition for a clean resume.
+    assert run_dir is not None
+    (run,) = state_rows(run_dir, "SELECT * FROM run")
+    assert run["status"] == "errored"
+    (node,) = state_rows(run_dir, "SELECT * FROM node")
+    assert node["status"] == "errored"
+    assert not done.exists(), "the node was interrupted before completing"
+
+    # Open the gate and resume: the interrupted node re-runs and completes.
+    gate.touch()
+    resumed = await resume_run(run["run_id"], runs_root)
+
+    assert resumed.succeeded, "the cancelled run resumes to completion"
+    assert done.exists(), "the interrupted node ran again and finished on resume"
+    (node,) = state_rows(run_dir, "SELECT * FROM node")
+    assert node["status"] == "succeeded"
 
 
 @pytest.mark.asyncio

@@ -667,13 +667,128 @@ async def execute_run(
         )
         events.append("run_started", {"workflow_name": workflow.name})
         scheduler = _Scheduler(workflow, state, events, run_id, registry or AdapterRegistry())
-        try:
-            run_result = await scheduler.run()
-            state.record_run_finished(run_id=run_id, status=run_result.status, finished_at=_now())
-            events.append("run_finished", {"status": run_result.status})
-        except BaseException as exc:
-            message = str(exc)
-            error = f"{type(exc).__name__}: {message}" if message else type(exc).__name__
-            _finalize_crashed_run(state, events, run_id, scheduler.in_flight_node_ids, error)
-            raise
+        return await _drive_scheduler(scheduler, state, events, run_id)
+
+
+async def _drive_scheduler(
+    scheduler: "_Scheduler", state: StateStore, events: EventLog, run_id: str
+) -> RunResult:
+    """Run the scheduler to completion and persist the Run's terminal status.
+
+    The single place a Run's success/failure is committed to State and Events,
+    and the single crash-finalization seam: a raise (spawn failure, cancellation)
+    is recorded ``errored`` over every in-flight Node without masking the original
+    exception. Shared by ``execute_run`` and ``resume_run`` so a resumed Run
+    finalizes identically to a fresh one (#6).
+    """
+    try:
+        run_result = await scheduler.run()
+        state.record_run_finished(run_id=run_id, status=run_result.status, finished_at=_now())
+        events.append("run_finished", {"status": run_result.status})
+    except BaseException as exc:
+        message = str(exc)
+        error = f"{type(exc).__name__}: {message}" if message else type(exc).__name__
+        _finalize_crashed_run(state, events, run_id, scheduler.in_flight_node_ids, error)
+        raise
     return run_result
+
+
+class ResumeError(Exception):
+    """Raised when a Run cannot be resumed: it is absent or not resume-eligible (#6)."""
+
+
+# A Run that already SUCCEEDED has nothing left to do, so resuming it is refused;
+# every other recorded status — a failed run, an errored/cancelled (interrupted)
+# run, even a run still marked ``running`` because it was killed mid-flight — has
+# incomplete work and IS resumable. Eligibility lives here so the entry point and
+# the CLI share one rule.
+_NON_RESUMABLE_RUN_STATUSES = frozenset({"succeeded"})
+
+
+def is_resumable(run_status: str | None) -> bool:
+    """Whether a Run with this recorded status can be resumed (#6).
+
+    ``None`` (an unknown Run) is not resumable; a ``succeeded`` Run is not (nothing
+    to do); any other terminal/interrupted status is.
+    """
+    return run_status is not None and run_status not in _NON_RESUMABLE_RUN_STATUSES
+
+
+def _load_resume_workflow(run_dir: Path, registry: AdapterRegistry) -> Workflow:
+    """Reconstruct and re-validate the Workflow from a run directory's snapshot (#6).
+
+    The snapshot stores ``Workflow.model_dump(mode="json")``; re-validating it
+    through the model re-applies every invariant before re-execution. The Workflow
+    is re-validated against the live registry's adapter names, since the snapshot
+    cannot record adapters injected at run time — so a run that used a custom
+    Adapter resumes only when the same registry is supplied (default mock/builtin
+    adapters round-trip with no registry argument).
+    """
+    snapshot = json.loads((run_dir / "workflow.normalized.json").read_text(encoding="utf-8"))
+    return Workflow.model_validate(
+        snapshot["workflow"], context={"known_adapters": registry.names}
+    )
+
+
+async def resume_run(
+    run_id: str, runs_root: Path, registry: AdapterRegistry | None = None
+) -> RunResult:
+    """Resume an interrupted or failed Run, re-running only its incomplete Nodes (#6).
+
+    Reopens the EXISTING run directory ``runs_root/<run_id>`` (a ``ResumeError`` if
+    absent or if the Run already succeeded), reconstructs the Workflow from the
+    persisted snapshot, and classifies each Node from prior State: a ``succeeded``
+    Node is seeded satisfied so its dependents can run WITHOUT re-running it, while
+    every other Node — failed, errored, timed_out, skipped, left ``running`` when
+    interrupted, or never started — is eligible to (re-)run. A re-run Node
+    continues its Attempt numbering from ``max prior attempt + 1`` so it never
+    collides with an Attempt already in State. The SAME run id, run directory,
+    State, and append-only Events trace are reused; the Run row flips back to
+    ``running`` and a ``run_resumed`` marker Event is appended, then the Run
+    finalizes to its new terminal status exactly as a fresh Run does.
+    """
+    run_dir = runs_root / run_id
+    if not run_dir.is_dir():
+        raise ResumeError(f"no run directory for run id {run_id!r} under {runs_root}")
+
+    resolved_registry = registry or AdapterRegistry()
+    workflow = _load_resume_workflow(run_dir, resolved_registry)
+    events = EventLog(run_dir / "events.jsonl", run_id=run_id)
+
+    with StateStore(run_dir / "state.sqlite") as state:
+        prior_status = state.run_status(run_id)
+        if not is_resumable(prior_status):
+            raise ResumeError(
+                f"run {run_id!r} is not resumable (status: {prior_status}); "
+                f"only an interrupted or failed run can be resumed"
+            )
+        node_statuses = state.node_statuses(run_id)
+        max_attempts = state.max_attempt_per_node(run_id)
+        # A `succeeded` Node is done; every other recorded Node is re-run. A re-run
+        # Node continues numbering past its recorded Attempts so the attempt PK
+        # never collides; its row already exists, so it is seeded `started` to flip
+        # to running rather than re-INSERT. A Node with no row at all (never
+        # started) starts fresh at Attempt 1 and INSERTs its row normally.
+        satisfied = {
+            node_id: status for node_id, status in node_statuses.items() if status == "succeeded"
+        }
+        attempt_seed = {
+            node_id: max_attempts.get(node_id, 0) + 1
+            for node_id in node_statuses
+            if node_id not in satisfied
+        }
+        started_seed = {node_id for node_id in node_statuses if node_id not in satisfied}
+
+        state.record_run_running(run_id=run_id)
+        events.append("run_resumed", {"workflow_name": workflow.name})
+        scheduler = _Scheduler(
+            workflow,
+            state,
+            events,
+            run_id,
+            resolved_registry,
+            satisfied_seed=satisfied,
+            attempt_seed=attempt_seed,
+            started_seed=started_seed,
+        )
+        return await _drive_scheduler(scheduler, state, events, run_id)

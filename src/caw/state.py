@@ -78,6 +78,19 @@ class StateStore:
             (status, finished_at, run_id),
         )
 
+    def record_run_running(self, run_id: str) -> None:
+        """Flip a finished Run row back to ``running`` for a resume (#6).
+
+        A resume reuses the same Run row; setting it ``running`` and clearing the
+        prior ``finished_at`` / ``error`` reflects that the Run is in flight again,
+        so the row's final state after the resume is the resumed outcome, not a
+        stale mix of the interrupted run's terminal fields.
+        """
+        self._execute(
+            "UPDATE run SET status = 'running', finished_at = NULL, error = NULL WHERE run_id = ?",
+            (run_id,),
+        )
+
     def record_run_errored(self, run_id: str, error: str, finished_at: str) -> None:
         self._execute(
             "UPDATE run SET status = 'errored', error = ?, finished_at = ? WHERE run_id = ?",

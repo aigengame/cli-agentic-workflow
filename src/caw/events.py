@@ -6,13 +6,36 @@ from pathlib import Path
 from typing import Any
 
 
+def _last_seq(path: Path) -> int:
+    """The highest ``seq`` already recorded in an Events file, or 0 if none.
+
+    A fresh Run starts from 0; a resume reads the prior maximum so its first
+    appended Event is ``last + 1`` and the trace stays strictly increasing. A
+    missing or empty file (a fresh Run) has no Events, hence 0.
+    """
+    if not path.exists():
+        return 0
+    last = 0
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            last = json.loads(line)["seq"]
+    return int(last)
+
+
 class EventLog:
-    """Appends Events for one Run to its events.jsonl file."""
+    """Appends Events for one Run to its events.jsonl file.
+
+    The sequence numbers are strictly increasing within the file, which is the
+    append-only trace's ordering invariant. A resume reopens an EXISTING log and
+    continues that sequence past the last recorded Event (#6), so the resumed
+    Events extend the same monotonic trace rather than restarting at 1 and
+    colliding with the prior run's numbers.
+    """
 
     def __init__(self, path: Path, run_id: str) -> None:
         self._path = path
         self._run_id = run_id
-        self._seq = 0
+        self._seq = _last_seq(path)
         path.touch()
 
     def append(self, event_type: str, data: dict[str, Any]) -> None:
