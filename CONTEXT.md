@@ -47,7 +47,8 @@ _Avoid_: AST
 **Node**:
 A unit of work in a workflow, such as invoking an agent, running a shell command,
 transforming or classifying data, verifying or synthesizing results, reporting artifacts,
-or pausing for human approval.
+or pausing for human approval. A Node carries an optional `when` Predicate (the sole
+conditional gate) and a `join` policy (`all` by default, or `any`).
 _Avoid_: step, task, stage
 
 **Edge**:
@@ -59,6 +60,14 @@ _Avoid_: transition, link
 The declared schema that a Node's normalized output must satisfy, validated by the kernel
 when the node completes and before dependents run.
 _Avoid_: output schema, result type
+
+**Predicate**:
+The boolean expression a Node's `when` evaluates to decide whether the Node runs; the sole
+conditional mechanism (Edges carry no conditions). It is a composable structured algebra,
+not an expression string: an atomic leaf (a reference to one field of an upstream Node's
+output, an operator, and a value) combined recursively by `all_of` / `any_of` / `not`. A
+false Predicate skips the Node. See ADR 0007.
+_Avoid_: condition, expression, rule, filter
 
 ### Run and State
 
@@ -111,7 +120,11 @@ A linear composition of nodes.
 _Avoid_: chain, sequence
 
 **Parallel**:
-A composition that runs independent branches concurrently and joins their results.
+A composition that runs independent branches concurrently and joins their results. A
+joining Node's `join` policy decides how it tolerates a SKIPPED branch: `all` (the default)
+skips the join if any branch skipped; `any` runs the join as long as at least one branch
+succeeded, and skips it only when every branch skipped. A FAILED branch blocks the join
+regardless of policy — join tolerates skips, never failures (ADR 0007).
 _Avoid_: fork-join
 
 **Await**:
