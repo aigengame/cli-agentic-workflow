@@ -7,7 +7,7 @@ import os
 import secrets
 import signal
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -78,6 +78,12 @@ class NodeResult:
     # The Adapter that ran an agent Node, threaded so a failure message can name
     # it (#6.5); ``None`` for a shell Node, which has no Adapter.
     adapter: str | None = None
+    # The Attempt NUMBER this result represents, stamped by the scheduler when the
+    # result becomes the Node's terminal outcome (#6). The runner cannot know it
+    # (retry bookkeeping is the scheduler's), so it defaults to 1 and the
+    # scheduler overrides it for a retried Node so the report names the real
+    # Attempt rather than a misleading "attempt 1".
+    attempt: int = 1
 
     @property
     def succeeded(self) -> bool:
@@ -541,28 +547,29 @@ class _Scheduler:
         the #4 branch-failure semantics exactly.
         """
         self._record_attempt(node, result)
-        if result.succeeded:
+        terminal = replace(result, attempt=self._attempt[node.id])
+        if terminal.succeeded:
             self._state.record_node_finished(
-                run_id=self._run_id, node_id=node.id, status=result.status
+                run_id=self._run_id, node_id=node.id, status=terminal.status
             )
-            self._results.append(result)
+            self._results.append(terminal)
             self._on_success(node)
             return
-        if result.retryable and self._retries_remaining(node):
+        if terminal.retryable and self._retries_remaining(node):
             self._attempt[node.id] += 1
             self._events.append(
                 "node_retrying",
                 {
                     "node_id": node.id,
                     "next_attempt": self._attempt[node.id],
-                    "failure_kind": result.failure_kind,
+                    "failure_kind": terminal.failure_kind,
                 },
             )
             return
         self._state.record_node_finished(
-            run_id=self._run_id, node_id=node.id, status=result.status
+            run_id=self._run_id, node_id=node.id, status=terminal.status
         )
-        self._results.append(result)
+        self._results.append(terminal)
         self._skip_transitive_dependents(node)
 
     def _on_success(self, node: Node) -> None:
@@ -591,6 +598,16 @@ class _Scheduler:
             queue.extend(self._dependents[node_id])
 
     async def run(self) -> RunResult:
+        """Drive the readiness loop to completion and return the Run's outcome.
+
+        Launches ready Nodes up to the concurrency limit, then on each completion
+        batch records every finished Attempt (routing it through the retry loop in
+        ``_handle_result``) BEFORE propagating any raise — so a peer that merely
+        exited non-zero still skips its dependents even when a sibling in the same
+        batch crashes the Run (#54). On any raise the in-flight Attempts are
+        drained (subprocesses killed) and the exception re-raised for crash
+        finalization; otherwise the accumulated results form the RunResult.
+        """
         self._launch_ready()
         try:
             while self._in_flight:
@@ -640,7 +657,7 @@ class _Scheduler:
             if task.done() and not task.cancelled() and task.exception() is None:
                 self._in_flight.pop(task, None)
                 self._record_finished(node, task.result())
-                self._results.append(task.result())
+                self._results.append(replace(task.result(), attempt=self._attempt[node.id]))
         for task in list(self._in_flight):
             task.cancel()
         for task in list(self._in_flight):

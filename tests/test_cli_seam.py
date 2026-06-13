@@ -461,6 +461,33 @@ def test_resume_an_unknown_run_id_is_refused_with_one_error_line(
     assert "no-such-run" in lines[0], "the error names the unknown run id"
 
 
+def test_run_reports_the_real_attempt_number_after_a_retry(
+    write_workflow_data: Callable[[dict[str, Any]], Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The run summary names the Attempt a Node actually finished on, not a
+    # hardcoded "attempt 1" (#6): a node that fails once then succeeds reports
+    # "attempt 2", so a reader sees the retry happened.
+    marker = tmp_path / "marker"
+    command = f"if [ -e {marker} ]; then exit 0; else touch {marker}; exit 7; fi"
+    workflow_file = write_workflow_data(
+        {
+            "name": "sample",
+            "version": 1,
+            "nodes": [
+                {"id": "flaky", "kind": "shell", "retries": 1, "inputs": {"command": command}}
+            ],
+        }
+    )
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["run", str(workflow_file)])
+
+    assert result.exit_code == 0, result.output
+    assert "node flaky attempt 2 exited 0" in result.output, "the report names the real attempt"
+
+
 def test_run_failure_message_names_the_workflow_file_node_id_and_adapter(
     write_workflow_data: Callable[[dict[str, Any]], Path],
     tmp_path: Path,

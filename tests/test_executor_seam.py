@@ -114,6 +114,10 @@ async def test_a_node_with_retries_reattempts_on_failure_and_records_each_attemp
     assert [(a["attempt"], a["exit_status"]) for a in attempts] == [(1, 7), (2, 0)], (
         "both attempts are recorded: attempt 1 failed (exit 7), attempt 2 succeeded"
     )
+    (terminal,) = result.node_results
+    assert terminal.attempt == 2, (
+        "the terminal NodeResult names the real attempt number, not a misleading 1"
+    )
 
 
 @pytest.mark.asyncio

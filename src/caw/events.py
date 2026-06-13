@@ -12,14 +12,23 @@ def _last_seq(path: Path) -> int:
     A fresh Run starts from 0; a resume reads the prior maximum so its first
     appended Event is ``last + 1`` and the trace stays strictly increasing. A
     missing or empty file (a fresh Run) has no Events, hence 0.
+
+    A hard kill can leave a half-written trailing line (the append is not atomic),
+    so a line that does not parse as a complete Event record is skipped rather than
+    crashing the resume that is meant to recover from exactly such an interruption;
+    the last COMPLETE record's ``seq`` is authoritative.
     """
     if not path.exists():
         return 0
     last = 0
     for line in path.read_text(encoding="utf-8").splitlines():
-        if line.strip():
-            last = json.loads(line)["seq"]
-    return int(last)
+        if not line.strip():
+            continue
+        try:
+            last = int(json.loads(line)["seq"])
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+            continue
+    return last
 
 
 class EventLog:

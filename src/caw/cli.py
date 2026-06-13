@@ -155,7 +155,10 @@ def _report_and_exit(result: RunResult, workflow_label: str) -> None:
     both. A failed Run exits 1; a succeeded Run returns 0 by falling through.
     """
     for node_result in result.node_results:
-        typer.echo(f"node {node_result.node_id} attempt 1 exited {node_result.exit_status}")
+        typer.echo(
+            f"node {node_result.node_id} attempt {node_result.attempt} "
+            f"exited {node_result.exit_status}"
+        )
         if not node_result.succeeded:
             typer.echo(_failure_line(workflow_label, node_result))
             if node_result.stderr:
