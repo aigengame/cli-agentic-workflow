@@ -12,6 +12,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from pydantic import ValidationError
+
 from caw.adapter import AdapterRegistry, AgentInvocation
 from caw.contract import OutputContractError, validate_output_contract
 from caw.events import EventLog
@@ -764,6 +766,17 @@ def is_resumable(run_status: str | None) -> bool:
     return run_status is not None and run_status not in _NON_RESUMABLE_RUN_STATUSES
 
 
+def _first_validation_error(exc: ValidationError) -> str:
+    """The first error's field path and message from a pydantic ValidationError (#70).
+
+    Used to fold a snapshot re-validation failure into an actionable ``ResumeError``
+    message rather than leaking pydantic's multi-line error dump to the caller.
+    """
+    first = exc.errors()[0]
+    location = ".".join(str(part) for part in first["loc"]) or "<workflow>"
+    return f"{location}: {first['msg']}"
+
+
 def _load_resume_workflow(run_dir: Path, registry: AdapterRegistry) -> Workflow:
     """Reconstruct and re-validate the Workflow from a run directory's snapshot (#6).
 
@@ -773,11 +786,45 @@ def _load_resume_workflow(run_dir: Path, registry: AdapterRegistry) -> Workflow:
     cannot record adapters injected at run time — so a run that used a custom
     Adapter resumes only when the same registry is supplied (default mock/builtin
     adapters round-trip with no registry argument).
+
+    Snapshot integrity is verified before re-execution (#70): the snapshot persists
+    the definition's ``definition_checksum``, and the checksum recomputed from the
+    reconstructed Workflow must match it. A mismatch means the run directory was
+    corrupted or tampered with after the run, so resume refuses with a
+    ``ResumeError`` rather than silently resuming a definition that no longer
+    matches its recorded checksum.
+
+    A re-validation failure is translated into an actionable ``ResumeError`` (#70):
+    the snapshot records an agent Node's ``adapter`` NAME but not the Adapter
+    injected at run time, so resuming a run that used a custom/non-builtin Adapter
+    without supplying the same registry re-validates against a registry that lacks
+    that name and raises a raw pydantic ``ValidationError`` ("unknown adapter").
+    Surfacing that internal error to the caller is unhelpful, so it is re-raised as
+    a ``ResumeError`` that names the problem and hints at supplying the right
+    registry.
     """
     snapshot = json.loads((run_dir / "workflow.normalized.json").read_text(encoding="utf-8"))
-    return Workflow.model_validate(
-        snapshot["workflow"], context={"known_adapters": registry.names}
-    )
+    try:
+        workflow = Workflow.model_validate(
+            snapshot["workflow"], context={"known_adapters": registry.names}
+        )
+    except ValidationError as exc:
+        raise ResumeError(
+            f"cannot reconstruct the workflow for resume from {run_dir}: "
+            f"{_first_validation_error(exc)}. If the run used a custom adapter "
+            f"injected at run time, resume with the same registry supplied "
+            f"(known adapters: {', '.join(sorted(registry.names)) or '<none>'})"
+        ) from exc
+    recomputed = definition_checksum(workflow)
+    stored = snapshot["definition_checksum"]
+    if recomputed != stored:
+        raise ResumeError(
+            f"run directory {run_dir} has a tampered or corrupted workflow snapshot: "
+            f"recomputed definition_checksum {recomputed} does not match the stored "
+            f"checksum {stored}; refusing to resume a definition that no longer "
+            f"matches its recorded checksum"
+        )
+    return workflow
 
 
 async def resume_run(
