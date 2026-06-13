@@ -1,23 +1,36 @@
 """The caw command-line interface.
 
-Exit code contract of `caw run`:
+Exit code contract:
 
-- 0: the Run succeeded
-- 1: the Run finished with a failed Node
-- 2: config error (unreadable file or invalid workflow definition)
+- 0: success (`caw run`: the Run succeeded; `caw validate`: the workflow
+  is valid; `caw graph`: the plan was rendered)
+- 1: the Run finished with a failed Node (`caw run` only)
+- 2: config error (unreadable file or invalid workflow definition);
+  config errors print exactly one `error:` line
 - 3: infrastructure error (e.g. unwritable runs root, State database
-  failure) — the Run could not be executed or completed
+  failure) — the Run could not be executed or completed (`caw run` only)
+
+Carve-out: command-line usage errors (unknown options, invalid option
+values) also exit 2, but render the framework's multi-line usage message
+without an `error:` prefix. Only workflow config errors are guaranteed
+the single `error:` line.
+
+`caw validate` and `caw graph` never execute anything: no run directory
+is created and no subprocess is spawned.
 """
 
 import asyncio
+import json
 import sqlite3
+from enum import StrEnum
 from pathlib import Path
+from typing import Annotated, Any
 
 import typer
 
 from caw.config import WorkflowConfigError, load_workflow_file
 from caw.executor import NodeResult, execute_run
-from caw.model import normalize_workflow
+from caw.model import Workflow, execution_order, normalize_workflow
 
 app = typer.Typer(
     name="caw",
@@ -42,15 +55,74 @@ def main() -> None:
     """caw: run explicit, inspectable, repeatable workflows over agent CLIs."""
 
 
-@app.command()
-def run(workflow_file: Path) -> None:
-    """Run a workflow file and print a plain-text result."""
+def _load_normalized_workflow(workflow_file: Path) -> Workflow:
+    """Load and normalize a workflow file, or exit 2 with one `error:` line."""
     try:
         raw = load_workflow_file(workflow_file)
-        workflow = normalize_workflow(raw, source=str(workflow_file))
+        return normalize_workflow(raw, source=str(workflow_file))
     except WorkflowConfigError as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=2) from exc
+
+
+@app.command()
+def validate(workflow_file: Path) -> None:
+    """Validate a workflow file without executing anything."""
+    workflow = _load_normalized_workflow(workflow_file)
+    typer.echo(f"workflow {workflow_file} is valid ({len(workflow.nodes)} nodes)")
+
+
+class GraphFormat(StrEnum):
+    """Output formats of `caw graph`."""
+
+    text = "text"
+    json = "json"
+
+
+def _json_plan(workflow: Workflow) -> dict[str, Any]:
+    """The machine-readable plan: nodes in declaration order, edges, topological order.
+
+    "topological_order" is a topological linearization of the dependency graph
+    with declaration order breaking ties among ready nodes — not a promise that
+    nodes execute strictly sequentially (parallel scheduling is issue #4).
+    """
+    return {
+        "workflow": workflow.name,
+        "nodes": [
+            {"id": node.id, "kind": node.kind, "needs": list(node.needs)}
+            for node in workflow.nodes
+        ],
+        "edges": [
+            {"from": dependency, "to": node.id}
+            for node in workflow.nodes
+            for dependency in node.needs
+        ],
+        "topological_order": [node.id for node in execution_order(workflow)],
+    }
+
+
+@app.command()
+def graph(
+    workflow_file: Path,
+    format: Annotated[
+        GraphFormat, typer.Option(help="Render the plan as human-readable text or as JSON.")
+    ] = GraphFormat.text,
+) -> None:
+    """Render the planned execution graph of a workflow file without executing it."""
+    workflow = _load_normalized_workflow(workflow_file)
+    if format is GraphFormat.json:
+        typer.echo(json.dumps(_json_plan(workflow), indent=2))
+        return
+    typer.echo(f"workflow {workflow.name}: {len(workflow.nodes)} nodes")
+    for position, node in enumerate(execution_order(workflow), start=1):
+        needs = f"  (needs: {', '.join(node.needs)})" if node.needs else ""
+        typer.echo(f"  {position}. {node.id}{needs}")
+
+
+@app.command()
+def run(workflow_file: Path) -> None:
+    """Run a workflow file and print a plain-text result."""
+    workflow = _load_normalized_workflow(workflow_file)
     runs_root = Path.cwd() / ".caw" / "runs"
     try:
         result = asyncio.run(execute_run(workflow, runs_root))

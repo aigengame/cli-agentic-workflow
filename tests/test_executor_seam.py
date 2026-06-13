@@ -16,16 +16,23 @@ import pytest
 from caw.executor import execute_run
 from caw.model import Workflow, normalize_workflow
 
+ShellNodeSpec = str | tuple[str, str, list[str]]
 
-def shell_workflow(*commands: str) -> Workflow:
-    raw: dict[str, Any] = {
-        "name": "sample",
-        "version": 1,
-        "nodes": [
-            {"id": f"node{index}", "kind": "shell", "inputs": {"command": command}}
-            for index, command in enumerate(commands, start=1)
-        ],
-    }
+
+def shell_workflow(*nodes: ShellNodeSpec) -> Workflow:
+    """Build a shell Workflow from node specs.
+
+    A bare command string becomes an auto-numbered ``nodeN`` with no needs; a
+    ``(id, command, needs)`` triple expresses an explicit id and dependency
+    edges, so dependency-shaped tests need no inline raw dicts.
+    """
+    raw_nodes: list[dict[str, Any]] = []
+    for index, spec in enumerate(nodes, start=1):
+        node_id, command, needs = (f"node{index}", spec, []) if isinstance(spec, str) else spec
+        raw_nodes.append(
+            {"id": node_id, "kind": "shell", "needs": needs, "inputs": {"command": command}}
+        )
+    raw: dict[str, Any] = {"name": "sample", "version": 1, "nodes": raw_nodes}
     return normalize_workflow(raw, source="<test>")
 
 
@@ -47,6 +54,65 @@ def state_rows(run_dir: Path, query: str) -> list[dict[str, Any]]:
 def read_events(run_dir: Path) -> list[dict[str, Any]]:
     lines = (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
     return [json.loads(line) for line in lines]
+
+
+@pytest.mark.asyncio
+async def test_run_executes_nodes_in_dependency_order_not_declaration_order(
+    tmp_path: Path,
+) -> None:
+    log = tmp_path / "order.log"
+    workflow = shell_workflow(
+        ("second", f"echo second >> {log}", ["first"]),
+        ("first", f"echo first >> {log}", []),
+    )
+
+    result = await execute_run(workflow, tmp_path / "runs")
+
+    assert result.succeeded
+    assert log.read_text(encoding="utf-8").split() == ["first", "second"]
+
+
+@pytest.mark.asyncio
+async def test_a_join_node_runs_only_after_both_of_its_branches_complete(
+    tmp_path: Path,
+) -> None:
+    # The durable contract this seam owns: a join runs after every branch it
+    # needs has completed. It deliberately does NOT assert a strict total
+    # completion order between the independent branches — that is the order
+    # function's declaration-order tie-break (pinned in tests/test_model.py),
+    # and parallel scheduling (#4) may legitimately interleave the branches.
+    log = tmp_path / "order.log"
+    workflow = shell_workflow(
+        ("join", f"echo join >> {log}", ["left", "right"]),
+        ("left", f"echo left >> {log}", []),
+        ("right", f"echo right >> {log}", []),
+    )
+
+    result = await execute_run(workflow, tmp_path / "runs")
+
+    assert result.succeeded
+    completions = log.read_text(encoding="utf-8").split()
+    assert set(completions) == {"left", "right", "join"}
+    assert completions.index("join") > completions.index("left")
+    assert completions.index("join") > completions.index("right")
+
+
+@pytest.mark.asyncio
+async def test_nodes_depending_on_a_failed_node_never_run(tmp_path: Path) -> None:
+    # Sequential Pipeline semantics: a node failure stops the run (issue #26),
+    # which in particular guarantees that transitive dependents of the failed
+    # node are never attempted.
+    marker = tmp_path / "deployed.txt"
+    workflow = shell_workflow(
+        ("build", "exit 7", []),
+        ("deploy", f"touch {marker}", ["build"]),
+    )
+
+    result = await execute_run(workflow, tmp_path / "runs")
+
+    assert not result.succeeded
+    assert not marker.exists(), "a dependent of a failed node never runs"
+    assert [node_result.node_id for node_result in result.node_results] == ["build"]
 
 
 def test_stdin_reading_node_completes_instead_of_hanging_the_run(
