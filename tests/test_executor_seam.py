@@ -13,6 +13,7 @@ from typing import Any
 
 import pytest
 
+from caw.adapter import Adapter, AdapterRegistry, AgentInvocation, AgentResult
 from caw.executor import ResumeError, execute_run, resume_run
 from caw.model import Workflow, normalize_workflow
 
@@ -393,6 +394,79 @@ async def test_resuming_an_already_succeeded_run_is_refused(tmp_path: Path) -> N
 async def test_resuming_an_unknown_run_id_is_refused(tmp_path: Path) -> None:
     with pytest.raises(ResumeError, match="no run directory"):
         await resume_run("no-such-run", tmp_path / "runs")
+
+
+@pytest.mark.asyncio
+async def test_resuming_a_run_with_a_tampered_snapshot_is_refused(tmp_path: Path) -> None:
+    # Snapshot integrity on resume (#70): the run directory persists a
+    # `definition_checksum` alongside the normalized workflow. If the workflow in
+    # the snapshot is tampered with after the run, the checksum the kernel
+    # recomputes from the reconstructed Workflow no longer matches the stored one,
+    # so resume must REFUSE with a clear ResumeError rather than silently resuming
+    # a corrupted definition. The first run fails (so it is resume-eligible), then
+    # the snapshot's workflow is mutated WITHOUT updating the stored checksum.
+    runs_root = tmp_path / "runs"
+    workflow = shell_workflow("exit 7")
+    first = await execute_run(workflow, runs_root)
+    assert not first.succeeded, "the first run fails, so it is resume-eligible"
+
+    run_dir = single_run_dir(runs_root)
+    snapshot_path = run_dir / "workflow.normalized.json"
+    snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    snapshot["workflow"]["name"] = "tampered"
+    snapshot_path.write_text(json.dumps(snapshot, indent=2) + "\n", encoding="utf-8")
+
+    with pytest.raises(ResumeError, match="checksum"):
+        await resume_run(first.run_id, runs_root)
+
+
+class FailingCustomAdapter(Adapter):
+    """A test-only injected Adapter that always fails, so its run is resume-eligible.
+
+    Stands in for a custom/real-CLI Adapter (#9 / #11) that is supplied at run time
+    via a populated registry but is NOT a built-in adapter name — the trigger for
+    the AC2 resume case.
+    """
+
+    async def invoke(self, invocation: AgentInvocation) -> AgentResult:
+        return AgentResult(exit_status=7, stderr="custom adapter failed")
+
+
+@pytest.mark.asyncio
+async def test_resuming_a_run_whose_adapter_is_absent_from_the_registry_is_refused(
+    tmp_path: Path,
+) -> None:
+    # Custom-adapter resume (#70): a run that used an injected (non-builtin)
+    # Adapter persists that adapter's NAME in its snapshot but cannot persist the
+    # Adapter itself. Resuming WITHOUT supplying the same registry re-validates the
+    # snapshot against the supplied registry's known adapters — which lack the
+    # custom name — so the model raises a pydantic ValidationError ("unknown
+    # adapter"). Resume must translate that into an actionable ResumeError naming
+    # the missing adapter and hinting to supply the right registry, never leaking a
+    # raw ValidationError to the caller. The first run uses a `custom` adapter and
+    # fails (so it is resume-eligible); the resume omits the registry.
+    runs_root = tmp_path / "runs"
+    registry = AdapterRegistry({"custom": FailingCustomAdapter()})
+    raw: dict[str, Any] = {
+        "name": "sample",
+        "version": 1,
+        "nodes": [
+            {
+                "id": "agent",
+                "kind": "agent",
+                "needs": [],
+                "inputs": {"adapter": "custom", "prompt": "do it"},
+            }
+        ],
+    }
+    workflow = normalize_workflow(raw, source="<test>", known_adapters=frozenset({"custom"}))
+    first = await execute_run(workflow, runs_root, registry=registry)
+    assert not first.succeeded, "the first run fails, so it is resume-eligible"
+
+    # Resuming without the custom adapter's registry must surface a clean,
+    # actionable ResumeError, not a raw pydantic ValidationError.
+    with pytest.raises(ResumeError, match="custom"):
+        await resume_run(first.run_id, runs_root)
 
 
 @pytest.mark.asyncio
