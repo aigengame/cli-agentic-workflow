@@ -268,3 +268,41 @@ async def test_non_zero_exit_with_schema_does_not_attempt_to_parse_structured_ou
     assert result.exit_status == 2
     assert result.structured_output is None
     assert result.stderr == "boom"
+
+
+@pytest.mark.asyncio
+async def test_capability_check_records_the_cli_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The capability check probes `claude --version` and records the version. It is
+    # adapter infrastructure (not a node invocation), so it may use the ambient
+    # environment to locate and run the CLI. The version is adapter-local — returned
+    # here, never persisted to State (#79 carve-out).
+    captured = patch_spawn(monkeypatch, FakeProcess(0, stdout=b"2.1.177 (Claude Code)\n"))
+    adapter = ClaudePrintAdapter()
+
+    version = await adapter.capability_check()
+
+    assert version == "2.1.177 (Claude Code)"
+    argv = captured["args"]
+    assert isinstance(argv, tuple)
+    assert argv == ("claude", "--version")
+    # Ambient environment: the probe does not pass a filtered env=... allow-list,
+    # so it can locate/run the CLI like any infrastructure command.
+    assert captured["env"] is None
+
+
+@pytest.mark.asyncio
+async def test_capability_check_on_a_missing_cli_is_an_actionable_setup_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def raise_not_found(*args: object, **kwargs: object) -> object:
+        raise FileNotFoundError(2, "No such file or directory", "claude")
+
+    monkeypatch.setattr("caw.claude_print.asyncio.create_subprocess_exec", raise_not_found)
+    adapter = ClaudePrintAdapter()
+
+    with pytest.raises(AdapterError) as excinfo:
+        await adapter.capability_check()
+
+    assert "install" in str(excinfo.value).lower()

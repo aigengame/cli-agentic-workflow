@@ -51,6 +51,7 @@ class ClaudePrintAdapter(Adapter):
         # environment. The consequence is intentional, not a bug: running real
         # `claude` requires the workflow to declare every env var the CLI needs
         # (e.g. its auth/config vars) so they appear in invocation.env.
+        context = f"node {invocation.node_id!r} (adapter {invocation.adapter!r})"
         try:
             process = await asyncio.create_subprocess_exec(
                 *argv,
@@ -59,10 +60,7 @@ class ClaudePrintAdapter(Adapter):
                 env=dict(invocation.env),
             )
         except FileNotFoundError as exc:
-            raise AdapterError(
-                f"node {invocation.node_id!r} (adapter {invocation.adapter!r}): "
-                f"{_MISSING_CLI_HINT}"
-            ) from exc
+            raise AdapterError(f"{context}: {_MISSING_CLI_HINT}") from exc
         stdout_bytes, stderr_bytes = await process.communicate()
         stdout = stdout_bytes.decode("utf-8", errors="replace")
         stderr = stderr_bytes.decode("utf-8", errors="replace")
@@ -79,6 +77,34 @@ class ClaudePrintAdapter(Adapter):
             stderr=stderr,
             structured_output=structured_output,
         )
+
+    async def capability_check(self) -> str:
+        """Probe the installed ``claude`` CLI and return its version string.
+
+        This is adapter INFRASTRUCTURE, not a node invocation: it probes
+        ``claude --version`` using the ambient environment to locate and run the
+        CLI (no node-declared env allow-list applies, unlike :meth:`invoke`). The
+        version is returned to the caller and kept adapter-local — it is NOT
+        persisted to State (token/cost/version surfacing is carved out to #79). A
+        missing CLI surfaces the same actionable setup AdapterError as invoke.
+        """
+        try:
+            process = await asyncio.create_subprocess_exec(
+                CLAUDE_CLI,
+                "--version",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except FileNotFoundError as exc:
+            raise AdapterError(f"capability check: {_MISSING_CLI_HINT}") from exc
+        stdout_bytes, stderr_bytes = await process.communicate()
+        if process.returncode != 0:
+            stderr = stderr_bytes.decode("utf-8", errors="replace").strip()
+            raise AdapterError(
+                f"capability check: 'claude --version' exited "
+                f"{process.returncode}: {stderr or '<no stderr>'}"
+            )
+        return stdout_bytes.decode("utf-8", errors="replace").strip()
 
     @staticmethod
     def _read_schema(invocation: AgentInvocation) -> str:
