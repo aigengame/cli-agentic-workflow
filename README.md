@@ -148,7 +148,8 @@ caw report <run-id> --format markdown
 
 - Product spec: [`docs/prd/0001-cli-agentic-workflow.md`](docs/prd/0001-cli-agentic-workflow.md)
 - Architecture decisions: [`docs/adr/`](docs/adr/) — local-first kernel (0001), run-group
-  iteration (0002), asyncio executor (0003), Python stack (0004)
+  iteration (0002), asyncio executor (0003), Python stack (0004), release model (0005),
+  Adapter interface (0006)
 - Domain vocabulary: [`CONTEXT.md`](CONTEXT.md)
 - CI and release flow: [`docs/release-flow.md`](docs/release-flow.md)
 
