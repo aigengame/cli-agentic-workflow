@@ -178,6 +178,125 @@ def _reprefix_inputs(error: Any) -> Any:
     return relocated
 
 
+# The atomic data sources a predicate leaf may read off an upstream Node's
+# normalized output (#7). They mirror NodeResult.normalized_output's keys, so a
+# `when` reads exactly what State persists: the textual `stdout`, the integer
+# `exit_status`, or the agent Node's parsed `structured_output`.
+PredicateField = Literal["stdout", "exit_status", "structured_output"]
+
+# The comparison operators v0.1 implements (#7). The shape admits more later
+# (not_equals, gt, lt, matches, in) with no restructuring; only this Literal
+# changes. `contains` is a substring test and is valid only on a string field.
+PredicateOp = Literal["equals", "contains"]
+
+# The only field whose value is guaranteed a string, so the only field `contains`
+# (a substring test) is valid against (#7). `exit_status` is an integer and
+# `structured_output` is arbitrary parsed JSON, so `contains` on either is a
+# config error rather than a meaningless run-time comparison.
+_STRING_PREDICATE_FIELDS = frozenset({"stdout"})
+
+
+class PredicateRef(BaseModel):
+    """An atomic reference to one field of an upstream Node's normalized output (#7)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    node: str
+    field: PredicateField
+
+    _node_non_blank = field_validator("node")(_require_non_blank)
+
+
+class Predicate(BaseModel):
+    """A node-level `when` predicate: a recursive, composable boolean algebra (#7).
+
+    A predicate is EXACTLY ONE shape — a leaf XOR one combinator:
+
+    - leaf: a ``ref`` to one upstream field, an ``op``, and a ``value`` (one
+      reference -> comparison, the indivisible atom);
+    - ``all_of`` / ``any_of``: a list of sub-predicates combined by AND / OR;
+    - ``not``: a single negated sub-predicate (the Python attribute is ``not_``
+      since ``not`` is a keyword; the authored field stays ``not``).
+
+    Combinators nest arbitrarily, so the algebra is composable and extensible.
+    CONTEXT.md makes ``when`` the sole conditional mechanism — Edges carry no
+    conditions — so the predicate is modelled structurally (no string eval, no
+    parser surface).
+    """
+
+    # `not` is reserved in Python, so the attribute is `not_` while the authored
+    # and SERIALIZED field stays `not`. ``serialize_by_alias`` makes the generic
+    # ``model_dump(mode="json")`` (used by the snapshot and definition_checksum)
+    # emit ``not`` with no per-call ``by_alias`` flag, and ``populate_by_name``
+    # lets a re-validation of that dump (resume reconstructs the Workflow with
+    # ``Workflow.model_validate``) accept either spelling — so the predicate
+    # round-trips through the snapshot losslessly.
+    model_config = ConfigDict(
+        frozen=True, extra="forbid", populate_by_name=True, serialize_by_alias=True
+    )
+
+    # Leaf fields.
+    ref: PredicateRef | None = None
+    op: PredicateOp | None = None
+    value: str | int | bool | None = None
+    # Combinator fields. `not` is reserved in Python, so the attribute is `not_`
+    # while the authored/serialized field stays `not` (alias).
+    all_of: tuple["Predicate", ...] | None = None
+    any_of: tuple["Predicate", ...] | None = None
+    not_: "Predicate | None" = Field(default=None, alias="not")
+
+    @model_validator(mode="after")
+    def _exactly_one_shape(self) -> "Predicate":
+        # A predicate is EXACTLY one shape — a leaf XOR one combinator (#7). A
+        # leaf is identified by `ref` and must be complete (`ref` AND `op`); each
+        # combinator is identified by its own field. Mixing shapes, declaring two
+        # combinators, or an empty/incomplete predicate is a config error, so a
+        # `when` always denotes one unambiguous boolean expression.
+        is_leaf = self.ref is not None
+        combinators = [
+            name
+            for name, present in (
+                ("all_of", self.all_of is not None),
+                ("any_of", self.any_of is not None),
+                ("not", self.not_ is not None),
+            )
+            if present
+        ]
+        shapes = int(is_leaf) + len(combinators)
+        if shapes != 1:
+            raise ValueError(
+                "must be exactly one of a leaf (ref/op/value), all_of, any_of, or not"
+            )
+        if is_leaf and self.op is None:
+            raise ValueError("a leaf predicate must declare both `ref` and `op`")
+        if not is_leaf and (self.op is not None or self.value is not None):
+            raise ValueError("`op`/`value` belong to a leaf predicate, not a combinator")
+        if (
+            is_leaf
+            and self.op == "contains"
+            and self.ref is not None
+            and self.ref.field not in _STRING_PREDICATE_FIELDS
+        ):
+            raise ValueError(f"`contains` is valid only on a string field, not {self.ref.field!r}")
+        return self
+
+    def leaf_refs(self) -> tuple[PredicateRef, ...]:
+        """Every leaf ``ref`` in this predicate tree, depth-first (#7).
+
+        The single source the dependency and field invariants walk: a leaf
+        contributes its own ``ref``; a combinator contributes the refs of its
+        children recursively. So a ref buried in any combinator is checked.
+        """
+        if self.ref is not None:
+            return (self.ref,)
+        refs: list[PredicateRef] = []
+        for child in (*(self.all_of or ()), *(self.any_of or ())):
+            refs.extend(child.leaf_refs())
+        if self.not_ is not None:
+            refs.extend(self.not_.leaf_refs())
+        return tuple(refs)
+
+
 class Node(BaseModel):
     """A unit of work in a Workflow; v0.1 supports shell and agent Nodes."""
 
@@ -187,6 +306,18 @@ class Node(BaseModel):
     kind: Literal["shell", "agent"]
     inputs: ShellNodeInputs | AgentNodeInputs
     needs: tuple[str, ...] = ()
+    # A node-level `when` predicate gates whether the Node runs (#7): a false
+    # predicate marks the Node `skipped` without executing it. `when` is the ONLY
+    # conditional mechanism (CONTEXT.md); it adds no Edges, so the acyclic IR
+    # (ADR 0002) stays honest.
+    when: Predicate | None = None
+    # The join policy axis (#7), separate from `when`: how this Node tolerates a
+    # SKIPPED dependency. `all` (default) is today's behavior — any skipped
+    # dependency skips this Node. `any` tolerates skipped upstream branches: the
+    # Node runs iff at least one dependency executed and succeeded, and is itself
+    # skipped only if ALL dependencies skipped. A FAILED dependency blocks
+    # dependents regardless of join policy — join tolerates skips, never failures.
+    join: Literal["all", "any"] = "all"
     # Failure-semantics policy lives per-Node (#6): `retries` counts the
     # ADDITIONAL Attempts the executor makes after the first on a retryable
     # failure, so total Attempts = retries + 1 and the default 0 keeps the
@@ -245,6 +376,21 @@ class Node(BaseModel):
     def _must_not_need_itself(self) -> "Node":
         if self.id in self.needs:
             raise ValueError(f"node {self.id!r} must not need itself")
+        return self
+
+    @model_validator(mode="after")
+    def _when_refs_must_be_dependencies(self) -> "Node":
+        # Every leaf `ref.node` in the predicate tree must be a dependency (#7):
+        # `when` reads only what is guaranteed present at evaluation time, and it
+        # adds no edges — so the IR stays acyclic (ADR 0002). A ref to a
+        # non-dependency is a config error.
+        if self.when is None:
+            return self
+        for ref in self.when.leaf_refs():
+            if ref.node not in self.needs:
+                raise ValueError(
+                    f"node {self.id!r} `when` references {ref.node!r}, which is not in its needs"
+                )
         return self
 
 

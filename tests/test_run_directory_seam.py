@@ -84,6 +84,11 @@ def test_snapshot_carries_a_definition_checksum_over_the_normalized_workflow(
         # under; the defaults round-trip explicitly.
         "retries": 0,
         "timeout": None,
+        # The node-level `when` predicate and `join` policy (#7) round-trip in the
+        # snapshot too, so a resume reconstructs the SAME conditional/join
+        # behavior; the defaults (no predicate, `all` join) serialize explicitly.
+        "when": None,
+        "join": "all",
     }
     canonical = json.dumps(workflow, sort_keys=True, separators=(",", ":")).encode("utf-8")
     expected = f"sha256:{hashlib.sha256(canonical).hexdigest()}"
