@@ -186,10 +186,10 @@ def test_graph_renders_a_json_plan_with_nodes_edges_and_order(
     plan = json.loads(result.output)
     assert plan["workflow"] == "sample"
     assert plan["nodes"] == [
-        {"id": "deploy", "kind": "shell", "needs": ["test"]},
-        {"id": "build", "kind": "shell", "needs": []},
-        {"id": "test", "kind": "shell", "needs": ["build"]},
-    ], "nodes render in declaration order"
+        {"id": "deploy", "kind": "shell", "needs": ["test"], "when": None, "join": "all"},
+        {"id": "build", "kind": "shell", "needs": [], "when": None, "join": "all"},
+        {"id": "test", "kind": "shell", "needs": ["build"], "when": None, "join": "all"},
+    ], "nodes render in declaration order; unconditional nodes show when: null, join: all"
     assert plan["edges"] == [
         {"from": "test", "to": "deploy"},
         {"from": "build", "to": "test"},
@@ -231,6 +231,84 @@ def test_graph_json_plan_defaults_concurrency_when_unspecified(
 
     assert result.exit_code == 0, result.output
     assert json.loads(result.output)["concurrency"] == 4, "the plan shows the conservative default"
+
+
+def conditional_pipeline() -> dict[str, Any]:
+    """A classify-and-act pipeline whose `act` carries a `when` and a `join: any`.
+
+    Exercises the AC5 graph surfacing: a Node that gates on an upstream field and
+    tolerates skipped branches must show both its `when` predicate and its `join`
+    policy in the plan, distinctly from an ordinary unconditional Node.
+    """
+    return {
+        "name": "sample",
+        "version": 1,
+        "nodes": [
+            {"id": "classify", "kind": "shell", "inputs": {"command": "echo billing"}},
+            {
+                "id": "act",
+                "kind": "shell",
+                "needs": ["classify"],
+                "join": "any",
+                "when": {
+                    "ref": {"node": "classify", "field": "stdout"},
+                    "op": "equals",
+                    "value": "shipping",
+                },
+                "inputs": {"command": "echo act"},
+            },
+        ],
+    }
+
+
+def test_graph_json_plan_surfaces_each_nodes_when_predicate_and_join_policy(
+    write_workflow_data: Callable[[dict[str, Any]], Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # AC5 (#7), machine-readable: the JSON plan must expose each Node's `when`
+    # predicate and `join` policy so a consumer can see the conditional structure
+    # without running the workflow. The conditional `act` shows its predicate (the
+    # serialized algebra, round-tripping the `not`/leaf shape) and `join: any`; the
+    # unconditional `classify` shows `when: null` and the default `join: all`.
+    workflow_file = write_workflow_data(conditional_pipeline())
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["graph", str(workflow_file), "--format", "json"])
+
+    assert result.exit_code == 0, result.output
+    nodes = {node["id"]: node for node in json.loads(result.output)["nodes"]}
+    assert nodes["classify"]["when"] is None, "an unconditional node has no predicate"
+    assert nodes["classify"]["join"] == "all", "join defaults to all in the plan"
+    assert nodes["act"]["join"] == "any", "the tolerant join policy is surfaced"
+    assert nodes["act"]["when"] == {
+        "ref": {"node": "classify", "field": "stdout"},
+        "op": "equals",
+        "value": "shipping",
+    }, "the predicate is surfaced as the serialized algebra"
+
+
+def test_graph_text_plan_annotates_a_nodes_when_and_non_default_join(
+    write_workflow_data: Callable[[dict[str, Any]], Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # AC5 (#7), human-readable: the text plan must annotate a conditional Node so a
+    # user reading the plan sees it carries a `when` gate and a non-default `join`
+    # policy. `act` shows both annotations; an unconditional default-join node
+    # carries neither, so the annotations are additive noise-free signal.
+    workflow_file = write_workflow_data(conditional_pipeline())
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["graph", str(workflow_file)])
+
+    assert result.exit_code == 0, result.output
+    act_line = next(line for line in result.output.splitlines() if "act" in line)
+    assert "when" in act_line, "the conditional node is annotated with its `when` gate"
+    assert "join: any" in act_line, "the non-default join policy is annotated"
+    classify_line = next(line for line in result.output.splitlines() if "classify" in line)
+    assert "when" not in classify_line, "an unconditional node carries no `when` annotation"
+    assert "join" not in classify_line, "a default-join node carries no `join` annotation"
 
 
 def test_run_rejects_a_concurrency_below_one_with_a_single_error_line(
@@ -363,6 +441,59 @@ def test_run_output_lists_a_skipped_join_node_and_its_blocker(
     skipped_line = next((line for line in lines if "join" in line and "skipped" in line), None)
     assert skipped_line is not None, "the skipped join node appears in the run summary"
     assert "right" in skipped_line, "the skipped node names the branch that blocked it"
+
+
+def test_run_output_distinguishes_a_when_skip_from_a_blocked_skip(
+    write_workflow_data: Callable[[dict[str, Any]], Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # AC5 (#7): a Node skipped by a closed `when` gate must read distinctly from
+    # one withheld by a failure, and BOTH distinctly from success/failure. Here
+    # `gate` is skipped `when_false` (its own gate closed) while `downstream`,
+    # needing `gate`, is skipped `blocked`. The summary must render the when-skip
+    # without a "blocked by" phrase and the blocked-skip naming its blocker, so a
+    # user can tell a closed condition from withheld-by-failure work.
+    workflow_file = write_workflow_data(
+        {
+            "name": "sample",
+            "version": 1,
+            "nodes": [
+                {"id": "classify", "kind": "shell", "inputs": {"command": "echo billing"}},
+                {
+                    "id": "gate",
+                    "kind": "shell",
+                    "needs": ["classify"],
+                    "when": {
+                        "ref": {"node": "classify", "field": "stdout"},
+                        "op": "equals",
+                        "value": "shipping",
+                    },
+                    "inputs": {"command": "echo gate"},
+                },
+                {
+                    "id": "downstream",
+                    "kind": "shell",
+                    "needs": ["gate"],
+                    "inputs": {"command": "echo downstream"},
+                },
+            ],
+        }
+    )
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["run", str(workflow_file)])
+
+    assert result.exit_code == 0, "a benign when-skip does not fail the run"
+    lines = result.output.splitlines()
+    gate_line = next(line for line in lines if "gate" in line and "skipped" in line)
+    downstream_line = next(line for line in lines if "downstream" in line and "skipped" in line)
+    assert "when" in gate_line, "a closed-gate skip names its cause distinctly"
+    assert "blocked by" not in gate_line, "a when-skip is not a blocked-by-failure skip"
+    assert "blocked by gate" in downstream_line, "a blocked skip still names its blocker"
+    assert "succeeded" in result.output and "failed" not in result.output, (
+        "a skip reads distinctly from success and failure"
+    )
 
 
 def _run_dir_name(tmp_path: Path) -> str:

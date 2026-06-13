@@ -327,6 +327,399 @@ def test_a_non_positive_timeout_is_a_config_error() -> None:
     assert "timeout" in str(excinfo.value)
 
 
+def test_a_node_accepts_a_leaf_when_predicate_referencing_an_upstream_node() -> None:
+    # The atomic unit of the predicate algebra (#7): one reference -> comparison.
+    # A node may carry a leaf `when` whose `ref.node` is an upstream dependency;
+    # the normalized predicate round-trips on the frozen Node.
+    raw: dict[str, Any] = {
+        "name": "sample",
+        "version": 1,
+        "nodes": [
+            {"id": "classify", "kind": "shell", "inputs": {"command": "echo billing"}},
+            {
+                "id": "act",
+                "kind": "shell",
+                "needs": ["classify"],
+                "when": {
+                    "ref": {"node": "classify", "field": "stdout"},
+                    "op": "equals",
+                    "value": "billing",
+                },
+                "inputs": {"command": "echo acting"},
+            },
+        ],
+    }
+
+    workflow = normalize_workflow(raw, source="<test>")
+
+    act = workflow.nodes[1]
+    assert act.when is not None, "the node carries a `when` predicate"
+    assert act.when.ref is not None, "a leaf predicate carries a ref"
+    assert act.when.ref.node == "classify"
+    assert act.when.ref.field == "stdout"
+    assert act.when.op == "equals"
+    assert act.when.value == "billing"
+
+
+def test_a_node_accepts_all_of_any_of_and_not_combinators_nesting_leaves() -> None:
+    # Composability (#7): a predicate is recursively a leaf OR a combinator, and
+    # combinators (all_of / any_of / not) nest arbitrarily. This exercises all
+    # three combinators in one tree, with `not` wrapping a nested `any_of`.
+    raw: dict[str, Any] = {
+        "name": "sample",
+        "version": 1,
+        "nodes": [
+            {"id": "a", "kind": "shell", "inputs": {"command": "echo x"}},
+            {"id": "b", "kind": "shell", "inputs": {"command": "echo y"}},
+            {
+                "id": "gate",
+                "kind": "shell",
+                "needs": ["a", "b"],
+                "when": {
+                    "all_of": [
+                        {"ref": {"node": "a", "field": "stdout"}, "op": "equals", "value": "x"},
+                        {
+                            "not": {
+                                "any_of": [
+                                    {
+                                        "ref": {"node": "b", "field": "exit_status"},
+                                        "op": "equals",
+                                        "value": 1,
+                                    },
+                                    {
+                                        "ref": {"node": "b", "field": "stdout"},
+                                        "op": "contains",
+                                        "value": "skip",
+                                    },
+                                ]
+                            }
+                        },
+                    ]
+                },
+                "inputs": {"command": "echo gate"},
+            },
+        ],
+    }
+
+    workflow = normalize_workflow(raw, source="<test>")
+
+    gate = workflow.nodes[2]
+    assert gate.when is not None
+    assert gate.when.all_of is not None and len(gate.when.all_of) == 2
+    inner_not = gate.when.all_of[1]
+    assert inner_not.not_ is not None
+    assert inner_not.not_.any_of is not None and len(inner_not.not_.any_of) == 2
+
+
+def test_a_when_referencing_a_node_not_in_needs_is_a_config_error() -> None:
+    # The recursive validation invariant (#7): every leaf `ref.node` in the
+    # predicate tree must appear in the owning Node's `needs`, so the referenced
+    # output is guaranteed present at evaluation time and `when` adds no edges
+    # (ADR 0002). Here `act` references `classify` but does not depend on it.
+    raw: dict[str, Any] = {
+        "name": "sample",
+        "version": 1,
+        "nodes": [
+            {"id": "classify", "kind": "shell", "inputs": {"command": "echo billing"}},
+            {
+                "id": "act",
+                "kind": "shell",
+                "needs": [],
+                "when": {
+                    "ref": {"node": "classify", "field": "stdout"},
+                    "op": "equals",
+                    "value": "billing",
+                },
+                "inputs": {"command": "echo acting"},
+            },
+        ],
+    }
+
+    with pytest.raises(WorkflowConfigError) as excinfo:
+        normalize_workflow(raw, source="workflow.yaml")
+
+    message = str(excinfo.value)
+    assert "classify" in message, "the error names the referenced non-dependency"
+    assert "needs" in message, "the error names the invariant it breached"
+
+
+def test_a_when_combinator_referencing_a_node_not_in_needs_is_a_config_error() -> None:
+    # The invariant collects EVERY leaf ref in the tree, including ones nested
+    # deep inside combinators: here the offending ref hides inside an all_of/not.
+    raw: dict[str, Any] = {
+        "name": "sample",
+        "version": 1,
+        "nodes": [
+            {"id": "a", "kind": "shell", "inputs": {"command": "echo x"}},
+            {"id": "stranger", "kind": "shell", "inputs": {"command": "echo y"}},
+            {
+                "id": "gate",
+                "kind": "shell",
+                "needs": ["a"],
+                "when": {
+                    "all_of": [
+                        {"ref": {"node": "a", "field": "stdout"}, "op": "equals", "value": "x"},
+                        {
+                            "not": {
+                                "ref": {"node": "stranger", "field": "stdout"},
+                                "op": "equals",
+                                "value": "y",
+                            }
+                        },
+                    ]
+                },
+                "inputs": {"command": "echo gate"},
+            },
+        ],
+    }
+
+    with pytest.raises(WorkflowConfigError) as excinfo:
+        normalize_workflow(raw, source="workflow.yaml")
+
+    assert "stranger" in str(excinfo.value), "a ref buried in a combinator is still checked"
+
+
+def test_a_predicate_mixing_a_leaf_and_a_combinator_is_a_config_error() -> None:
+    # Shape exclusivity (#7): a predicate is EXACTLY one shape — a leaf XOR one
+    # combinator. A predicate carrying both leaf fields and a combinator is
+    # ambiguous and rejected as a config error.
+    raw: dict[str, Any] = {
+        "name": "sample",
+        "version": 1,
+        "nodes": [
+            {"id": "a", "kind": "shell", "inputs": {"command": "echo x"}},
+            {
+                "id": "gate",
+                "kind": "shell",
+                "needs": ["a"],
+                "when": {
+                    "ref": {"node": "a", "field": "stdout"},
+                    "op": "equals",
+                    "value": "x",
+                    "all_of": [
+                        {"ref": {"node": "a", "field": "stdout"}, "op": "equals", "value": "x"}
+                    ],
+                },
+                "inputs": {"command": "echo gate"},
+            },
+        ],
+    }
+
+    with pytest.raises(WorkflowConfigError) as excinfo:
+        normalize_workflow(raw, source="workflow.yaml")
+
+    assert "when" in str(excinfo.value), "the error names the malformed predicate"
+
+
+def test_an_empty_predicate_is_a_config_error() -> None:
+    # A predicate that is neither a valid leaf nor any combinator (an empty
+    # mapping) is a config error: it has no shape at all.
+    raw: dict[str, Any] = {
+        "name": "sample",
+        "version": 1,
+        "nodes": [
+            {"id": "a", "kind": "shell", "inputs": {"command": "echo x"}},
+            {
+                "id": "gate",
+                "kind": "shell",
+                "needs": ["a"],
+                "when": {},
+                "inputs": {"command": "echo gate"},
+            },
+        ],
+    }
+
+    with pytest.raises(WorkflowConfigError) as excinfo:
+        normalize_workflow(raw, source="workflow.yaml")
+
+    assert "when" in str(excinfo.value)
+
+
+def test_a_leaf_predicate_missing_op_is_a_config_error() -> None:
+    # A leaf must be complete: a `ref` with no `op` is not a valid leaf, and with
+    # no combinator either it is not exactly one shape.
+    raw: dict[str, Any] = {
+        "name": "sample",
+        "version": 1,
+        "nodes": [
+            {"id": "a", "kind": "shell", "inputs": {"command": "echo x"}},
+            {
+                "id": "gate",
+                "kind": "shell",
+                "needs": ["a"],
+                "when": {"ref": {"node": "a", "field": "stdout"}, "value": "x"},
+                "inputs": {"command": "echo gate"},
+            },
+        ],
+    }
+
+    with pytest.raises(WorkflowConfigError) as excinfo:
+        normalize_workflow(raw, source="workflow.yaml")
+
+    assert "when" in str(excinfo.value)
+
+
+def test_two_combinators_at_once_is_a_config_error() -> None:
+    # Exactly one combinator: a predicate carrying both all_of and any_of is two
+    # shapes at once, rejected.
+    raw: dict[str, Any] = {
+        "name": "sample",
+        "version": 1,
+        "nodes": [
+            {"id": "a", "kind": "shell", "inputs": {"command": "echo x"}},
+            {
+                "id": "gate",
+                "kind": "shell",
+                "needs": ["a"],
+                "when": {
+                    "all_of": [
+                        {"ref": {"node": "a", "field": "stdout"}, "op": "equals", "value": "x"}
+                    ],
+                    "any_of": [
+                        {"ref": {"node": "a", "field": "stdout"}, "op": "equals", "value": "y"}
+                    ],
+                },
+                "inputs": {"command": "echo gate"},
+            },
+        ],
+    }
+
+    with pytest.raises(WorkflowConfigError) as excinfo:
+        normalize_workflow(raw, source="workflow.yaml")
+
+    assert "when" in str(excinfo.value)
+
+
+def test_an_empty_all_of_combinator_is_a_config_error() -> None:
+    # FIX 4 (#74): an empty `all_of` is not a meaningful conjunction — it would
+    # validate (an empty tuple is `is not None`) and evaluate vacuously true,
+    # silently opening the gate. Reject it at validation time instead.
+    raw: dict[str, Any] = {
+        "name": "sample",
+        "version": 1,
+        "nodes": [
+            {"id": "a", "kind": "shell", "inputs": {"command": "echo x"}},
+            {
+                "id": "gate",
+                "kind": "shell",
+                "needs": ["a"],
+                "when": {"all_of": []},
+                "inputs": {"command": "echo gate"},
+            },
+        ],
+    }
+
+    with pytest.raises(WorkflowConfigError) as excinfo:
+        normalize_workflow(raw, source="workflow.yaml")
+
+    message = str(excinfo.value)
+    assert "all_of" in message, "the error names the empty combinator"
+
+
+def test_an_empty_any_of_combinator_is_a_config_error() -> None:
+    # FIX 4 (#74): an empty `any_of` would validate and evaluate vacuously false,
+    # silently closing the gate. Reject it at validation time.
+    raw: dict[str, Any] = {
+        "name": "sample",
+        "version": 1,
+        "nodes": [
+            {"id": "a", "kind": "shell", "inputs": {"command": "echo x"}},
+            {
+                "id": "gate",
+                "kind": "shell",
+                "needs": ["a"],
+                "when": {"any_of": []},
+                "inputs": {"command": "echo gate"},
+            },
+        ],
+    }
+
+    with pytest.raises(WorkflowConfigError) as excinfo:
+        normalize_workflow(raw, source="workflow.yaml")
+
+    message = str(excinfo.value)
+    assert "any_of" in message, "the error names the empty combinator"
+
+
+def test_contains_on_a_non_string_field_is_a_config_error() -> None:
+    # `contains` is a substring test, valid only on a string field (#7): using it
+    # against `exit_status` (an integer) is a config error, caught at validation
+    # time rather than producing a meaningless run-time comparison.
+    raw: dict[str, Any] = {
+        "name": "sample",
+        "version": 1,
+        "nodes": [
+            {"id": "a", "kind": "shell", "inputs": {"command": "echo x"}},
+            {
+                "id": "gate",
+                "kind": "shell",
+                "needs": ["a"],
+                "when": {
+                    "ref": {"node": "a", "field": "exit_status"},
+                    "op": "contains",
+                    "value": 0,
+                },
+                "inputs": {"command": "echo gate"},
+            },
+        ],
+    }
+
+    with pytest.raises(WorkflowConfigError) as excinfo:
+        normalize_workflow(raw, source="workflow.yaml")
+
+    message = str(excinfo.value)
+    assert "contains" in message, "the error names the misused operator"
+    assert "exit_status" in message, "the error names the offending field"
+
+
+def test_join_defaults_to_all_and_accepts_any() -> None:
+    # The join policy axis (#7): a Node's `join` defaults to `all` (today's
+    # behavior — any skipped dependency skips this Node) and may be set to `any`
+    # (tolerate skipped upstream branches).
+    raw: dict[str, Any] = {
+        "name": "sample",
+        "version": 1,
+        "nodes": [
+            {"id": "a", "kind": "shell", "inputs": {"command": "echo x"}},
+            {"id": "b", "kind": "shell", "inputs": {"command": "echo y"}},
+            {"id": "strict", "kind": "shell", "needs": ["a"], "inputs": {"command": "echo s"}},
+            {
+                "id": "tolerant",
+                "kind": "shell",
+                "needs": ["a", "b"],
+                "join": "any",
+                "inputs": {"command": "echo t"},
+            },
+        ],
+    }
+
+    workflow = normalize_workflow(raw, source="<test>")
+
+    by_id = {node.id: node for node in workflow.nodes}
+    assert by_id["strict"].join == "all", "join defaults to all"
+    assert by_id["tolerant"].join == "any"
+
+
+def test_an_unknown_join_policy_is_a_config_error() -> None:
+    raw: dict[str, Any] = {
+        "name": "sample",
+        "version": 1,
+        "nodes": [
+            {
+                "id": "gate",
+                "kind": "shell",
+                "join": "some",
+                "inputs": {"command": "echo gate"},
+            }
+        ],
+    }
+
+    with pytest.raises(WorkflowConfigError) as excinfo:
+        normalize_workflow(raw, source="workflow.yaml")
+
+    assert "join" in str(excinfo.value)
+
+
 def test_validation_and_ordering_scale_to_thousands_of_nodes() -> None:
     # Pattern Expanders (roadmap) compile patterns into graphs of exactly this
     # scale, and validate is sold as the fast fail-fast check. A 5,000-node

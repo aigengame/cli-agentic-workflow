@@ -26,7 +26,20 @@ from caw.model import (
     execution_order,
     workflow_snapshot,
 )
+from caw.predicate import evaluate_predicate
 from caw.state import StateStore
+
+# The named reasons a Node was skipped (#7), recorded as the skip's `cause` in
+# State and surfaced in the RunResult so a Reporter renders a closed `when` gate
+# distinctly from work withheld by a failure. A `BLOCKED` skip carries a blocker
+# (the failed Node); the others carry none.
+#   "blocked"               — a dependency failed (the failure-driven #4 skip)
+#   "when_false"            — the Node's own `when` predicate evaluated false
+#   "all_branches_skipped"  — a tolerant `join: any` Node whose every dependency
+#                             skipped (no branch executed, so nothing to join)
+SKIP_BLOCKED = "blocked"
+SKIP_WHEN_FALSE = "when_false"
+SKIP_ALL_BRANCHES_SKIPPED = "all_branches_skipped"
 
 # Error classification (#6): the terminal status of a failed Node Attempt names
 # WHY it failed, so a timeout is diagnosable as a timeout and an adapter/internal
@@ -132,18 +145,28 @@ class RunResult:
 
     ``skipped_blockers`` maps each skipped Node id to the failed Node that blocked
     it, so a Reporter can tell a user which downstream work was withheld and why.
+
+    ``skipped_causes`` names WHY each skipped Node was skipped (#7): ``blocked``
+    (a dependency failed — the failure-driven #4 skip), ``when_false`` (the
+    Node's own `when` gate closed), or ``all_branches_skipped`` (a tolerant
+    ``join: any`` Node whose every dependency skipped). A ``blocked`` skip carries
+    a ``skipped_blockers`` entry; the others carry none, so a Reporter renders a
+    closed gate distinctly from withheld-by-failure work.
     """
 
     run_id: str
     node_results: tuple[NodeResult, ...]
     skipped_node_ids: tuple[str, ...] = ()
     skipped_blockers: Mapping[str, str] = field(default_factory=dict)
+    skipped_causes: Mapping[str, str] = field(default_factory=dict)
 
     @property
     def succeeded(self) -> bool:
-        # A skipped Node is always the transitive dependent of a failed Node, so
-        # an all-succeeded `node_results` already implies nothing was skipped; the
-        # failed Node that caused the skip is itself in `node_results`.
+        # A Run fails iff an ATTEMPTED Node failed. A failure-driven (`blocked`)
+        # skip always coincides with a failed Node already in `node_results`, so
+        # it is captured here; a benign skip — a closed `when` gate or a fully
+        # skipped tolerant join — introduces no failure and so does not fail the
+        # Run (#7). Thus the success test stays "all attempted Nodes succeeded".
         return all(result.succeeded for result in self.node_results)
 
     @property
@@ -439,6 +462,7 @@ class _Scheduler:
         self._results: list[NodeResult] = []
         self._skipped: list[str] = []
         self._skipped_blockers: dict[str, str] = {}
+        self._skipped_causes: dict[str, str] = {}
         # Per-Node Attempt bookkeeping for the in-run retry loop (#6). ``_attempt``
         # is the Attempt NUMBER the next launch of a Node uses, so re-launched
         # Nodes write distinct ``attempt`` rows ((run_id, node_id, attempt) is the
@@ -449,11 +473,12 @@ class _Scheduler:
         self._attempt: dict[str, int] = dict(attempt_seed or {})
         self._started: set[str] = set(started_seed or ())
         # A resume seeds the Nodes that already SUCCEEDED in the prior Run so they
-        # are not re-run, yet their dependents become ready (#6). Decrementing
-        # indegree for each satisfied Node's dependents mirrors the on-success
-        # path; the satisfied set is treated as ``done`` by readiness so the Node
-        # itself is never launched again. The seed maps node_id -> its succeeded
-        # status, which becomes its NodeResult status in the resumed RunResult.
+        # are not re-run, yet their dependents become ready (#6). The satisfied set
+        # is treated as ``done`` by ``_ready_nodes`` so the Node itself is never
+        # launched again, and decrementing indegree for each satisfied Node's
+        # dependents mirrors the on-success path so those dependents become ready.
+        # The seed maps node_id -> its succeeded status, which becomes its
+        # NodeResult status in the resumed RunResult.
         self._satisfied: dict[str, str] = dict(satisfied_seed or {})
         for satisfied_id in self._satisfied:
             for dependent in self._dependents.get(satisfied_id, []):
@@ -478,22 +503,77 @@ class _Scheduler:
             if self._indegree[node.id] == 0 and node.id not in running and node.id not in done
         ]
 
+    def _output_of(self, node_id: str) -> dict[str, Any] | None:
+        """The normalized output a `when` predicate reads off an upstream Node (#7).
+
+        A Node this Run ran is in ``self._results`` with its in-memory
+        NodeResult; on resume a dependency may instead be a prior success seeded
+        ``satisfied`` with no in-memory result, so its output is read from State.
+        Either way the returned mapping is the persisted
+        ``{exit_status, stdout, [structured_output]}`` shape, so the predicate
+        evaluates identically in a fresh Run and a resumed one.
+
+        A dependency that was SKIPPED produced NO output, so there is nothing to
+        read: ``None`` is returned and the leaf evaluator treats it as false
+        (#74). This is reachable for a tolerant ``join: any`` Node whose `when`
+        references a dependency that skipped — the validator only guarantees a ref
+        is a dependency, not that the dependency ran. A genuine anomaly — a
+        dependency that SUCCEEDED but whose output is missing from both memory and
+        State — is the one case that must not silently become false, so it raises.
+        """
+        for result in self._results:
+            if result.node_id == node_id:
+                return result.normalized_output
+        persisted = self._state.node_output(self._run_id, node_id)
+        if persisted is not None:
+            return persisted
+        if node_id in self._skipped:
+            # A skipped dependency has no output; the leaf evaluating it is false.
+            return None
+        # Not in memory, not in State, and not skipped: the dependency is recorded
+        # SUCCEEDED yet its output is unexpectedly absent. This breaches the
+        # "a satisfied dependency's output is present at evaluation time" invariant
+        # and must surface as a clear error, never silently evaluate to false.
+        raise RuntimeError(
+            f"no recorded output for upstream node {node_id!r}, which is not skipped; "
+            f"its output should be present in memory or State at predicate evaluation"
+        )
+
     def _launch_ready(self) -> None:
-        for node in self._ready_nodes():
-            if len(self._in_flight) >= self._concurrency:
-                break
-            attempt = self._attempt.setdefault(node.id, 1)
-            # The ``node`` row is INSERTed once; a retry re-launch (and a resume
-            # re-run, whose row already exists) flips the existing row back to
-            # ``running`` instead, so the PK is never violated.
-            if node.id in self._started:
-                self._state.record_node_running(run_id=self._run_id, node_id=node.id)
-            else:
-                self._state.record_node_started(run_id=self._run_id, node_id=node.id)
-                self._started.add(node.id)
-            self._events.append("node_started", {"node_id": node.id, "attempt": attempt})
-            task = asyncio.ensure_future(_execute_node(node, self._registry))
-            self._in_flight[task] = node
+        # Loop until a full pass over the ready Nodes neither launches nor skips
+        # anything: a `when`-false skip decrements its dependents' indegree, so a
+        # skip can make further Nodes ready (or skip them) WITHIN this call, even
+        # when no task is in flight to trigger the next scheduling round (#7). A
+        # pass that only fills the concurrency slots stops naturally (no skip,
+        # slots full), and re-running the readiness query each pass keeps the
+        # newly-orphaned Nodes visible.
+        while True:
+            progressed = False
+            for node in self._ready_nodes():
+                if len(self._in_flight) >= self._concurrency:
+                    break
+                if node.when is not None and not evaluate_predicate(node.when, self._output_of):
+                    # The Node's own `when` gate closed: skip it (and, transitively,
+                    # its dependents) without ever launching it (#7). cause is
+                    # when_false with no failure blocker.
+                    self._skip_with_cause(node.id, cause=SKIP_WHEN_FALSE, blocker=None)
+                    progressed = True
+                    break
+                attempt = self._attempt.setdefault(node.id, 1)
+                # The ``node`` row is INSERTed once; a retry re-launch (and a
+                # resume re-run, whose row already exists) flips the existing row
+                # back to ``running`` instead, so the PK is never violated.
+                if node.id in self._started:
+                    self._state.record_node_running(run_id=self._run_id, node_id=node.id)
+                else:
+                    self._state.record_node_started(run_id=self._run_id, node_id=node.id)
+                    self._started.add(node.id)
+                self._events.append("node_started", {"node_id": node.id, "attempt": attempt})
+                task = asyncio.ensure_future(_execute_node(node, self._registry))
+                self._in_flight[task] = node
+                progressed = True
+            if not progressed:
+                return
 
     def _record_attempt(self, node: Node, result: NodeResult) -> None:
         """Record one Attempt's outcome in State and the Event trace.
@@ -572,46 +652,110 @@ class _Scheduler:
             run_id=self._run_id, node_id=node.id, status=terminal.status
         )
         self._results.append(terminal)
-        self._skip_transitive_dependents(node)
+        self._skip_failed_dependents(node)
 
     def _on_success(self, node: Node) -> None:
         for dependent in self._dependents[node.id]:
             self._indegree[dependent] -= 1
 
-    def _skip_transitive_dependents(self, node: Node) -> None:
-        """Mark every not-yet-attempted transitive dependent of a failed Node skipped.
+    def _on_skip(self, node_id: str) -> None:
+        """Decrement dependents' indegree when a Node is skipped (#7).
 
-        Independent branches are untouched: only Nodes reachable from the failed
-        Node by ``needs`` edges are skipped, recorded ``skipped`` in both State
-        and Events so they are distinguishable from Nodes that ran.
-
-        The ``node`` row is INSERTed the first time a Node is skipped; a Node whose
-        row already exists (the normal case on resume, where a prior run already
-        recorded it ``skipped``) is flipped with an UPDATE instead, so re-skipping
-        it never breaches the ``(run_id, node_id)`` PK. This mirrors the launch
-        path's INSERT-vs-UPDATE distinction (``_launch_ready``): ``_started`` is the
-        single source of truth for whether a Node already has a row, so a newly
-        skipped Node is added to it — letting a deeper transitive re-skip in the
-        same pass also take the UPDATE branch.
+        Mirrors ``_on_success`` so a skip unblocks dependents the same way a
+        success does: a ``join: any`` Node's indegree can still reach 0 after one
+        branch skips, leaving it ready to run on its surviving branch. The join
+        tolerance is enforced not by an extra readiness gate but by skip
+        propagation (``_propagate_skip_to_dependents``): a ``join: any`` Node is
+        skipped — cause ``all_branches_skipped`` — only once EVERY dependency has
+        skipped, and the ``done``-set exclusion in ``_ready_nodes`` then keeps it
+        from being launched. A ``join: all`` Node is instead skipped as soon as
+        any one dependency skips.
         """
-        already = {result.node_id for result in self._results} | set(self._skipped)
+        for dependent in self._dependents[node_id]:
+            self._indegree[dependent] -= 1
+
+    def _record_skip(self, node_id: str, cause: str, blocker: str | None) -> None:
+        """Record one Node skipped, with its cause and optional blocker (#7).
+
+        The ``node`` row is INSERTed the first time a Node is skipped; a Node
+        whose row already exists (the resume re-skip path) is flipped with an
+        UPDATE instead, so re-skipping never breaches the ``(run_id, node_id)``
+        PK. ``_started`` is the single source of truth for whether a row exists.
+        """
+        self._skipped.append(node_id)
+        self._skipped_causes[node_id] = cause
+        if blocker is not None:
+            self._skipped_blockers[node_id] = blocker
+        if node_id in self._started:
+            self._state.record_node_finished(
+                run_id=self._run_id, node_id=node_id, status="skipped", cause=cause
+            )
+        else:
+            self._state.record_node_skipped(run_id=self._run_id, node_id=node_id, cause=cause)
+            self._started.add(node_id)
+        event: dict[str, Any] = {"node_id": node_id, "cause": cause}
+        if blocker is not None:
+            event["blocked_by"] = blocker
+        self._events.append("node_skipped", event)
+
+    def _skip_with_cause(self, node_id: str, cause: str, blocker: str | None) -> None:
+        """Skip a Node with a cause, then walk its dependents — join-aware (#7).
+
+        The ORIGIN skip carries the given cause (``when_false`` for a closed gate,
+        ``all_branches_skipped`` for a fully skipped tolerant join). Every
+        transitive dependent reached purely through skips is itself a
+        skip-origin: a ``join: all`` dependent is ``blocked`` by the skip, while a
+        ``join: any`` dependent only becomes skipped once ALL its dependencies
+        skipped (cause ``all_branches_skipped``) — otherwise it is left to run on
+        its surviving succeeded branch. Only this skip-origin walk consults
+        ``join``; the failure-origin walk (``_skip_failed_dependents``) never does,
+        which is how a failed dependency blocks dependents regardless of join.
+        """
+        if node_id in self._terminal_node_ids():
+            return
+        self._record_skip(node_id, cause=cause, blocker=blocker)
+        self._on_skip(node_id)
+        self._propagate_skip_to_dependents(node_id)
+
+    def _propagate_skip_to_dependents(self, skipped_id: str) -> None:
+        """Skip the dependents a skip newly orphans, honoring each one's join (#7)."""
+        for dependent_id in self._dependents[skipped_id]:
+            if dependent_id in self._terminal_node_ids():
+                continue
+            dependent = self._by_id[dependent_id]
+            if dependent.join == "any":
+                # A tolerant join is skipped only when EVERY dependency has
+                # skipped (no branch executed); while any dependency is still
+                # pending or succeeded, leave it to run on its surviving branch.
+                if all(need in self._skipped for need in dependent.needs):
+                    self._skip_with_cause(
+                        dependent_id, cause=SKIP_ALL_BRANCHES_SKIPPED, blocker=None
+                    )
+            else:
+                # The default guard: any skipped dependency skips a `join: all`
+                # dependent, blocked by the skip that orphaned it.
+                self._skip_with_cause(dependent_id, cause=SKIP_BLOCKED, blocker=skipped_id)
+
+    def _terminal_node_ids(self) -> set[str]:
+        """Nodes already attempted or skipped — never (re-)skipped a second time."""
+        return {result.node_id for result in self._results} | set(self._skipped)
+
+    def _skip_failed_dependents(self, node: Node) -> None:
+        """Skip every transitive dependent of a FAILED Node — join policy ignored.
+
+        A failed dependency blocks its dependents REGARDLESS of join policy (#7):
+        join tolerates skips, never failures. So this walk never consults
+        ``join`` — it skips the whole transitive cone of the failure, each
+        dependent ``blocked`` by the original failed Node, exactly as #4 did.
+        """
         queue = list(self._dependents[node.id])
         seen: set[str] = set()
         while queue:
             node_id = queue.pop()
-            if node_id in seen or node_id in already:
+            if node_id in seen or node_id in self._terminal_node_ids():
                 continue
             seen.add(node_id)
-            self._skipped.append(node_id)
-            self._skipped_blockers[node_id] = node.id
-            if node_id in self._started:
-                self._state.record_node_finished(
-                    run_id=self._run_id, node_id=node_id, status="skipped"
-                )
-            else:
-                self._state.record_node_skipped(run_id=self._run_id, node_id=node_id)
-                self._started.add(node_id)
-            self._events.append("node_skipped", {"node_id": node_id, "blocked_by": node.id})
+            self._record_skip(node_id, cause=SKIP_BLOCKED, blocker=node.id)
             queue.extend(self._dependents[node_id])
 
     async def run(self) -> RunResult:
@@ -659,6 +803,7 @@ class _Scheduler:
             node_results=tuple(self._results),
             skipped_node_ids=tuple(self._skipped),
             skipped_blockers=dict(self._skipped_blockers),
+            skipped_causes=dict(self._skipped_causes),
         )
 
     async def _drain_in_flight(self) -> None:
