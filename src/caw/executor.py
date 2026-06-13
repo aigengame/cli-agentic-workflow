@@ -5,6 +5,7 @@ import contextlib
 import json
 import os
 import secrets
+import signal
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -161,16 +162,22 @@ def _task_crash(task: "asyncio.Task[NodeResult]") -> BaseException:
 
 
 async def _kill_and_reap(process: "asyncio.subprocess.Process") -> None:
-    """Kill a still-running subprocess and reap it so no orphan is left behind.
+    """Kill a still-running subprocess tree and reap it so no orphan is left behind.
 
-    Shared by the cancellation and timeout paths (#6): a node whose budget
-    expires must leave no live subprocess, exactly as cancellation does. A
-    process that already exited (returncode set) needs no kill; ProcessLookupError
-    is suppressed for the race where it exits between the check and the signal.
+    Shared by the cancellation and timeout paths (#6): a node whose budget expires
+    must leave no live process, exactly as cancellation does. The shell is spawned
+    in its OWN session/process group (``start_new_session``), so the whole tree —
+    including a grandchild like ``sleep`` the command launched — is signalled by
+    process group; killing only the shell would orphan such a grandchild, and its
+    inherited stdout pipe would keep ``communicate()`` blocked for the grandchild's
+    full lifetime (the timeout would classify correctly but the call would still
+    hang). A process that already exited (returncode set) needs no kill;
+    ProcessLookupError is suppressed for the race where it exits between the check
+    and the signal. ``wait()`` then reaps the shell.
     """
     if process.returncode is None:
         with contextlib.suppress(ProcessLookupError):
-            process.kill()
+            os.killpg(process.pid, signal.SIGKILL)
     await process.wait()
 
 
@@ -178,11 +185,12 @@ async def _execute_shell_node(node: Node) -> NodeResult:
     """Run a shell Node's command as a subprocess, enforcing its timeout budget.
 
     A non-zero exit is an ordinary node failure (``FAILED``). A Node that exceeds
-    its ``timeout`` is terminated — the subprocess is KILLED so no orphan is left,
-    mirroring the cancellation handler — and classified ``TIMED_OUT`` with
+    its ``timeout`` is terminated — the whole process tree is KILLED so no orphan
+    is left, mirroring the cancellation handler — and classified ``TIMED_OUT`` with
     exit_status -1, so a timeout is never read as a non-zero exit (#6). Timeout
     wraps ``communicate()`` (the wall-clock the node spends running); a Node with
-    no ``timeout`` runs unbounded as before.
+    no ``timeout`` runs unbounded as before. The subprocess starts a new session
+    so its descendants can be torn down by process group (see ``_kill_and_reap``).
     """
     assert isinstance(node.inputs, ShellNodeInputs)
     started_at = _now()
@@ -191,6 +199,7 @@ async def _execute_shell_node(node: Node) -> NodeResult:
         stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
     )
     try:
         async with asyncio.timeout(node.timeout):

@@ -152,6 +152,28 @@ async def test_retries_are_exhausted_then_the_node_fails_and_skips_its_dependent
 
 
 @pytest.mark.asyncio
+async def test_a_timed_out_node_is_retried_when_retries_remain(tmp_path: Path) -> None:
+    # A timeout is a retryable failure kind (#6): the first Attempt sleeps past the
+    # 0.2s budget and is killed (timed_out); the second, seeing the marker the
+    # first left, returns immediately and succeeds. retries=1 therefore lets the
+    # node ultimately succeed, with the first Attempt recorded timed_out.
+    marker = tmp_path / "seen"
+    command = f"if [ -e {marker} ]; then exit 0; else touch {marker}; sleep 30; fi"
+    workflow = policy_shell_workflow("slow", command, timeout=0.2, retries=1)
+
+    result = await execute_run(workflow, tmp_path / "runs")
+
+    assert result.succeeded, "the second attempt beat the budget, so the run succeeds"
+    run_dir = single_run_dir(tmp_path / "runs")
+    attempts = state_rows(
+        run_dir,
+        "SELECT attempt, exit_status FROM attempt WHERE node_id = 'slow' ORDER BY attempt",
+    )
+    assert len(attempts) == 2, "the timed-out first attempt and the succeeding second are recorded"
+    assert attempts[0]["exit_status"] == -1, "a timeout records exit_status -1 for the first try"
+
+
+@pytest.mark.asyncio
 async def test_an_errored_adapter_failure_is_not_retried(tmp_path: Path) -> None:
     # Retry policy boundary (#6): an ERRORED failure (here a mock agent Node with
     # no fixture, an AdapterError) is an Adapter/internal fault that is almost
