@@ -5,7 +5,8 @@ import hashlib
 import heapq
 import json
 from collections.abc import Sequence
-from typing import Any, Literal
+from pathlib import Path
+from typing import Annotated, Any, Literal
 
 from pydantic import (
     BaseModel,
@@ -30,20 +31,81 @@ class ShellNodeInputs(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
+    kind: Literal["shell"] = "shell"
     command: str
 
     _command_non_blank = field_validator("command")(_require_non_blank)
 
 
+class AgentNodeInputs(BaseModel):
+    """Inputs of an agent Node: how it selects an Adapter and what it sends.
+
+    ``adapter`` names the Adapter that invokes the external Agent CLI (the mock
+    Adapter in v0.1). ``output_schema`` and ``fixture`` are file paths the kernel
+    and the mock Adapter resolve relative to their own working directory; they
+    are validated for shape here and for existence at execution time, so an
+    authoring typo still fails as a node error rather than a crash. ``env`` is a
+    declaration of variable NAMES, never values: only the named variables reach
+    the node process, and the env policy keeps their values out of State, Events,
+    and Artifacts (#5).
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    kind: Literal["agent"] = "agent"
+    adapter: str
+    prompt: str
+    args: tuple[str, ...] = ()
+    env: tuple[str, ...] = ()
+    output_schema: Path | None = None
+    fixture: Path | None = None
+
+    _adapter_non_blank = field_validator("adapter")(_require_non_blank)
+    _prompt_non_blank = field_validator("prompt")(_require_non_blank)
+
+    @field_validator("env")
+    @classmethod
+    def _env_names_must_be_unique_and_non_blank(cls, names: tuple[str, ...]) -> tuple[str, ...]:
+        seen: set[str] = set()
+        for name in names:
+            if not name.strip():
+                raise ValueError("env names must not be blank or whitespace-only")
+            if name in seen:
+                raise ValueError(f"duplicate env name {name!r}")
+            seen.add(name)
+        return names
+
+
+NodeInputs = Annotated[
+    ShellNodeInputs | AgentNodeInputs,
+    Field(discriminator="kind"),
+]
+
+
 class Node(BaseModel):
-    """A unit of work in a Workflow; the walking skeleton supports only shell Nodes."""
+    """A unit of work in a Workflow; v0.1 supports shell and agent Nodes."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     id: str
-    kind: Literal["shell"]
-    inputs: ShellNodeInputs
+    kind: Literal["shell", "agent"]
+    inputs: NodeInputs
     needs: tuple[str, ...] = ()
+
+    @model_validator(mode="before")
+    @classmethod
+    def _stamp_inputs_kind(cls, data: object) -> object:
+        # `kind` lives at the node level in workflow definitions, never inside
+        # `inputs`. Copy it down so the discriminated `inputs` union resolves to
+        # the matching inputs model; a mismatching explicit `inputs.kind` is left
+        # to surface as a discriminator error rather than being silently rewritten.
+        if isinstance(data, dict):
+            kind = data.get("kind")
+            inputs = data.get("inputs")
+            if isinstance(kind, str) and isinstance(inputs, dict) and "kind" not in inputs:
+                inputs = {**inputs, "kind": kind}
+                data = {**data, "inputs": inputs}
+        return data
 
     _id_non_blank = field_validator("id")(_require_non_blank)
 
@@ -231,7 +293,30 @@ def _node_id_at(raw: dict[str, Any], index: int) -> str | None:
     return None
 
 
+_INPUTS_DISCRIMINATOR_TAGS = frozenset({"shell", "agent"})
+
+
+def _strip_inputs_discriminator(loc: tuple[int | str, ...]) -> tuple[int | str, ...]:
+    """Drop the ``inputs`` discriminator tag pydantic injects into the error path.
+
+    A discriminated-union field error carries the chosen tag as a path segment,
+    e.g. ``(..., 'inputs', 'shell', 'command')``. That tag is an internal routing
+    detail, not a field a workflow author wrote, so it would make the one-error
+    line read ``inputs.shell.command``. Drop it so the path names the authored
+    field (``inputs.command``), preserving the error-location contract.
+    """
+    for index, part in enumerate(loc):
+        if (
+            part == "inputs"
+            and index + 1 < len(loc)
+            and loc[index + 1] in _INPUTS_DISCRIMINATOR_TAGS
+        ):
+            return (*loc[: index + 1], *loc[index + 2 :])
+    return loc
+
+
 def _render_location(loc: tuple[int | str, ...], raw: dict[str, Any]) -> str:
+    loc = _strip_inputs_discriminator(loc)
     parts = [str(part) for part in loc]
     if len(loc) >= 2 and loc[0] == "nodes" and isinstance(loc[1], int):
         # Pair the position with the quoted id: nodes[1 'greet'].kind stays

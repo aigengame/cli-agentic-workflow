@@ -74,7 +74,10 @@ def test_snapshot_carries_a_definition_checksum_over_the_normalized_workflow(
     assert workflow["nodes"][0] == {
         "id": "greet",
         "kind": "shell",
-        "inputs": {"command": "echo hello"},
+        # The normalized inputs carry the discriminator tag `kind` since #5 added
+        # the agent Node kind: `inputs` is a discriminated union and the tag is
+        # part of its serialized form.
+        "inputs": {"kind": "shell", "command": "echo hello"},
         "needs": [],
     }
     canonical = json.dumps(workflow, sort_keys=True, separators=(",", ":")).encode("utf-8")
