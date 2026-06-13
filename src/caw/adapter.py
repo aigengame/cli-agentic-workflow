@@ -185,3 +185,14 @@ class AdapterRegistry:
         except KeyError as exc:
             known = ", ".join(sorted(self._adapters)) or "<none>"
             raise AdapterError(f"unknown adapter {adapter!r} (known: {known})") from exc
+
+    @property
+    def names(self) -> frozenset[str]:
+        """The adapter identifiers this registry can resolve.
+
+        A resume reconstructs the Workflow from its persisted snapshot and
+        re-validates it; the snapshot cannot record which adapters were injected
+        at run time, so the resume must re-validate against the registry's own
+        known set rather than only the built-ins (#6).
+        """
+        return frozenset(self._adapters)

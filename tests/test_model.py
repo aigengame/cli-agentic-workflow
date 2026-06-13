@@ -248,6 +248,85 @@ def test_concurrency_below_one_is_a_config_error() -> None:
     assert "concurrency" in str(excinfo.value)
 
 
+def test_retries_default_to_zero_so_a_node_runs_exactly_once_unless_asked_otherwise() -> None:
+    # The retry policy is per-node and opt-in: with no `retries` declared a Node
+    # is attempted exactly once (total attempts = retries + 1 = 1), preserving the
+    # pre-#6 single-attempt behavior for every existing workflow.
+    raw: dict[str, Any] = {
+        "name": "sample",
+        "version": 1,
+        "nodes": [{"id": "greet", "kind": "shell", "inputs": {"command": "echo hi"}}],
+    }
+
+    workflow = normalize_workflow(raw, source="<test>")
+
+    assert workflow.nodes[0].retries == 0
+    assert workflow.nodes[0].timeout is None
+
+
+def test_retries_records_additional_attempts_after_the_first() -> None:
+    # `retries` is the number of ADDITIONAL attempts after the first, so a Node
+    # with retries=2 may be attempted up to three times. The field carries the
+    # policy; the executor enforces the count.
+    raw: dict[str, Any] = {
+        "name": "sample",
+        "version": 1,
+        "nodes": [
+            {"id": "greet", "kind": "shell", "retries": 2, "inputs": {"command": "echo hi"}}
+        ],
+    }
+
+    workflow = normalize_workflow(raw, source="<test>")
+
+    assert workflow.nodes[0].retries == 2
+
+
+def test_negative_retries_is_a_config_error() -> None:
+    raw: dict[str, Any] = {
+        "name": "sample",
+        "version": 1,
+        "nodes": [
+            {"id": "greet", "kind": "shell", "retries": -1, "inputs": {"command": "echo hi"}}
+        ],
+    }
+
+    with pytest.raises(WorkflowConfigError) as excinfo:
+        normalize_workflow(raw, source="workflow.yaml")
+
+    assert "retries" in str(excinfo.value)
+
+
+def test_timeout_is_a_positive_wall_clock_second_budget() -> None:
+    raw: dict[str, Any] = {
+        "name": "sample",
+        "version": 1,
+        "nodes": [
+            {"id": "greet", "kind": "shell", "timeout": 1.5, "inputs": {"command": "echo hi"}}
+        ],
+    }
+
+    workflow = normalize_workflow(raw, source="<test>")
+
+    assert workflow.nodes[0].timeout == 1.5
+
+
+def test_a_non_positive_timeout_is_a_config_error() -> None:
+    # A timeout is a wall-clock budget; zero or negative seconds is meaningless
+    # and must be rejected at validation time rather than silently disabling it.
+    raw: dict[str, Any] = {
+        "name": "sample",
+        "version": 1,
+        "nodes": [
+            {"id": "greet", "kind": "shell", "timeout": 0, "inputs": {"command": "echo hi"}}
+        ],
+    }
+
+    with pytest.raises(WorkflowConfigError) as excinfo:
+        normalize_workflow(raw, source="workflow.yaml")
+
+    assert "timeout" in str(excinfo.value)
+
+
 def test_validation_and_ordering_scale_to_thousands_of_nodes() -> None:
     # Pattern Expanders (roadmap) compile patterns into graphs of exactly this
     # scale, and validate is sold as the fast fail-fast check. A 5,000-node

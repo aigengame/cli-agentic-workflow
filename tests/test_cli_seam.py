@@ -365,6 +365,168 @@ def test_run_output_lists_a_skipped_join_node_and_its_blocker(
     assert "right" in skipped_line, "the skipped node names the branch that blocked it"
 
 
+def _run_dir_name(tmp_path: Path) -> str:
+    run_dirs = list((tmp_path / ".caw" / "runs").iterdir())
+    assert len(run_dirs) == 1
+    return run_dirs[0].name
+
+
+def test_resume_completes_an_interrupted_run_and_exits_zero(
+    write_workflow_data: Callable[[dict[str, Any]], Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Acceptance criterion #6.4 at the CLI seam: `caw resume <run-id>` continues an
+    # interrupted run to completion, re-running only incomplete nodes, mirroring
+    # `run`'s exit-code contract (0 on success). `build` succeeds; `test` fails on
+    # the first run (its marker is absent) so `deploy` is skipped and the run
+    # fails (exit 1); on resume `test` succeeds and `deploy` runs, exiting 0.
+    test_marker = tmp_path / "test.marker"
+    deployed = tmp_path / "deployed"
+    workflow_file = write_workflow_data(
+        {
+            "name": "sample",
+            "version": 1,
+            "nodes": [
+                {"id": "build", "kind": "shell", "inputs": {"command": "echo build"}},
+                {
+                    "id": "test",
+                    "kind": "shell",
+                    "needs": ["build"],
+                    "inputs": {
+                        "command": (
+                            f"if [ -e {test_marker} ]; then exit 0; "
+                            f"else touch {test_marker}; exit 7; fi"
+                        )
+                    },
+                },
+                {
+                    "id": "deploy",
+                    "kind": "shell",
+                    "needs": ["test"],
+                    "inputs": {"command": f"touch {deployed}"},
+                },
+            ],
+        }
+    )
+    monkeypatch.chdir(tmp_path)
+
+    first = runner.invoke(app, ["run", str(workflow_file)])
+    assert first.exit_code == 1, first.output
+    run_id = _run_dir_name(tmp_path)
+    assert not deployed.exists()
+
+    resumed = runner.invoke(app, ["resume", run_id])
+
+    assert resumed.exit_code == 0, resumed.output
+    assert "succeeded" in resumed.output
+    assert run_id in resumed.output, "the resume result names the run id"
+    assert deployed.exists(), "deploy ran on resume"
+
+
+def test_resume_an_already_succeeded_run_is_refused_with_one_error_line(
+    write_workflow: Callable[[str], Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A succeeded run is not resumable; the CLI refuses it with a single `error:`
+    # line and a config-class exit code, never re-running it.
+    workflow_file = write_workflow("echo ok")
+    monkeypatch.chdir(tmp_path)
+    assert runner.invoke(app, ["run", str(workflow_file)]).exit_code == 0
+    run_id = _run_dir_name(tmp_path)
+
+    result = runner.invoke(app, ["resume", run_id])
+
+    assert result.exit_code == 2, "refusing an ineligible run is a config-class error"
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    lines = [line for line in result.output.splitlines() if line.strip()]
+    assert len(lines) == 1
+    assert lines[0].startswith("error:")
+    assert "not resumable" in lines[0]
+
+
+def test_resume_an_unknown_run_id_is_refused_with_one_error_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["resume", "no-such-run"])
+
+    assert result.exit_code == 2
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    lines = [line for line in result.output.splitlines() if line.strip()]
+    assert len(lines) == 1
+    assert lines[0].startswith("error:")
+    assert "no-such-run" in lines[0], "the error names the unknown run id"
+
+
+def test_run_reports_the_real_attempt_number_after_a_retry(
+    write_workflow_data: Callable[[dict[str, Any]], Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The run summary names the Attempt a Node actually finished on, not a
+    # hardcoded "attempt 1" (#6): a node that fails once then succeeds reports
+    # "attempt 2", so a reader sees the retry happened.
+    marker = tmp_path / "marker"
+    command = f"if [ -e {marker} ]; then exit 0; else touch {marker}; exit 7; fi"
+    workflow_file = write_workflow_data(
+        {
+            "name": "sample",
+            "version": 1,
+            "nodes": [
+                {"id": "flaky", "kind": "shell", "retries": 1, "inputs": {"command": command}}
+            ],
+        }
+    )
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["run", str(workflow_file)])
+
+    assert result.exit_code == 0, result.output
+    assert "node flaky attempt 2 exited 0" in result.output, "the report names the real attempt"
+
+
+def test_run_failure_message_names_the_workflow_file_node_id_and_adapter(
+    write_workflow_data: Callable[[dict[str, Any]], Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Acceptance criterion #6.5: a node failure's surfaced message names the
+    # workflow file, the node id, and (for an agent node) the adapter, so a user
+    # can locate the failure across definition, graph, and integration without
+    # cross-referencing. The mock agent node fails (fixture exit_status 7); the
+    # run output must mention all three identifiers.
+    fixture = tmp_path / "fixture.json"
+    fixture.write_text(json.dumps({"exit_status": 7, "stderr": "agent blew up"}), encoding="utf-8")
+    workflow_file = write_workflow_data(
+        {
+            "name": "sample",
+            "version": 1,
+            "nodes": [
+                {
+                    "id": "summarize",
+                    "kind": "agent",
+                    "inputs": {
+                        "adapter": "mock",
+                        "prompt": "do it",
+                        "fixture": str(fixture),
+                    },
+                }
+            ],
+        }
+    )
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["run", str(workflow_file)])
+
+    assert result.exit_code == 1, result.output
+    assert "workflow.yaml" in result.output, "the failure names the workflow file"
+    assert "summarize" in result.output, "the failure names the node id"
+    assert "mock" in result.output, "the failure names the adapter"
+
+
 def test_run_failing_node_prints_its_stderr_excerpt(
     write_workflow: Callable[[str], Path],
     tmp_path: Path,

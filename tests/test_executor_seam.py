@@ -13,7 +13,7 @@ from typing import Any
 
 import pytest
 
-from caw.executor import execute_run
+from caw.executor import ResumeError, execute_run, resume_run
 from caw.model import Workflow, normalize_workflow
 
 ShellNodeSpec = str | tuple[str, str, list[str]]
@@ -54,6 +54,396 @@ def state_rows(run_dir: Path, query: str) -> list[dict[str, Any]]:
 def read_events(run_dir: Path) -> list[dict[str, Any]]:
     lines = (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
     return [json.loads(line) for line in lines]
+
+
+def policy_shell_workflow(node_id: str, command: str, **policy: Any) -> Workflow:
+    """A single-shell-node Workflow carrying per-Node failure-semantics policy.
+
+    ``policy`` passes ``retries`` / ``timeout`` straight onto the node so the
+    failure-semantics tests can declare a budget without an inline raw dict.
+    """
+    raw: dict[str, Any] = {
+        "name": "sample",
+        "version": 1,
+        "nodes": [{"id": node_id, "kind": "shell", "inputs": {"command": command}, **policy}],
+    }
+    return normalize_workflow(raw, source="<test>")
+
+
+@pytest.mark.asyncio
+async def test_a_node_exceeding_its_timeout_is_terminated_and_recorded_timed_out(
+    tmp_path: Path,
+) -> None:
+    # Acceptance criterion #6.2: a Node whose wall-clock exceeds its `timeout` is
+    # terminated and recorded with a status DISTINCT from a non-zero exit, so a
+    # timeout is diagnosable as a timeout — not conflated with an ordinary
+    # failure. The 0.2s budget against a 30s sleep makes the timeout deterministic.
+    workflow = policy_shell_workflow("slow", "sleep 30", timeout=0.2)
+
+    result = await execute_run(workflow, tmp_path / "runs")
+
+    assert not result.succeeded, "a timed-out node fails the run"
+    run_dir = single_run_dir(tmp_path / "runs")
+    (node,) = state_rows(run_dir, "SELECT * FROM node")
+    assert node["status"] == "timed_out", "the node is recorded timed_out, not failed"
+
+
+@pytest.mark.asyncio
+async def test_a_node_with_retries_reattempts_on_failure_and_records_each_attempt(
+    tmp_path: Path,
+) -> None:
+    # Acceptance criterion #6.1: a Node with `retries` re-attempts on failure and
+    # the attempt history is recorded in State. The command fails on its first
+    # run (no marker yet) and succeeds on its second (marker now exists), so a
+    # node with retries=1 ultimately succeeds — and BOTH attempts are recorded as
+    # distinct rows in the attempt table, the durable Attempt history.
+    marker = tmp_path / "marker"
+    command = f"if [ -e {marker} ]; then exit 0; else touch {marker}; exit 7; fi"
+    workflow = policy_shell_workflow("flaky", command, retries=1)
+
+    result = await execute_run(workflow, tmp_path / "runs")
+
+    assert result.succeeded, "the second attempt succeeded, so the run succeeds"
+    run_dir = single_run_dir(tmp_path / "runs")
+    (node,) = state_rows(run_dir, "SELECT * FROM node")
+    assert node["status"] == "succeeded", "the node's terminal status is its last attempt's"
+    attempts = state_rows(
+        run_dir,
+        "SELECT attempt, exit_status FROM attempt WHERE node_id = 'flaky' ORDER BY attempt",
+    )
+    assert [(a["attempt"], a["exit_status"]) for a in attempts] == [(1, 7), (2, 0)], (
+        "both attempts are recorded: attempt 1 failed (exit 7), attempt 2 succeeded"
+    )
+    (terminal,) = result.node_results
+    assert terminal.attempt == 2, (
+        "the terminal NodeResult names the real attempt number, not a misleading 1"
+    )
+
+
+@pytest.mark.asyncio
+async def test_retries_are_exhausted_then_the_node_fails_and_skips_its_dependents(
+    tmp_path: Path,
+) -> None:
+    # The retry budget is bounded: a Node that fails EVERY Attempt exhausts its
+    # retries, goes terminal-failed, and skips its transitive dependents exactly
+    # as a non-retried failure does (#4 semantics preserved). retries=2 means
+    # three Attempts total, all exit 7; the dependent is never run.
+    marker = tmp_path / "deployed"
+    raw: dict[str, Any] = {
+        "name": "sample",
+        "version": 1,
+        "nodes": [
+            {"id": "build", "kind": "shell", "retries": 2, "inputs": {"command": "exit 7"}},
+            {
+                "id": "deploy",
+                "kind": "shell",
+                "needs": ["build"],
+                "inputs": {"command": f"touch {marker}"},
+            },
+        ],
+    }
+    workflow = normalize_workflow(raw, source="<test>")
+
+    result = await execute_run(workflow, tmp_path / "runs")
+
+    assert not result.succeeded
+    assert not marker.exists(), "the dependent of an exhausted-retry failure never runs"
+    run_dir = single_run_dir(tmp_path / "runs")
+    nodes = {row["node_id"]: row["status"] for row in state_rows(run_dir, "SELECT * FROM node")}
+    assert nodes == {"build": "failed", "deploy": "skipped"}
+    attempts = state_rows(run_dir, "SELECT attempt FROM attempt WHERE node_id = 'build'")
+    assert len(attempts) == 3, "retries=2 yields exactly three recorded attempts"
+
+
+@pytest.mark.asyncio
+async def test_a_timed_out_node_is_retried_when_retries_remain(tmp_path: Path) -> None:
+    # A timeout is a retryable failure kind (#6): the first Attempt sleeps past the
+    # 0.2s budget and is killed (timed_out); the second, seeing the marker the
+    # first left, returns immediately and succeeds. retries=1 therefore lets the
+    # node ultimately succeed, with the first Attempt recorded timed_out.
+    marker = tmp_path / "seen"
+    command = f"if [ -e {marker} ]; then exit 0; else touch {marker}; sleep 30; fi"
+    workflow = policy_shell_workflow("slow", command, timeout=0.2, retries=1)
+
+    result = await execute_run(workflow, tmp_path / "runs")
+
+    assert result.succeeded, "the second attempt beat the budget, so the run succeeds"
+    run_dir = single_run_dir(tmp_path / "runs")
+    attempts = state_rows(
+        run_dir,
+        "SELECT attempt, exit_status FROM attempt WHERE node_id = 'slow' ORDER BY attempt",
+    )
+    assert len(attempts) == 2, "the timed-out first attempt and the succeeding second are recorded"
+    assert attempts[0]["exit_status"] == -1, "a timeout records exit_status -1 for the first try"
+
+
+@pytest.mark.asyncio
+async def test_an_errored_adapter_failure_is_not_retried(tmp_path: Path) -> None:
+    # Retry policy boundary (#6): an ERRORED failure (here a mock agent Node with
+    # no fixture, an AdapterError) is an Adapter/internal fault that is almost
+    # always deterministic, so it is NOT retried even with retries set — retrying
+    # it would only burn Attempts. Exactly one Attempt is recorded.
+    raw: dict[str, Any] = {
+        "name": "sample",
+        "version": 1,
+        "nodes": [
+            {
+                "id": "summarize",
+                "kind": "agent",
+                "retries": 3,
+                "inputs": {"adapter": "mock", "prompt": "do it"},
+            }
+        ],
+    }
+    workflow = normalize_workflow(raw, source="<test>")
+
+    result = await execute_run(workflow, tmp_path / "runs")
+
+    assert not result.succeeded
+    run_dir = single_run_dir(tmp_path / "runs")
+    (node,) = state_rows(run_dir, "SELECT * FROM node")
+    assert node["status"] == "errored", "an adapter fault is classified errored, not failed"
+    attempts = state_rows(run_dir, "SELECT * FROM attempt WHERE node_id = 'summarize'")
+    assert len(attempts) == 1, "an errored failure is not retried even with retries set"
+
+
+@pytest.mark.asyncio
+async def test_resume_completes_an_interrupted_run_without_rerunning_completed_nodes(
+    tmp_path: Path,
+) -> None:
+    # Acceptance criterion #6.4: `caw resume` completes an interrupted workflow
+    # without re-running completed Nodes. `build` succeeds and `test` fails on the
+    # first run (its marker is absent), so `deploy` is skipped and the run fails.
+    # `build` appends to a counter on every run; `test` succeeds once its marker
+    # exists. On resume, the already-succeeded `build` must NOT run again (the
+    # counter stays at one), `test` re-runs and now succeeds, and `deploy` runs —
+    # so the resumed run succeeds, reusing the SAME run id and run directory.
+    runs_root = tmp_path / "runs"
+    build_count = tmp_path / "build.count"
+    test_marker = tmp_path / "test.marker"
+    deployed = tmp_path / "deployed"
+    raw: dict[str, Any] = {
+        "name": "sample",
+        "version": 1,
+        "nodes": [
+            {"id": "build", "kind": "shell", "inputs": {"command": f"echo x >> {build_count}"}},
+            {
+                "id": "test",
+                "kind": "shell",
+                "needs": ["build"],
+                "inputs": {
+                    "command": (
+                        f"if [ -e {test_marker} ]; then exit 0; "
+                        f"else touch {test_marker}; exit 7; fi"
+                    )
+                },
+            },
+            {
+                "id": "deploy",
+                "kind": "shell",
+                "needs": ["test"],
+                "inputs": {"command": f"touch {deployed}"},
+            },
+        ],
+    }
+    workflow = normalize_workflow(raw, source="<test>")
+
+    first = await execute_run(workflow, runs_root)
+    assert not first.succeeded, "the first run fails because `test` fails"
+    assert build_count.read_text(encoding="utf-8").split() == ["x"], "build ran once"
+    assert not deployed.exists(), "deploy is skipped on the first run"
+
+    resumed = await resume_run(first.run_id, runs_root)
+
+    assert resumed.succeeded, "the resumed run completes the interrupted workflow"
+    assert resumed.run_id == first.run_id, "resume reuses the same run id"
+    assert build_count.read_text(encoding="utf-8").split() == ["x"], (
+        "the already-succeeded build node is NOT re-run on resume"
+    )
+    assert deployed.exists(), "deploy runs on resume once test succeeds"
+
+    # The same run directory is reused, and the run's final status is succeeded.
+    run_dir = single_run_dir(runs_root)
+    assert run_dir.name == first.run_id
+    (run,) = state_rows(run_dir, "SELECT * FROM run")
+    assert run["status"] == "succeeded"
+    nodes = {row["node_id"]: row["status"] for row in state_rows(run_dir, "SELECT * FROM node")}
+    assert nodes == {"build": "succeeded", "test": "succeeded", "deploy": "succeeded"}
+
+
+@pytest.mark.asyncio
+async def test_resuming_a_run_whose_blocker_fails_again_re_skips_its_dependent_cleanly(
+    tmp_path: Path,
+) -> None:
+    # Resume idempotency for the skip path (#6 review): on the first run `build`
+    # fails and its dependent `deploy` is recorded `skipped` — so a `node` row for
+    # `deploy` already exists. When the run is resumed and `build` fails AGAIN, the
+    # scheduler re-skips `deploy`; that re-skip must flip the EXISTING row to
+    # `skipped` (an UPDATE) rather than re-INSERT it, which would breach the
+    # `(run_id, node_id)` PK and crash the resume with an IntegrityError instead of
+    # returning a clean failed RunResult. The blocker stays a hard failure
+    # (`exit 7` every time), so the resumed run must end failed, not crash.
+    runs_root = tmp_path / "runs"
+    raw: dict[str, Any] = {
+        "name": "sample",
+        "version": 1,
+        "nodes": [
+            {"id": "build", "kind": "shell", "inputs": {"command": "exit 7"}},
+            {
+                "id": "deploy",
+                "kind": "shell",
+                "needs": ["build"],
+                "inputs": {"command": "echo deployed"},
+            },
+        ],
+    }
+    workflow = normalize_workflow(raw, source="<test>")
+
+    first = await execute_run(workflow, runs_root)
+    assert not first.succeeded, "the first run fails because `build` fails"
+    run_dir = single_run_dir(runs_root)
+    first_nodes = {
+        row["node_id"]: row["status"] for row in state_rows(run_dir, "SELECT * FROM node")
+    }
+    assert first_nodes == {"build": "failed", "deploy": "skipped"}, (
+        "the first run leaves a `deploy` row already present, the precondition for the bug"
+    )
+
+    # Resuming must NOT crash with an IntegrityError when `build` fails again and
+    # `deploy` is re-skipped over its pre-existing row.
+    resumed = await resume_run(first.run_id, runs_root)
+
+    assert not resumed.succeeded, "the blocker fails again, so the resumed run is still failed"
+    assert resumed.run_id == first.run_id, "resume reuses the same run id"
+    nodes = {row["node_id"]: row["status"] for row in state_rows(run_dir, "SELECT * FROM node")}
+    assert nodes == {"build": "failed", "deploy": "skipped"}, (
+        "the blocker is recorded failed again and the dependent is re-recorded skipped"
+    )
+
+
+@pytest.mark.asyncio
+async def test_resuming_a_run_whose_blocker_now_succeeds_runs_the_previously_skipped_dependent(
+    tmp_path: Path,
+) -> None:
+    # The happy sibling of the re-skip case (#6 review): when the blocker now
+    # SUCCEEDS on resume, the previously-skipped dependent must re-run to
+    # completion. `build` fails the first run (no marker), so `deploy` is skipped;
+    # on resume the marker exists, `build` succeeds, and `deploy` — whose row
+    # exists from the first run — flips to running via record_node_running and then
+    # runs its command. The marker file proves the previously-skipped node ran.
+    runs_root = tmp_path / "runs"
+    build_marker = tmp_path / "build.marker"
+    deployed = tmp_path / "deployed"
+    raw: dict[str, Any] = {
+        "name": "sample",
+        "version": 1,
+        "nodes": [
+            {
+                "id": "build",
+                "kind": "shell",
+                "inputs": {
+                    "command": (
+                        f"if [ -e {build_marker} ]; then exit 0; "
+                        f"else touch {build_marker}; exit 7; fi"
+                    )
+                },
+            },
+            {
+                "id": "deploy",
+                "kind": "shell",
+                "needs": ["build"],
+                "inputs": {"command": f"touch {deployed}"},
+            },
+        ],
+    }
+    workflow = normalize_workflow(raw, source="<test>")
+
+    first = await execute_run(workflow, runs_root)
+    assert not first.succeeded, "the first run fails because `build` fails"
+    assert not deployed.exists(), "deploy is skipped on the first run"
+    run_dir = single_run_dir(runs_root)
+    first_nodes = {
+        row["node_id"]: row["status"] for row in state_rows(run_dir, "SELECT * FROM node")
+    }
+    assert first_nodes == {"build": "failed", "deploy": "skipped"}
+
+    resumed = await resume_run(first.run_id, runs_root)
+
+    assert resumed.succeeded, "the blocker now succeeds, so the resumed run completes"
+    assert deployed.exists(), "the previously-skipped dependent re-runs once its blocker succeeds"
+    nodes = {row["node_id"]: row["status"] for row in state_rows(run_dir, "SELECT * FROM node")}
+    assert nodes == {"build": "succeeded", "deploy": "succeeded"}
+
+
+@pytest.mark.asyncio
+async def test_resuming_an_already_succeeded_run_is_refused(tmp_path: Path) -> None:
+    # Resume eligibility (#6): a Run that already succeeded has nothing to do, so
+    # resuming it is refused with a clear error rather than re-running it or
+    # silently no-opping. Unknown and succeeded ids are the two refusal cases.
+    runs_root = tmp_path / "runs"
+    workflow = shell_workflow("echo ok")
+    first = await execute_run(workflow, runs_root)
+    assert first.succeeded
+
+    with pytest.raises(ResumeError, match="not resumable"):
+        await resume_run(first.run_id, runs_root)
+
+
+@pytest.mark.asyncio
+async def test_resuming_an_unknown_run_id_is_refused(tmp_path: Path) -> None:
+    with pytest.raises(ResumeError, match="no run directory"):
+        await resume_run("no-such-run", tmp_path / "runs")
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_run_is_consistent_and_resumes_to_completion(tmp_path: Path) -> None:
+    # Acceptance criterion #6.3: cancelling a run mid-flight leaves State
+    # consistent (the run errored, the in-flight node errored — never left
+    # `running`) and the run resumable. A gate file blocks the node until the
+    # resume releases it; cancelling the first run interrupts it, and resume
+    # re-runs the interrupted node, which now completes because the gate is open.
+    runs_root = tmp_path / "runs"
+    gate = tmp_path / "gate"
+    done = tmp_path / "done"
+    workflow = policy_shell_workflow(
+        "blocked",
+        f"while [ ! -e {gate} ]; do sleep 0.05; done; touch {done}",
+    )
+
+    run_task = asyncio.create_task(execute_run(workflow, runs_root))
+    run_dir = None
+    for _ in range(200):
+        if runs_root.exists() and list(runs_root.iterdir()):
+            run_dir = single_run_dir(runs_root)
+            nodes = state_rows(run_dir, "SELECT status FROM node")
+            if nodes and nodes[0]["status"] == "running":
+                break
+        await asyncio.sleep(0.05)
+    else:
+        run_task.cancel()
+        pytest.fail("the node never reached running before cancellation")
+
+    run_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await run_task
+
+    # State is consistent after cancellation: the run and its in-flight node are
+    # errored, not left running — the precondition for a clean resume.
+    assert run_dir is not None
+    (run,) = state_rows(run_dir, "SELECT * FROM run")
+    assert run["status"] == "errored"
+    (node,) = state_rows(run_dir, "SELECT * FROM node")
+    assert node["status"] == "errored"
+    assert not done.exists(), "the node was interrupted before completing"
+
+    # Open the gate and resume: the interrupted node re-runs and completes.
+    gate.touch()
+    resumed = await resume_run(run["run_id"], runs_root)
+
+    assert resumed.succeeded, "the cancelled run resumes to completion"
+    assert done.exists(), "the interrupted node ran again and finished on resume"
+    (node,) = state_rows(run_dir, "SELECT * FROM node")
+    assert node["status"] == "succeeded"
 
 
 @pytest.mark.asyncio

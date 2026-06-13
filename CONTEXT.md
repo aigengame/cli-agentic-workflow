@@ -83,6 +83,27 @@ An append-only record of one occurrence during a run; the event sequence is the
 machine-readable trace of a run.
 _Avoid_: log entry
 
+**Error Classification**:
+The named reason a node Attempt failed, recorded as the node's terminal status so a
+timeout is diagnosable as a timeout and an adapter/internal fault is distinguishable from
+a node that ran and exited non-zero. The kinds are `failed` (non-zero exit), `timed_out`
+(exceeded the node's wall-clock `timeout`; the subprocess is terminated), and `errored`
+(an Adapter or internal exception prevented a result), alongside `succeeded` and the
+scheduler's `skipped`.
+_Avoid_: error code, failure type
+
+**Resume**:
+Continuing an interrupted or failed Run by re-running only its incomplete nodes, reusing
+the same run id, run directory, State, and Event trace. A succeeded node is not re-run; a
+re-run node continues its Attempt numbering past the Attempts already recorded.
+_Avoid_: restart, retry, rerun
+
+**Resume Eligibility**:
+The rule in State that decides whether a Run can be resumed: a Run that already
+`succeeded` (nothing left to do) or is unknown is refused; every other terminal or
+interrupted Run (failed, errored, cancelled) is resumable.
+_Avoid_: resumable flag
+
 ### Patterns and Composition
 
 **Pipeline**:
