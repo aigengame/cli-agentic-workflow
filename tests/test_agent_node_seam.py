@@ -12,6 +12,7 @@ from typing import Any
 
 import pytest
 
+from caw.config import WorkflowConfigError
 from caw.executor import execute_run
 from caw.model import Workflow, normalize_workflow
 
@@ -74,3 +75,83 @@ async def test_agent_node_runs_through_mock_adapter_replaying_a_fixture(
     assert agent_result.node_id == "agent"
     assert agent_result.exit_status == 0
     assert agent_result.stdout == "a one-line summary"
+
+
+def test_agent_node_missing_adapter_is_a_config_error() -> None:
+    raw: dict[str, Any] = {
+        "name": "sample",
+        "version": 1,
+        "nodes": [{"id": "agent", "kind": "agent", "inputs": {"prompt": "do it"}}],
+    }
+
+    with pytest.raises(WorkflowConfigError) as excinfo:
+        normalize_workflow(raw, source="workflow.yaml")
+
+    assert "nodes[0 'agent'].inputs.adapter" in str(excinfo.value)
+
+
+def test_agent_node_blank_prompt_is_a_config_error() -> None:
+    raw: dict[str, Any] = {
+        "name": "sample",
+        "version": 1,
+        "nodes": [{"id": "agent", "kind": "agent", "inputs": {"adapter": "mock", "prompt": "  "}}],
+    }
+
+    with pytest.raises(WorkflowConfigError) as excinfo:
+        normalize_workflow(raw, source="workflow.yaml")
+
+    message = str(excinfo.value)
+    assert "nodes[0 'agent'].inputs.prompt" in message
+    assert "must not be blank" in message
+
+
+def test_agent_node_with_shell_command_input_is_a_config_error() -> None:
+    # An agent Node carrying a shell `command` is a malformed mix; the discriminated
+    # inputs union forbids the foreign field rather than silently ignoring it.
+    raw: dict[str, Any] = {
+        "name": "sample",
+        "version": 1,
+        "nodes": [
+            {
+                "id": "agent",
+                "kind": "agent",
+                "inputs": {"adapter": "mock", "prompt": "do it", "command": "echo hi"},
+            }
+        ],
+    }
+
+    with pytest.raises(WorkflowConfigError):
+        normalize_workflow(raw, source="workflow.yaml")
+
+
+@pytest.mark.asyncio
+async def test_parallel_agent_and_shell_nodes_run_fully_offline(tmp_path: Path) -> None:
+    left = write_fixture(tmp_path / "left.json", exit_status=0, stdout="left agent")
+    right = write_fixture(tmp_path / "right.json", exit_status=0, stdout="right agent")
+    log = tmp_path / "join.log"
+    raw: dict[str, Any] = {
+        "name": "mixed",
+        "version": 1,
+        "nodes": [
+            {
+                "id": "left",
+                "kind": "agent",
+                "inputs": {"adapter": "mock", "prompt": "left", "fixture": str(left)},
+            },
+            {"id": "right", "kind": "shell", "inputs": {"command": f"echo right > {log}"}},
+            {
+                "id": "join",
+                "kind": "agent",
+                "needs": ["left", "right"],
+                "inputs": {"adapter": "mock", "prompt": "join", "fixture": str(right)},
+            },
+        ],
+    }
+    workflow = normalize_workflow(raw, source="<test>")
+
+    result = await execute_run(workflow, tmp_path / "runs")
+
+    assert result.succeeded
+    statuses = {r.node_id: r.exit_status for r in result.node_results}
+    assert statuses == {"left": 0, "right": 0, "join": 0}
+    assert log.read_text(encoding="utf-8").strip() == "right"

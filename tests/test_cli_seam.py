@@ -855,3 +855,30 @@ def test_run_invalid_workflow_definition_fails_before_executing_anything(
     assert result.exception is None or isinstance(result.exception, SystemExit)
     assert "invalid.yaml" in result.output
     assert not (tmp_path / ".caw").exists(), "no run directory is created for invalid input"
+
+
+def test_run_malformed_agent_node_is_a_config_error_before_executing_anything(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workflow_file = tmp_path / "agent.yaml"
+    # An agent Node missing its required `adapter` is malformed; it must fail as a
+    # config error (exit 2, one error line naming the node) before any execution,
+    # exactly like a malformed shell Node.
+    workflow_file.write_text(
+        "name: sample\n"
+        "version: 1\n"
+        "nodes:\n"
+        "  - id: summarize\n    kind: agent\n    inputs:\n      prompt: do it\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["run", str(workflow_file)])
+
+    assert result.exit_code == 2
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    lines = [line for line in result.output.splitlines() if line.strip()]
+    assert len(lines) == 1
+    assert lines[0].startswith("error:")
+    assert "summarize" in lines[0], "the error names the node id"
+    assert not (tmp_path / ".caw").exists(), "no run directory is created for invalid input"
