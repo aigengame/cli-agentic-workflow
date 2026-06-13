@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.0](https://github.com/aigengame/cli-agentic-workflow/compare/v0.4.0...v0.5.0) (2026-06-13)
+
+
+### Features
+
+* failure semantics — retries, timeouts, cancellation, and resume ([#69](https://github.com/aigengame/cli-agentic-workflow/issues/69)) ([fdf7344](https://github.com/aigengame/cli-agentic-workflow/commit/fdf7344b66d1b9e92d4a5477e6ff69b523fdecd9))
+
 ## [0.4.0](https://github.com/aigengame/cli-agentic-workflow/compare/v0.3.0...v0.4.0) (2026-06-13)
 
 
