@@ -96,3 +96,58 @@ async def test_missing_cli_raises_an_actionable_setup_error(
     message = str(excinfo.value)
     assert "claude" in message
     assert "install" in message.lower(), "the error tells the user how to install/enable the CLI"
+
+
+@pytest.mark.asyncio
+async def test_prompt_is_positional_and_node_args_pass_through_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The prompt is a positional argument to `claude -p`; the node's `args`
+    # (sandbox/approval/any other CLI flags) pass through to the subprocess
+    # UNCHANGED. caw adds no policy engine: it neither interprets nor injects flags.
+    captured = patch_spawn(monkeypatch, FakeProcess(0, stdout=b"ok"))
+    adapter = ClaudePrintAdapter()
+
+    await adapter.invoke(
+        AgentInvocation(
+            node_id="n",
+            adapter="claude.print",
+            prompt="summarize the repo",
+            args=("--permission-mode", "acceptEdits", "--add-dir", "/tmp/x"),
+        )
+    )
+
+    assert captured["args"] == (
+        "claude",
+        "-p",
+        "summarize the repo",
+        "--permission-mode",
+        "acceptEdits",
+        "--add-dir",
+        "/tmp/x",
+    )
+
+
+@pytest.mark.asyncio
+async def test_only_the_invocation_env_reaches_the_subprocess(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Env policy (ADR 0006, #5): the executor hands the adapter an already-filtered
+    # allow-list. The adapter passes EXACTLY that to the subprocess — never merging
+    # the parent os.environ, which would leak the whole environment.
+    monkeypatch.setenv("PARENT_ONLY_VAR", "leaked-if-present")
+    captured = patch_spawn(monkeypatch, FakeProcess(0, stdout=b"ok"))
+    adapter = ClaudePrintAdapter()
+
+    await adapter.invoke(
+        AgentInvocation(
+            node_id="n",
+            adapter="claude.print",
+            prompt="do it",
+            env={"DECLARED_VAR": "declared-value"},
+        )
+    )
+
+    assert captured["env"] == {"DECLARED_VAR": "declared-value"}, (
+        "exactly the invocation env reaches the subprocess, with no parent-env leakage"
+    )

@@ -31,12 +31,22 @@ class ClaudePrintAdapter(Adapter):
     """Invokes ``claude -p`` (Claude Code headless mode) and normalizes its result."""
 
     async def invoke(self, invocation: AgentInvocation) -> AgentResult:
+        # The prompt is positional; the node's `args` pass through verbatim —
+        # caw owns no policy engine, so it neither interprets nor injects
+        # sandbox/approval (or any) flags. exec (not shell): args are a list, so
+        # there is no shell interpolation of the prompt or the passthrough flags.
         argv = [CLAUDE_CLI, "-p", invocation.prompt, *invocation.args]
+        # Env policy (ADR 0006, #5): pass EXACTLY the kernel's already-filtered
+        # allow-list, never a merge of os.environ — that would leak the parent
+        # environment. The consequence is intentional, not a bug: running real
+        # `claude` requires the workflow to declare every env var the CLI needs
+        # (e.g. its auth/config vars) so they appear in invocation.env.
         try:
             process = await asyncio.create_subprocess_exec(
                 *argv,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                env=dict(invocation.env),
             )
         except FileNotFoundError as exc:
             raise AdapterError(
