@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.1](https://github.com/aigengame/cli-agentic-workflow/compare/v0.5.0...v0.5.1) (2026-06-13)
+
+
+### Bug Fixes
+
+* **executor:** verify snapshot checksum and translate adapter errors on resume ([#70](https://github.com/aigengame/cli-agentic-workflow/issues/70)) ([#72](https://github.com/aigengame/cli-agentic-workflow/issues/72)) ([6bfc0cb](https://github.com/aigengame/cli-agentic-workflow/commit/6bfc0cbcbf7139ab106a9623c743858d0c62fc45))
+
 ## [0.5.0](https://github.com/aigengame/cli-agentic-workflow/compare/v0.4.0...v0.5.0) (2026-06-13)
 
 
