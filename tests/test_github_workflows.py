@@ -128,6 +128,63 @@ class TestReleasePleaseWorkflow:
         assert "release_created" in build_job["if"]
 
 
+class TestReleasePleaseLockfileSync:
+    """A Release PR must carry a uv.lock that matches its bumped pyproject (issue #46).
+
+    release-please bumps pyproject.toml and src/caw/__init__.py but never touches
+    uv.lock, which embeds the project's own ``caw`` version. Without re-locking on
+    the Release PR branch, the PR's ``uv sync --locked`` gate fails (Release PR #45).
+    """
+
+    def _sync_job(self) -> dict[str, Any]:
+        jobs = load_workflow("release-please.yml")["jobs"]
+        sync_jobs = [
+            job
+            for name, job in jobs.items()
+            if name != "release-please"
+            and any("uv lock" in step.get("run", "") for step in job.get("steps", []))
+        ]
+        assert len(sync_jobs) == 1, "expected exactly one job that runs `uv lock`"
+        job = sync_jobs[0]
+        assert isinstance(job, dict)
+        return job
+
+    def test_sync_job_is_guarded_on_a_release_pr_being_touched(self) -> None:
+        job = self._sync_job()
+        # prs_created is true when a Release PR is created OR updated, so the
+        # re-lock fires on the version-bump PR rather than only at release time.
+        assert "needs.release-please.outputs.prs_created" in job["if"]
+
+    def test_sync_job_checks_out_the_release_pr_branch(self) -> None:
+        job = self._sync_job()
+        # The release branch comes from the action's `pr` output (PullRequest JSON,
+        # field headBranchName); checking out main would re-lock the wrong branch.
+        assert "headBranchName" in yaml.safe_dump(job)
+        assert "needs.release-please.outputs.pr" in yaml.safe_dump(job)
+
+    def test_sync_job_relocks_and_pushes_uv_lock(self) -> None:
+        joined = "\n".join(step.get("run", "") for step in self._sync_job().get("steps", []))
+        assert "uv lock" in joined, "must refresh the lockfile"
+        assert "uv.lock" in joined, "must act on the lockfile specifically"
+        assert "git push" in joined, "must push the refreshed lockfile back"
+
+    def test_sync_job_avoids_empty_commits(self) -> None:
+        joined = "\n".join(step.get("run", "") for step in self._sync_job().get("steps", []))
+        # No-op when the lockfile is already in sync: a diff check must gate the
+        # commit so an unchanged uv.lock does not produce an empty commit.
+        assert "git diff" in joined, "must guard the commit on an actual change"
+
+    def test_sync_job_keeps_least_privilege_write_permission(self) -> None:
+        job = self._sync_job()
+        assert job.get("permissions") == {"contents": "write"}
+
+    def test_release_please_exposes_the_pr_output(self) -> None:
+        release_job = load_workflow("release-please.yml")["jobs"]["release-please"]
+        outputs = release_job.get("outputs", {})
+        assert "pr" in outputs, "downstream re-lock needs the Release PR JSON"
+        assert "prs_created" in outputs, "downstream re-lock needs the touched guard"
+
+
 class TestReleasePleaseConfig:
     """The release-please config bumps the Python project version from conventional commits."""
 
