@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 import json
+import os
 import secrets
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -10,14 +11,31 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from caw.adapter import AdapterRegistry, AgentInvocation
+from caw.contract import OutputContractError, validate_output_contract
 from caw.events import EventLog
-from caw.model import Node, Workflow, definition_checksum, execution_order, workflow_snapshot
+from caw.model import (
+    AgentNodeInputs,
+    Node,
+    ShellNodeInputs,
+    Workflow,
+    definition_checksum,
+    execution_order,
+    workflow_snapshot,
+)
 from caw.state import StateStore
 
 
 @dataclass(frozen=True)
 class NodeResult:
-    """The normalized output of one Node Attempt."""
+    """The normalized output of one Node Attempt.
+
+    Shell and agent Nodes share this shape so the scheduler, State, and Events
+    treat them identically. ``structured_output`` and ``artifacts`` are populated
+    only for agent Nodes (the Adapter's normalized result); for shell Nodes they
+    stay ``None``/empty. ``artifacts`` holds durable file paths produced by the
+    Attempt, indexed minimally in State (#5).
+    """
 
     node_id: str
     exit_status: int
@@ -25,6 +43,8 @@ class NodeResult:
     stderr: str
     started_at: str
     finished_at: str
+    structured_output: object | None = None
+    artifacts: tuple[Path, ...] = ()
 
     @property
     def succeeded(self) -> bool:
@@ -36,7 +56,18 @@ class NodeResult:
 
     @property
     def normalized_output(self) -> dict[str, Any]:
-        return {"exit_status": self.exit_status, "stdout": self.stdout, "stderr": self.stderr}
+        output: dict[str, Any] = {
+            "exit_status": self.exit_status,
+            "stdout": self.stdout,
+            "stderr": self.stderr,
+        }
+        # Only agent Nodes carry structured output / artifacts; omit them for
+        # shell Nodes so the persisted output shape is unchanged from before #5.
+        if self.structured_output is not None:
+            output["structured_output"] = self.structured_output
+        if self.artifacts:
+            output["artifacts"] = [str(path) for path in self.artifacts]
+        return output
 
 
 @dataclass(frozen=True)
@@ -89,6 +120,7 @@ def _task_crash(task: "asyncio.Task[NodeResult]") -> BaseException:
 
 
 async def _execute_shell_node(node: Node) -> NodeResult:
+    assert isinstance(node.inputs, ShellNodeInputs)
     started_at = _now()
     process = await asyncio.create_subprocess_shell(
         node.inputs.command,
@@ -113,6 +145,109 @@ async def _execute_shell_node(node: Node) -> NodeResult:
         started_at=started_at,
         finished_at=_now(),
     )
+
+
+def _resolve_declared_env(declared: tuple[str, ...]) -> dict[str, str]:
+    """Resolve declared env var NAMES to their values from the parent environment.
+
+    The env policy is allow-list-only: a Node receives a variable solely if it
+    declared the name AND that name is present in the parent environment. Nothing
+    else from the parent environment passes through, and an undeclared or absent
+    name is simply omitted — never defaulted. The returned mapping is the ONLY
+    environment the Adapter (and thus the Agent CLI process) sees for this Node;
+    its VALUES are never persisted to State, Events, or the snapshot (#5).
+    """
+    return {name: os.environ[name] for name in declared if name in os.environ}
+
+
+async def _execute_agent_node(node: Node, registry: AdapterRegistry) -> NodeResult:
+    """Run an agent Node through its Adapter and validate its Output Contract.
+
+    Adapter or Output-Contract failures are recorded as an ordinary node failure
+    (exit_status 1) with the cause on stderr, so the #4 scheduler skips the
+    failed Node's dependents exactly as it does for a non-zero shell Node. The
+    Output Contract is validated AFTER the Adapter returns and BEFORE the result
+    is reported, so a contract breach fails the Node even when the Agent CLI
+    itself exited zero.
+
+    Exit-status gating (#63): the Output Contract is evaluated ONLY when the Agent
+    CLI exited zero. The contract is a guarantee about a successful invocation's
+    structured output; a non-zero exit is already a node failure, so re-checking
+    the contract would be redundant and could mask the agent's own failure cause
+    with a contract message. The structured output is validated as-is, including
+    JSON null — a schema permitting null passes, one requiring content fails — so
+    the schema is the sole arbiter and None is never special-cased.
+    """
+    assert isinstance(node.inputs, AgentNodeInputs)
+    inputs = node.inputs
+    started_at = _now()
+    adapter = registry.resolve(inputs.adapter)
+    invocation = AgentInvocation(
+        node_id=node.id,
+        adapter=inputs.adapter,
+        prompt=inputs.prompt,
+        args=inputs.args,
+        env=_resolve_declared_env(inputs.env),
+        output_schema=inputs.output_schema,
+        fixture=inputs.fixture,
+    )
+    result = await adapter.invoke(invocation)
+    exit_status = result.exit_status
+    stderr = result.stderr
+    if exit_status == 0 and inputs.output_schema is not None:
+        try:
+            validate_output_contract(inputs.output_schema, result.structured_output)
+        except OutputContractError as exc:
+            exit_status = 1
+            stderr = f"{stderr}\n{exc}".strip() if stderr else str(exc)
+    return NodeResult(
+        node_id=node.id,
+        exit_status=exit_status,
+        stdout=result.stdout,
+        stderr=stderr,
+        started_at=started_at,
+        finished_at=_now(),
+        structured_output=result.structured_output,
+        artifacts=result.artifacts,
+    )
+
+
+async def _execute_node(node: Node, registry: AdapterRegistry) -> NodeResult:
+    """Dispatch a Node Attempt to the runner for its kind.
+
+    The single dispatch seam every new Node kind extends: shell Nodes spawn a
+    subprocess, agent Nodes go through an Adapter. An Adapter-level failure
+    (unknown adapter, unreadable fixture) is normalized into a failed NodeResult
+    here so the scheduler treats it like any other node failure rather than a Run
+    crash. Both runners share one NodeResult shape, so State, Events, and the
+    scheduler stay kind-agnostic.
+    """
+    if isinstance(node.inputs, ShellNodeInputs):
+        return await _execute_shell_node(node)
+    try:
+        return await _execute_agent_node(node, registry)
+    except Exception as exc:
+        # ANY Exception from the agent path — an AdapterError (unknown adapter,
+        # unreadable/malformed fixture), an OutputContractError, or an arbitrary
+        # exception a real Agent CLI Adapter raises inside invoke() (parse,
+        # subprocess, timeout) — is normalized into a failed Node here so the
+        # scheduler skips its dependents uniformly rather than the exception
+        # escaping and crashing the whole Run (#61, ADR 0006's own contract).
+        #
+        # Only Exception is caught, never BaseException: asyncio.CancelledError
+        # (a BaseException since 3.8), KeyboardInterrupt, and SystemExit must
+        # still propagate so the #4 crash/cancel path and #22/#54 finalization
+        # tear down siblings and record the Run errored.
+        now = _now()
+        cause = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+        return NodeResult(
+            node_id=node.id,
+            exit_status=1,
+            stdout="",
+            stderr=cause,
+            started_at=now,
+            finished_at=now,
+        )
 
 
 def _finalize_crashed_run(
@@ -158,11 +293,17 @@ class _Scheduler:
     """
 
     def __init__(
-        self, workflow: Workflow, state: StateStore, events: EventLog, run_id: str
+        self,
+        workflow: Workflow,
+        state: StateStore,
+        events: EventLog,
+        run_id: str,
+        registry: AdapterRegistry,
     ) -> None:
         self._state = state
         self._events = events
         self._run_id = run_id
+        self._registry = registry
         self._concurrency = workflow.concurrency
         # execution_order seeds a deterministic launch order among ready Nodes:
         # declaration-order tie-break, the same order `caw graph` reports.
@@ -199,7 +340,7 @@ class _Scheduler:
                 break
             self._state.record_node_started(run_id=self._run_id, node_id=node.id)
             self._events.append("node_started", {"node_id": node.id, "attempt": 1})
-            task = asyncio.ensure_future(_execute_shell_node(node))
+            task = asyncio.ensure_future(_execute_node(node, self._registry))
             self._in_flight[task] = node
 
     def _record_finished(self, node: Node, result: NodeResult) -> None:
@@ -314,8 +455,16 @@ class _Scheduler:
                 await task
 
 
-async def execute_run(workflow: Workflow, runs_root: Path) -> RunResult:
-    """Materialize a run directory, execute the Workflow's Nodes, and persist the Run."""
+async def execute_run(
+    workflow: Workflow, runs_root: Path, registry: AdapterRegistry | None = None
+) -> RunResult:
+    """Materialize a run directory, execute the Workflow's Nodes, and persist the Run.
+
+    ``registry`` resolves agent Nodes' ``adapter`` names to Adapters; it defaults
+    to the mock-Adapter registry so shell-only Runs and offline agent Runs need
+    no wiring. Real-CLI Adapters (#9, #11) are injected by passing a populated
+    registry.
+    """
     # A normally constructed Workflow is validated `concurrency >= 1`; a Workflow
     # that bypassed validation (model_construct, model_copy(update=...)) could
     # reach the scheduler with concurrency < 1, which would launch nothing and
@@ -342,7 +491,7 @@ async def execute_run(workflow: Workflow, runs_root: Path) -> RunResult:
             created_at=_now(),
         )
         events.append("run_started", {"workflow_name": workflow.name})
-        scheduler = _Scheduler(workflow, state, events, run_id)
+        scheduler = _Scheduler(workflow, state, events, run_id, registry or AdapterRegistry())
         try:
             run_result = await scheduler.run()
             state.record_run_finished(run_id=run_id, status=run_result.status, finished_at=_now())

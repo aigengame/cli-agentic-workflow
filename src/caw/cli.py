@@ -59,7 +59,11 @@ def _load_normalized_workflow(workflow_file: Path) -> Workflow:
     """Load and normalize a workflow file, or exit 2 with one `error:` line."""
     try:
         raw = load_workflow_file(workflow_file)
-        return normalize_workflow(raw, source=str(workflow_file))
+        # Anchor relative agent-Node paths to the workflow file's directory so the
+        # same definition validates and runs identically from any cwd (#64).
+        return normalize_workflow(
+            raw, source=str(workflow_file), base_dir=workflow_file.resolve().parent
+        )
     except WorkflowConfigError as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=2) from exc

@@ -103,6 +103,50 @@ def test_error_location_renders_index_and_quoted_id_for_an_integer_like_id() -> 
     )
 
 
+def test_node_kind_shell_with_an_explicit_agent_inputs_kind_is_a_config_error() -> None:
+    # #62: node kind is the single source of truth. A node declaring kind `shell`
+    # but carrying an explicit `inputs.kind: agent` must be rejected as a config
+    # error, never validate to a shell-labelled node the executor runs as an agent.
+    raw: dict[str, Any] = {
+        "name": "sample",
+        "version": 1,
+        "nodes": [
+            {
+                "id": "n",
+                "kind": "shell",
+                "inputs": {"kind": "agent", "adapter": "mock", "prompt": "p"},
+            }
+        ],
+    }
+
+    with pytest.raises(WorkflowConfigError) as excinfo:
+        normalize_workflow(raw, source="workflow.yaml")
+
+    message = str(excinfo.value)
+    assert "n" in message, "the error names the offending node"
+    assert "kind" in message, "the error names the kind/inputs mismatch"
+
+
+def test_node_kind_agent_with_an_explicit_shell_inputs_kind_is_a_config_error() -> None:
+    # The reverse: kind `agent` with an explicit `inputs.kind: shell`.
+    raw: dict[str, Any] = {
+        "name": "sample",
+        "version": 1,
+        "nodes": [
+            {
+                "id": "n",
+                "kind": "agent",
+                "inputs": {"kind": "shell", "command": "echo hi"},
+            }
+        ],
+    }
+
+    with pytest.raises(WorkflowConfigError) as excinfo:
+        normalize_workflow(raw, source="workflow.yaml")
+
+    assert "kind" in str(excinfo.value), "the error names the kind/inputs mismatch"
+
+
 def test_error_location_disambiguates_duplicate_ids_by_position() -> None:
     raw: dict[str, Any] = {
         "name": "sample",

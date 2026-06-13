@@ -5,6 +5,7 @@ import hashlib
 import heapq
 import json
 from collections.abc import Sequence
+from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import (
@@ -12,10 +13,12 @@ from pydantic import (
     ConfigDict,
     Field,
     ValidationError,
+    ValidationInfo,
     field_validator,
     model_validator,
 )
 
+from caw.adapter import BUILTIN_ADAPTER_NAMES
 from caw.config import WorkflowConfigError
 
 
@@ -30,20 +33,190 @@ class ShellNodeInputs(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
+    kind: Literal["shell"] = "shell"
     command: str
 
     _command_non_blank = field_validator("command")(_require_non_blank)
 
 
+class AgentNodeInputs(BaseModel):
+    """Inputs of an agent Node: how it selects an Adapter and what it sends.
+
+    ``adapter`` names the Adapter that invokes the external Agent CLI (the mock
+    Adapter in v0.1); an unknown built-in adapter name fails validation fast (#64).
+    ``output_schema`` and ``fixture`` are file paths: a relative path is anchored
+    to the workflow file's directory at normalize time (not the process CWD), so
+    the same definition runs identically from any working directory (#64); an
+    absolute path is used as-is. Existence is checked at execution time, so an
+    authoring typo fails as a node error rather than a crash. ``env`` is a
+    declaration of variable NAMES, never values: only the named variables reach
+    the node process, and the env policy keeps their values out of State, Events,
+    and Artifacts (#5).
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    kind: Literal["agent"] = "agent"
+    adapter: str
+    prompt: str
+    args: tuple[str, ...] = ()
+    env: tuple[str, ...] = ()
+    output_schema: Path | None = None
+    fixture: Path | None = None
+
+    _adapter_non_blank = field_validator("adapter")(_require_non_blank)
+    _prompt_non_blank = field_validator("prompt")(_require_non_blank)
+
+    @field_validator("adapter")
+    @classmethod
+    def _adapter_must_be_known(cls, adapter: str, info: ValidationInfo) -> str:
+        # A typo'd / unknown adapter name fails validation fast (#64), before any
+        # run directory. The known set is the built-in adapter names by default;
+        # a caller injecting adapters at run time passes its known names through
+        # the validation context, since those names are not knowable from the
+        # definition alone.
+        known = BUILTIN_ADAPTER_NAMES
+        if isinstance(info.context, dict):
+            override = info.context.get("known_adapters")
+            if override is not None:
+                known = frozenset(override)
+        if adapter not in known:
+            allowed = ", ".join(sorted(known)) or "<none>"
+            raise ValueError(f"unknown adapter {adapter!r} (known: {allowed})")
+        return adapter
+
+    @field_validator("env")
+    @classmethod
+    def _env_names_must_be_unique_and_non_blank(cls, names: tuple[str, ...]) -> tuple[str, ...]:
+        seen: set[str] = set()
+        for name in names:
+            if not name.strip():
+                raise ValueError("env names must not be blank or whitespace-only")
+            if name in seen:
+                raise ValueError(f"duplicate env name {name!r}")
+            seen.add(name)
+        return names
+
+
+# The node-level `kind` is the single source of truth (#62): it selects which
+# inputs model is built, so the top-level kind, the `caw graph` plan, and the
+# executor dispatch can never disagree. Because the concrete model is chosen by
+# kind (not by a discriminated union), validation errors name the authored field
+# directly (`inputs.command`) with no injected discriminator tag to strip.
+_INPUTS_MODEL_FOR_KIND: dict[str, type[ShellNodeInputs | AgentNodeInputs]] = {
+    "shell": ShellNodeInputs,
+    "agent": AgentNodeInputs,
+}
+
+
+_RELATIVE_PATH_INPUTS = ("output_schema", "fixture")
+
+
+def _resolve_inputs_paths(inputs: dict[str, Any], context: Any) -> dict[str, Any]:
+    """Anchor relative agent-Node file paths to the workflow file's directory (#64).
+
+    ``output_schema`` and ``fixture`` are file paths; resolving a relative one
+    against the workflow file's directory (the ``base_dir`` in the validation
+    context) rather than the kernel process CWD makes the same definition run
+    identically from any working directory. An absolute path is left untouched,
+    and with no ``base_dir`` the paths pass through as authored.
+    """
+    if not isinstance(context, dict):
+        return inputs
+    base_dir = context.get("base_dir")
+    if base_dir is None or inputs.get("kind") != "agent":
+        return inputs
+    resolved = dict(inputs)
+    for key in _RELATIVE_PATH_INPUTS:
+        value = resolved.get(key)
+        if isinstance(value, str | Path):
+            path = Path(value)
+            if not path.is_absolute():
+                resolved[key] = str(Path(base_dir) / path)
+    return resolved
+
+
+def _build_inputs(
+    model: type[ShellNodeInputs | AgentNodeInputs],
+    inputs: dict[str, Any],
+    context: Any,
+) -> ShellNodeInputs | AgentNodeInputs:
+    """Build the kind's inputs model, re-raising any failure under the `inputs` field.
+
+    Validating the inputs model here (rather than via a discriminated union on the
+    field) means an inner failure carries the inputs-local path (``command``);
+    re-prefixing it with ``inputs`` keeps the rendered location precise
+    (``inputs.command``) without the discriminated union's injected tag — so #62
+    removes the discriminator-strip workaround entirely. The validation context
+    flows down so the adapter-known check (#64) sees any caller-injected adapters.
+    """
+    try:
+        return model.model_validate(inputs, context=context)
+    except ValidationError as exc:
+        raise ValidationError.from_exception_data(
+            exc.title, [_reprefix_inputs(error) for error in exc.errors()]
+        ) from exc
+
+
+def _reprefix_inputs(error: Any) -> Any:
+    """Re-locate one inner-inputs error under the node's ``inputs`` field.
+
+    Preserves the original error type so the rendered message is unchanged (a
+    ``missing`` stays "Field required", a ``value_error`` carries its own
+    message), only prepending ``inputs`` to the location path.
+    """
+    relocated: dict[str, Any] = {
+        "type": error["type"],
+        "loc": ("inputs", *error["loc"]),
+        "input": error.get("input"),
+    }
+    ctx = error.get("ctx")
+    if ctx is not None:
+        # A value_error renders from ctx['error']; keep the original ValueError so
+        # the message is not double-prefixed with "Value error,".
+        relocated["ctx"] = ctx
+    return relocated
+
+
 class Node(BaseModel):
-    """A unit of work in a Workflow; the walking skeleton supports only shell Nodes."""
+    """A unit of work in a Workflow; v0.1 supports shell and agent Nodes."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     id: str
-    kind: Literal["shell"]
-    inputs: ShellNodeInputs
+    kind: Literal["shell", "agent"]
+    inputs: ShellNodeInputs | AgentNodeInputs
     needs: tuple[str, ...] = ()
+
+    @model_validator(mode="before")
+    @classmethod
+    def _build_inputs_from_kind(cls, data: object, info: ValidationInfo) -> object:
+        # `kind` lives at the node level in workflow definitions and is the single
+        # source of truth: build the inputs model the node-level `kind` names,
+        # rather than letting `inputs` pick its own variant independently (#62).
+        # An explicit `inputs.kind` that disagrees with the node `kind` is a
+        # mismatch — rejected as a config error instead of validating to a node
+        # whose graph label and runner disagree.
+        if isinstance(data, dict):
+            kind = data.get("kind")
+            inputs = data.get("inputs")
+            if isinstance(kind, str) and isinstance(inputs, dict):
+                explicit = inputs.get("kind")
+                if explicit is not None and explicit != kind:
+                    raise ValueError(
+                        f"node kind {kind!r} disagrees with inputs.kind {explicit!r}; "
+                        f"the node-level kind is authoritative"
+                    )
+                model = _INPUTS_MODEL_FOR_KIND.get(kind)
+                if model is not None:
+                    resolved = _resolve_inputs_paths({**inputs, "kind": kind}, info.context)
+                    # Build the concrete inputs model the kind names and hand the
+                    # built instance to the field. The field type is a plain union,
+                    # so pydantic accepts the already-built instance as-is without
+                    # re-resolving a variant — keeping validation errors on the
+                    # authored field (inputs.command) with no discriminator tag.
+                    data = {**data, "inputs": _build_inputs(model, resolved, info.context)}
+        return data
 
     _id_non_blank = field_validator("id")(_require_non_blank)
 
@@ -232,6 +405,9 @@ def _node_id_at(raw: dict[str, Any], index: int) -> str | None:
 
 
 def _render_location(loc: tuple[int | str, ...], raw: dict[str, Any]) -> str:
+    # The node-level kind selects the inputs model directly (#62), so no
+    # discriminated-union tag is ever injected into the path: the location reads
+    # `inputs.command` straight off the error, with no strip step.
     parts = [str(part) for part in loc]
     if len(loc) >= 2 and loc[0] == "nodes" and isinstance(loc[1], int):
         # Pair the position with the quoted id: nodes[1 'greet'].kind stays
@@ -251,10 +427,29 @@ def _first_error_line(exc: ValidationError, raw: dict[str, Any]) -> str:
     return f"{location}: {first['msg']}{suffix}"
 
 
-def normalize_workflow(raw: dict[str, Any], source: str) -> Workflow:
-    """Normalize a raw workflow mapping into the Workflow IR, or fail with field paths."""
+def normalize_workflow(
+    raw: dict[str, Any],
+    source: str,
+    *,
+    base_dir: Path | None = None,
+    known_adapters: frozenset[str] | None = None,
+) -> Workflow:
+    """Normalize a raw workflow mapping into the Workflow IR, or fail with field paths.
+
+    ``base_dir`` anchors relative agent-Node ``output_schema`` / ``fixture`` paths
+    (the workflow file's directory), so the same definition runs identically from
+    any working directory (#64); when ``None`` the paths are left as authored.
+    ``known_adapters`` overrides the built-in adapter set the adapter-known check
+    validates against, for a caller injecting adapters at run time; when ``None``
+    the built-in set applies (#64).
+    """
+    context: dict[str, Any] = {}
+    if base_dir is not None:
+        context["base_dir"] = base_dir
+    if known_adapters is not None:
+        context["known_adapters"] = known_adapters
     try:
-        return Workflow.model_validate(raw)
+        return Workflow.model_validate(raw, context=context or None)
     except ValidationError as exc:
         raise WorkflowConfigError(
             f"invalid workflow definition in {source}: {_first_error_line(exc, raw)}"
