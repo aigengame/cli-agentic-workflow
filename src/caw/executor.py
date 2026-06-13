@@ -25,6 +25,28 @@ from caw.model import (
 )
 from caw.state import StateStore
 
+# Error classification (#6): the terminal status of a failed Node Attempt names
+# WHY it failed, so a timeout is diagnosable as a timeout and an adapter/internal
+# error is distinguishable from a node that ran and exited non-zero. The kinds:
+#   "failed"    — the runner ran and reported a non-zero exit status
+#   "timed_out" — the Attempt exceeded the Node's wall-clock `timeout` budget and
+#                 was terminated (subprocess killed)
+#   "errored"   — an Adapter or internal exception prevented the runner from
+#                 producing a result at all
+# ``failure_kind is None`` is the single source of truth for success, so the
+# status taxonomy stays in one place rather than scattered across call sites.
+FAILED = "failed"
+TIMED_OUT = "timed_out"
+ERRORED = "errored"
+
+# The failure kinds the executor RE-ATTEMPTS when a Node has retries remaining
+# (#6). A non-zero exit and a timeout are commonly transient (a flaky command, a
+# slow upstream), so they are retryable; an ``errored`` failure is an
+# Adapter/internal fault (unknown adapter, unreadable fixture, a bug) that is
+# almost always deterministic, so retrying it would only burn Attempts — it goes
+# terminal immediately. No backoff is applied between Attempts in v0.1.
+_RETRYABLE_FAILURE_KINDS = frozenset({FAILED, TIMED_OUT})
+
 
 @dataclass(frozen=True)
 class NodeResult:
@@ -35,6 +57,12 @@ class NodeResult:
     only for agent Nodes (the Adapter's normalized result); for shell Nodes they
     stay ``None``/empty. ``artifacts`` holds durable file paths produced by the
     Attempt, indexed minimally in State (#5).
+
+    ``failure_kind`` classifies a failed Attempt (#6): ``None`` means the Attempt
+    succeeded; otherwise it is one of ``FAILED`` / ``TIMED_OUT`` / ``ERRORED`` and
+    becomes the Node's terminal status. It is the single source of truth for
+    success so a timeout (exit_status -1, ``TIMED_OUT``) is never read as an
+    ordinary non-zero exit.
     """
 
     node_id: str
@@ -45,14 +73,24 @@ class NodeResult:
     finished_at: str
     structured_output: object | None = None
     artifacts: tuple[Path, ...] = ()
+    failure_kind: str | None = None
 
     @property
     def succeeded(self) -> bool:
-        return self.exit_status == 0
+        return self.failure_kind is None
 
     @property
     def status(self) -> str:
-        return "succeeded" if self.succeeded else "failed"
+        # succeeded ⇔ failure_kind is None, so a non-success always carries a
+        # concrete kind string; assert keeps the return type str for mypy.
+        if self.failure_kind is None:
+            return "succeeded"
+        return self.failure_kind
+
+    @property
+    def retryable(self) -> bool:
+        """Whether this failure kind is worth re-attempting if retries remain (#6)."""
+        return self.failure_kind in _RETRYABLE_FAILURE_KINDS
 
     @property
     def normalized_output(self) -> dict[str, Any]:
@@ -119,7 +157,30 @@ def _task_crash(task: "asyncio.Task[NodeResult]") -> BaseException:
     return exception
 
 
+async def _kill_and_reap(process: "asyncio.subprocess.Process") -> None:
+    """Kill a still-running subprocess and reap it so no orphan is left behind.
+
+    Shared by the cancellation and timeout paths (#6): a node whose budget
+    expires must leave no live subprocess, exactly as cancellation does. A
+    process that already exited (returncode set) needs no kill; ProcessLookupError
+    is suppressed for the race where it exits between the check and the signal.
+    """
+    if process.returncode is None:
+        with contextlib.suppress(ProcessLookupError):
+            process.kill()
+    await process.wait()
+
+
 async def _execute_shell_node(node: Node) -> NodeResult:
+    """Run a shell Node's command as a subprocess, enforcing its timeout budget.
+
+    A non-zero exit is an ordinary node failure (``FAILED``). A Node that exceeds
+    its ``timeout`` is terminated — the subprocess is KILLED so no orphan is left,
+    mirroring the cancellation handler — and classified ``TIMED_OUT`` with
+    exit_status -1, so a timeout is never read as a non-zero exit (#6). Timeout
+    wraps ``communicate()`` (the wall-clock the node spends running); a Node with
+    no ``timeout`` runs unbounded as before.
+    """
     assert isinstance(node.inputs, ShellNodeInputs)
     started_at = _now()
     process = await asyncio.create_subprocess_shell(
@@ -129,12 +190,21 @@ async def _execute_shell_node(node: Node) -> NodeResult:
         stderr=asyncio.subprocess.PIPE,
     )
     try:
-        stdout, stderr = await process.communicate()
+        async with asyncio.timeout(node.timeout):
+            stdout, stderr = await process.communicate()
+    except TimeoutError:
+        await _kill_and_reap(process)
+        return NodeResult(
+            node_id=node.id,
+            exit_status=-1,
+            stdout="",
+            stderr=f"node {node.id!r} exceeded its timeout of {node.timeout}s",
+            started_at=started_at,
+            finished_at=_now(),
+            failure_kind=TIMED_OUT,
+        )
     except asyncio.CancelledError:
-        if process.returncode is None:
-            with contextlib.suppress(ProcessLookupError):
-                process.kill()
-        await process.wait()
+        await _kill_and_reap(process)
         raise
     exit_status = process.returncode if process.returncode is not None else -1
     return NodeResult(
@@ -144,6 +214,7 @@ async def _execute_shell_node(node: Node) -> NodeResult:
         stderr=stderr.decode(errors="backslashreplace"),
         started_at=started_at,
         finished_at=_now(),
+        failure_kind=None if exit_status == 0 else FAILED,
     )
 
 
@@ -191,7 +262,24 @@ async def _execute_agent_node(node: Node, registry: AdapterRegistry) -> NodeResu
         output_schema=inputs.output_schema,
         fixture=inputs.fixture,
     )
-    result = await adapter.invoke(invocation)
+    # The timeout wraps the Adapter invocation — the wall-clock the node spends
+    # waiting on the external Agent CLI (#6). A TimeoutError is classified
+    # TIMED_OUT here rather than caught by the generic ERRORED handler in
+    # _execute_node, so a slow agent is diagnosable as a timeout, not an error.
+    try:
+        async with asyncio.timeout(node.timeout):
+            result = await adapter.invoke(invocation)
+    except TimeoutError:
+        return NodeResult(
+            node_id=node.id,
+            exit_status=-1,
+            stdout="",
+            stderr=f"node {node.id!r} (adapter {inputs.adapter!r}) "
+            f"exceeded its timeout of {node.timeout}s",
+            started_at=started_at,
+            finished_at=_now(),
+            failure_kind=TIMED_OUT,
+        )
     exit_status = result.exit_status
     stderr = result.stderr
     if exit_status == 0 and inputs.output_schema is not None:
@@ -209,6 +297,7 @@ async def _execute_agent_node(node: Node, registry: AdapterRegistry) -> NodeResu
         finished_at=_now(),
         structured_output=result.structured_output,
         artifacts=result.artifacts,
+        failure_kind=None if exit_status == 0 else FAILED,
     )
 
 
@@ -247,6 +336,7 @@ async def _execute_node(node: Node, registry: AdapterRegistry) -> NodeResult:
             stderr=cause,
             started_at=now,
             finished_at=now,
+            failure_kind=ERRORED,
         )
 
 

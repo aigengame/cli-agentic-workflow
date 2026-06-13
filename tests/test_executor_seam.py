@@ -56,6 +56,38 @@ def read_events(run_dir: Path) -> list[dict[str, Any]]:
     return [json.loads(line) for line in lines]
 
 
+def policy_shell_workflow(node_id: str, command: str, **policy: Any) -> Workflow:
+    """A single-shell-node Workflow carrying per-Node failure-semantics policy.
+
+    ``policy`` passes ``retries`` / ``timeout`` straight onto the node so the
+    failure-semantics tests can declare a budget without an inline raw dict.
+    """
+    raw: dict[str, Any] = {
+        "name": "sample",
+        "version": 1,
+        "nodes": [{"id": node_id, "kind": "shell", "inputs": {"command": command}, **policy}],
+    }
+    return normalize_workflow(raw, source="<test>")
+
+
+@pytest.mark.asyncio
+async def test_a_node_exceeding_its_timeout_is_terminated_and_recorded_timed_out(
+    tmp_path: Path,
+) -> None:
+    # Acceptance criterion #6.2: a Node whose wall-clock exceeds its `timeout` is
+    # terminated and recorded with a status DISTINCT from a non-zero exit, so a
+    # timeout is diagnosable as a timeout — not conflated with an ordinary
+    # failure. The 0.2s budget against a 30s sleep makes the timeout deterministic.
+    workflow = policy_shell_workflow("slow", "sleep 30", timeout=0.2)
+
+    result = await execute_run(workflow, tmp_path / "runs")
+
+    assert not result.succeeded, "a timed-out node fails the run"
+    run_dir = single_run_dir(tmp_path / "runs")
+    (node,) = state_rows(run_dir, "SELECT * FROM node")
+    assert node["status"] == "timed_out", "the node is recorded timed_out, not failed"
+
+
 @pytest.mark.asyncio
 async def test_run_executes_nodes_in_dependency_order_not_declaration_order(
     tmp_path: Path,
