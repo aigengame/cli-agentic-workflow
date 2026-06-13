@@ -265,6 +265,47 @@ async def test_a_failing_branch_prevents_the_join_and_marks_the_run_failed(
 
 
 @pytest.mark.asyncio
+async def test_a_failure_skips_the_whole_transitive_chain_of_dependents(tmp_path: Path) -> None:
+    # Skipping is transitive: fail -> mid -> leaf. A failed `fail` skips `mid`,
+    # and because `mid` never succeeds, `leaf` is skipped too — the skip walks
+    # the full dependent chain, not just the immediate neighbour.
+    workflow = shell_workflow(
+        ("fail", "exit 7", []),
+        ("mid", "echo mid", ["fail"]),
+        ("leaf", "echo leaf", ["mid"]),
+    )
+
+    result = await execute_run(workflow, tmp_path / "runs")
+
+    assert not result.succeeded
+    attempted = {node_result.node_id for node_result in result.node_results}
+    assert attempted == {"fail"}, "neither the dependent nor its dependent ran"
+    assert set(result.skipped_node_ids) == {"mid", "leaf"}
+
+
+@pytest.mark.asyncio
+async def test_a_join_is_skipped_when_only_one_of_its_branches_fails(tmp_path: Path) -> None:
+    # A diamond join needs both a failing and a succeeding branch. The join is a
+    # transitive dependent of the failure, so it is skipped even though its other
+    # branch succeeded — and the scheduler still terminates cleanly rather than
+    # waiting forever for the never-satisfiable join.
+    joined = tmp_path / "joined.txt"
+    workflow = shell_workflow(
+        ("ok", "echo ok", []),
+        ("fail", "exit 7", []),
+        ("join", f"touch {joined}", ["ok", "fail"]),
+    )
+
+    result = await execute_run(workflow, tmp_path / "runs")
+
+    assert not result.succeeded
+    assert not joined.exists(), "a join with any failed branch never runs"
+    attempted = {node_result.node_id for node_result in result.node_results}
+    assert attempted == {"ok", "fail"}, "the succeeding branch ran; the join did not"
+    assert result.skipped_node_ids == ("join",)
+
+
+@pytest.mark.asyncio
 async def test_an_independent_branch_still_runs_when_another_branch_fails(tmp_path: Path) -> None:
     # Branch-failure isolation (#4): `failing` and `independent` share no
     # dependency edge, so a failure in one must not prevent the other from
