@@ -1,7 +1,10 @@
 """The minimal Workflow IR: typed and immutable once a Run starts (ADR 0002)."""
 
+import functools
 import hashlib
+import heapq
 import json
+from collections.abc import Sequence
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, ValidationError, field_validator, model_validator
@@ -104,26 +107,57 @@ class Workflow(BaseModel):
         return nodes
 
 
-def _peel_in_declaration_order(nodes: tuple[Node, ...]) -> tuple[list[Node], list[Node]]:
+@functools.lru_cache(maxsize=8)
+def _peel_in_declaration_order(
+    nodes: tuple[Node, ...],
+) -> tuple[tuple[Node, ...], tuple[Node, ...]]:
     """Kahn's algorithm over needs edges, preferring declaration order among ready nodes.
 
     Returns the peeled (topologically ordered) nodes and the unpeelable remainder;
     a non-empty remainder lies on or downstream of a dependency cycle.
+
+    Classic in-degree Kahn at O((V + E) log V): adjacency and in-degree counts
+    are built once, and ready nodes are kept in a heap keyed by declaration
+    index so the deterministic declaration-order tie-break among ready nodes is
+    preserved exactly. The result is memoized on the frozen `nodes` tuple so the
+    acyclicity validator and `execution_order` share one peel per invocation
+    instead of recomputing it (issue #43).
     """
+    index_of = {node.id: index for index, node in enumerate(nodes)}
+    dependents: dict[str, list[Node]] = {node.id: [] for node in nodes}
+    indegree: dict[str, int] = {}
+    for node in nodes:
+        # Count only needs that reference a known node; the known-reference
+        # validator runs before this, so for a normally constructed Workflow
+        # every need is present. A validation-bypassed Workflow with a dangling
+        # need simply leaves the dependent unpeelable, surfacing in the
+        # remainder rather than crashing here.
+        present = [reference for reference in node.needs if reference in index_of]
+        indegree[node.id] = len(present)
+        for reference in present:
+            dependents[reference].append(node)
+
+    ready: list[tuple[int, str]] = [
+        (index_of[node.id], node.id) for node in nodes if indegree[node.id] == 0
+    ]
+    heapq.heapify(ready)
+    by_id = {node.id: node for node in nodes}
+
     ordered: list[Node] = []
-    done: set[str] = set()
-    remaining = list(nodes)
-    while remaining:
-        node = next((n for n in remaining if done.issuperset(n.needs)), None)
-        if node is None:
-            break
-        ordered.append(node)
-        done.add(node.id)
-        remaining.remove(node)
-    return ordered, remaining
+    while ready:
+        _, node_id = heapq.heappop(ready)
+        ordered.append(by_id[node_id])
+        for dependent in dependents[node_id]:
+            indegree[dependent.id] -= 1
+            if indegree[dependent.id] == 0:
+                heapq.heappush(ready, (index_of[dependent.id], dependent.id))
+
+    peeled = set(node.id for node in ordered)
+    remaining = tuple(node for node in nodes if node.id not in peeled)
+    return tuple(ordered), remaining
 
 
-def _find_cycle(remaining: list[Node]) -> list[str]:
+def _find_cycle(remaining: Sequence[Node]) -> list[str]:
     """Extract one actual cycle from the unpeelable remainder of Kahn's algorithm.
 
     Walks `needs` references between remaining nodes until one repeats. The
@@ -169,7 +203,7 @@ def execution_order(workflow: Workflow) -> tuple[Node, ...]:
             f"workflow {workflow.name!r} has unorderable nodes (dependency cycle "
             f"or unknown reference; was validation bypassed?): {unorderable}"
         )
-    return tuple(ordered)
+    return ordered
 
 
 def _node_id_at(raw: dict[str, Any], index: int) -> str | None:

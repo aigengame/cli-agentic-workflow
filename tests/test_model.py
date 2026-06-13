@@ -1,5 +1,6 @@
 """Model-seam tests: Workflow IR validation details exercised through normalize_workflow."""
 
+import time
 from typing import Any
 
 import pytest
@@ -160,3 +161,37 @@ def test_cycle_message_arrows_point_in_execution_direction_like_the_json_plan_ed
         normalize_workflow(raw, source="workflow.yaml")
 
     assert "dependency cycle: 'a' -> 'c' -> 'b' -> 'a'" in str(excinfo.value)
+
+
+def test_validation_and_ordering_scale_to_thousands_of_nodes() -> None:
+    # Pattern Expanders (roadmap) compile patterns into graphs of exactly this
+    # scale, and validate is sold as the fast fail-fast check. A 5,000-node
+    # reverse-declared linear chain is the worst case for a quadratic peel
+    # (declaration order is the exact reverse of dependency order); it must
+    # validate and order in well under a second. The 5s threshold is generous
+    # to avoid CI flakiness while still failing an accidental O(N^2) regression
+    # (which costs ~15s here).
+    count = 5000
+    raw: dict[str, Any] = {
+        "name": "sample",
+        "version": 1,
+        "nodes": [
+            {
+                "id": f"node{index}",
+                "kind": "shell",
+                "needs": [f"node{index - 1}"] if index > 1 else [],
+                "inputs": {"command": "echo hi"},
+            }
+            for index in range(count, 0, -1)
+        ],
+    }
+
+    start = time.perf_counter()
+    workflow = normalize_workflow(raw, source="<test>")
+    ordered = execution_order(workflow)
+    elapsed = time.perf_counter() - start
+
+    assert [node.id for node in ordered] == [f"node{index}" for index in range(1, count + 1)]
+    assert elapsed < 5.0, (
+        f"validation+ordering of {count} nodes took {elapsed:.2f}s (expected < 5s)"
+    )
