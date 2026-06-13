@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS node (
     run_id TEXT NOT NULL REFERENCES run (run_id),
     node_id TEXT NOT NULL,
     status TEXT NOT NULL,
+    cause TEXT,
     PRIMARY KEY (run_id, node_id)
 );
 CREATE TABLE IF NOT EXISTS attempt (
@@ -116,21 +117,33 @@ class StateStore:
             (run_id, node_id),
         )
 
-    def record_node_finished(self, run_id: str, node_id: str, status: str) -> None:
-        self._execute(
-            "UPDATE node SET status = ? WHERE run_id = ? AND node_id = ?",
-            (status, run_id, node_id),
-        )
+    def record_node_finished(
+        self, run_id: str, node_id: str, status: str, cause: str | None = None
+    ) -> None:
+        """Drive an existing Node row to a terminal status, with an optional cause.
 
-    def record_node_skipped(self, run_id: str, node_id: str) -> None:
-        """Record a Node that was never attempted because a dependency failed.
-
-        A skipped Node has no prior ``running`` row and no Attempt, so it is
-        inserted straight into its terminal ``skipped`` status (issue #4).
+        ``cause`` names WHY a Node was skipped (#7) — a closed `when` gate, a
+        failed blocker, or a tolerant join with no executed branch — when a Node
+        that already has a row is flipped to ``skipped`` (the resume re-skip
+        path). For a non-skip terminal status it stays ``None``.
         """
         self._execute(
-            "INSERT INTO node (run_id, node_id, status) VALUES (?, ?, 'skipped')",
-            (run_id, node_id),
+            "UPDATE node SET status = ?, cause = ? WHERE run_id = ? AND node_id = ?",
+            (status, cause, run_id, node_id),
+        )
+
+    def record_node_skipped(self, run_id: str, node_id: str, cause: str | None = None) -> None:
+        """Record a Node that was never attempted, with WHY it was skipped (#7).
+
+        A skipped Node has no prior ``running`` row and no Attempt, so it is
+        inserted straight into its terminal ``skipped`` status (#4). ``cause``
+        records whether the skip came from a closed `when` gate (``when_false``),
+        a failed blocker (``blocked``), or a tolerant join with no executed
+        branch (``all_branches_skipped``), so a Reporter can distinguish them.
+        """
+        self._execute(
+            "INSERT INTO node (run_id, node_id, status, cause) VALUES (?, ?, 'skipped', ?)",
+            (run_id, node_id, cause),
         )
 
     def record_attempt(
@@ -176,6 +189,25 @@ class StateStore:
                 "SELECT node_id, status FROM node WHERE run_id = ?", (run_id,)
             )
         }
+
+    def node_output(self, run_id: str, node_id: str) -> dict[str, Any] | None:
+        """The latest Attempt's persisted normalized output for a Node, or ``None``.
+
+        On resume a `when` predicate may reference a dependency that was a prior
+        SUCCESS (seeded ``satisfied`` with no in-memory NodeResult), so its output
+        must be read back from State to evaluate the predicate (#7). The latest
+        Attempt (highest ``attempt`` number) is the terminal one. A Node with no
+        recorded Attempt returns ``None``.
+        """
+        row = self._connection.execute(
+            "SELECT output_json FROM attempt WHERE run_id = ? AND node_id = ?"
+            " ORDER BY attempt DESC LIMIT 1",
+            (run_id, node_id),
+        ).fetchone()
+        if row is None or row[0] is None:
+            return None
+        loaded: dict[str, Any] = json.loads(row[0])
+        return loaded
 
     def max_attempt_per_node(self, run_id: str) -> dict[str, int]:
         """Map each Node of a Run to the highest Attempt number it has recorded.
