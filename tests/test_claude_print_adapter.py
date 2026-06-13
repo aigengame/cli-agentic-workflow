@@ -8,10 +8,35 @@ the only seams, and they are monkeypatched here. A separate online test
 the CLI is absent.
 """
 
+import json
+from pathlib import Path
+
 import pytest
 
 from caw.adapter import AdapterError, AgentInvocation
 from caw.claude_print import ClaudePrintAdapter
+
+
+def claude_json_result(result: str = "ok", **fields: object) -> bytes:
+    """Build the wrapper JSON object `claude -p --output-format json` prints.
+
+    Mirrors the real CLI shape: a single JSON object with `type: "result"`, the
+    freeform `result` text, and (when a `--json-schema` was supplied) a top-level
+    `structured_output` field. Encoded to bytes as the subprocess would emit it.
+    """
+    payload: dict[str, object] = {
+        "type": "result",
+        "subtype": "success",
+        "is_error": False,
+        "result": result,
+    }
+    payload.update(fields)
+    return json.dumps(payload).encode("utf-8")
+
+
+def write_schema(path: Path, schema: dict[str, object]) -> Path:
+    path.write_text(json.dumps(schema), encoding="utf-8")
+    return path
 
 
 class FakeProcess:
@@ -151,3 +176,95 @@ async def test_only_the_invocation_env_reaches_the_subprocess(
     assert captured["env"] == {"DECLARED_VAR": "declared-value"}, (
         "exactly the invocation env reaches the subprocess, with no parent-env leakage"
     )
+
+
+@pytest.mark.asyncio
+async def test_output_schema_requests_json_and_parses_structured_output(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # When the node declares an output_schema, the adapter REQUESTS JSON output
+    # from the CLI (`--output-format json --json-schema <schema>`) and parses the
+    # CLI's top-level `structured_output` field into AgentResult.structured_output.
+    # The KERNEL validates the schema afterward; the adapter does NOT validate it.
+    schema = write_schema(
+        tmp_path / "person.schema.json",
+        {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]},
+    )
+    stdout = claude_json_result(
+        result="Returned a person.", structured_output={"name": "Alice", "age": 30}
+    )
+    captured = patch_spawn(monkeypatch, FakeProcess(0, stdout=stdout))
+    adapter = ClaudePrintAdapter()
+
+    result = await adapter.invoke(
+        AgentInvocation(
+            node_id="n", adapter="claude.print", prompt="make a person", output_schema=schema
+        )
+    )
+
+    argv = captured["args"]
+    assert isinstance(argv, tuple)
+    assert "--output-format" in argv and argv[argv.index("--output-format") + 1] == "json"
+    schema_text = schema.read_text(encoding="utf-8")
+    assert "--json-schema" in argv and argv[argv.index("--json-schema") + 1] == schema_text
+    assert result.exit_status == 0
+    assert result.structured_output == {"name": "Alice", "age": 30}
+
+
+@pytest.mark.asyncio
+async def test_no_output_schema_does_not_request_json_and_leaves_structured_output_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Without an output_schema the adapter does NOT request JSON output: stdout is
+    # the CLI's raw text and structured_output stays None.
+    captured = patch_spawn(monkeypatch, FakeProcess(0, stdout=b"plain text answer"))
+    adapter = ClaudePrintAdapter()
+
+    result = await adapter.invoke(
+        AgentInvocation(node_id="n", adapter="claude.print", prompt="answer")
+    )
+
+    argv = captured["args"]
+    assert isinstance(argv, tuple)
+    assert "--output-format" not in argv and "--json-schema" not in argv
+    assert result.stdout == "plain text answer"
+    assert result.structured_output is None
+
+
+@pytest.mark.asyncio
+async def test_unparseable_json_when_a_schema_was_required_is_an_adapter_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # When the node required structured output but the CLI exited zero with stdout
+    # that is not the expected JSON wrapper, the adapter cannot produce a result:
+    # ADR 0006 reserves AdapterError for exactly this (output required, unparseable).
+    schema = write_schema(tmp_path / "s.schema.json", {"type": "object"})
+    patch_spawn(monkeypatch, FakeProcess(0, stdout=b"not json at all"))
+    adapter = ClaudePrintAdapter()
+
+    with pytest.raises(AdapterError) as excinfo:
+        await adapter.invoke(
+            AgentInvocation(node_id="n", adapter="claude.print", prompt="p", output_schema=schema)
+        )
+
+    assert "n" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_non_zero_exit_with_schema_does_not_attempt_to_parse_structured_output(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A non-zero exit is an ordinary AgentResult even when a schema was declared:
+    # the adapter must NOT raise an AdapterError for unparseable output here — the
+    # process failed and its exit status is the node's failure, parseability moot.
+    schema = write_schema(tmp_path / "s.schema.json", {"type": "object"})
+    patch_spawn(monkeypatch, FakeProcess(2, stdout=b"error text, not json", stderr=b"boom"))
+    adapter = ClaudePrintAdapter()
+
+    result = await adapter.invoke(
+        AgentInvocation(node_id="n", adapter="claude.print", prompt="p", output_schema=schema)
+    )
+
+    assert result.exit_status == 2
+    assert result.structured_output is None
+    assert result.stderr == "boom"

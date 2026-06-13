@@ -9,6 +9,7 @@ stay vendor-neutral.
 """
 
 import asyncio
+import json
 
 from caw.adapter import Adapter, AdapterError, AgentInvocation, AgentResult
 
@@ -36,6 +37,15 @@ class ClaudePrintAdapter(Adapter):
         # sandbox/approval (or any) flags. exec (not shell): args are a list, so
         # there is no shell interpolation of the prompt or the passthrough flags.
         argv = [CLAUDE_CLI, "-p", invocation.prompt, *invocation.args]
+        wants_structured = invocation.output_schema is not None
+        if wants_structured:
+            # An Output Contract is declared: ask the CLI for its single-object JSON
+            # result (`--output-format json`) and hand it the schema so it can shape
+            # its structured output (`--json-schema <schema-content>`). The adapter
+            # parses the result wrapper; the KERNEL re-validates the schema after
+            # invoke returns (ADR 0006) — the adapter never validates it itself.
+            schema_text = self._read_schema(invocation)
+            argv += ["--output-format", "json", "--json-schema", schema_text]
         # Env policy (ADR 0006, #5): pass EXACTLY the kernel's already-filtered
         # allow-list, never a merge of os.environ — that would leak the parent
         # environment. The consequence is intentional, not a bug: running real
@@ -56,8 +66,55 @@ class ClaudePrintAdapter(Adapter):
         stdout_bytes, stderr_bytes = await process.communicate()
         stdout = stdout_bytes.decode("utf-8", errors="replace")
         stderr = stderr_bytes.decode("utf-8", errors="replace")
+        exit_status = process.returncode if process.returncode is not None else -1
+        # Parse structured output only on a successful, structured-requested run:
+        # a non-zero exit is already a node failure (ADR 0006), so unparseable
+        # stdout from a failed process is moot and must NOT mask the real exit.
+        structured_output: object | None = None
+        if wants_structured and exit_status == 0:
+            structured_output = self._extract_structured_output(stdout, invocation)
         return AgentResult(
-            exit_status=process.returncode if process.returncode is not None else -1,
+            exit_status=exit_status,
             stdout=stdout,
             stderr=stderr,
+            structured_output=structured_output,
         )
+
+    @staticmethod
+    def _read_schema(invocation: AgentInvocation) -> str:
+        schema = invocation.output_schema
+        assert schema is not None  # guarded by the caller
+        try:
+            return schema.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise AdapterError(
+                f"node {invocation.node_id!r} (adapter {invocation.adapter!r}): "
+                f"cannot read output_schema {schema}: {exc}"
+            ) from exc
+
+    @staticmethod
+    def _extract_structured_output(stdout: str, invocation: AgentInvocation) -> object | None:
+        """Parse the CLI's JSON result wrapper and return its `structured_output`.
+
+        The CLI prints a single JSON object whose top-level `structured_output`
+        field holds the schema-shaped value (separate from the freeform `result`
+        text). Unparseable stdout when structured output was REQUIRED means the
+        adapter cannot produce a result — an AdapterError, per ADR 0006. The value
+        is returned as-is (including JSON null); the kernel is the sole arbiter of
+        whether it satisfies the Output Contract.
+        """
+        try:
+            wrapper = json.loads(stdout)
+        except json.JSONDecodeError as exc:
+            raise AdapterError(
+                f"node {invocation.node_id!r} (adapter {invocation.adapter!r}): "
+                f"expected a JSON result from 'claude -p --output-format json' but could "
+                f"not parse stdout: {exc}"
+            ) from exc
+        if not isinstance(wrapper, dict):
+            raise AdapterError(
+                f"node {invocation.node_id!r} (adapter {invocation.adapter!r}): "
+                f"expected a JSON object from 'claude -p --output-format json', "
+                f"got {type(wrapper).__name__}"
+            )
+        return wrapper.get("structured_output")
