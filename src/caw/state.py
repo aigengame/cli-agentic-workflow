@@ -96,6 +96,17 @@ class StateStore:
             (status, run_id, node_id),
         )
 
+    def record_node_skipped(self, run_id: str, node_id: str) -> None:
+        """Record a Node that was never attempted because a dependency failed.
+
+        A skipped Node has no prior ``running`` row and no Attempt, so it is
+        inserted straight into its terminal ``skipped`` status (issue #4).
+        """
+        self._execute(
+            "INSERT INTO node (run_id, node_id, status) VALUES (?, ?, 'skipped')",
+            (run_id, node_id),
+        )
+
     def record_attempt(
         self,
         run_id: str,

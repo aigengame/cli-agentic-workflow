@@ -98,10 +98,10 @@ async def test_a_join_node_runs_only_after_both_of_its_branches_complete(
 
 
 @pytest.mark.asyncio
-async def test_nodes_depending_on_a_failed_node_never_run(tmp_path: Path) -> None:
-    # Sequential Pipeline semantics: a node failure stops the run (issue #26),
-    # which in particular guarantees that transitive dependents of the failed
-    # node are never attempted.
+async def test_transitive_dependents_of_a_failed_node_never_run(tmp_path: Path) -> None:
+    # Branch-failure isolation (#4): a node failure prevents only its transitive
+    # dependents from being attempted. Here `deploy` needs `build`, so a failing
+    # `build` keeps `deploy`'s command from ever running.
     marker = tmp_path / "deployed.txt"
     workflow = shell_workflow(
         ("build", "exit 7", []),
@@ -112,7 +112,27 @@ async def test_nodes_depending_on_a_failed_node_never_run(tmp_path: Path) -> Non
 
     assert not result.succeeded
     assert not marker.exists(), "a dependent of a failed node never runs"
-    assert [node_result.node_id for node_result in result.node_results] == ["build"]
+    attempted = {node_result.node_id for node_result in result.node_results}
+    assert attempted == {"build"}, "only the failed node was attempted; its dependent was not"
+
+
+@pytest.mark.asyncio
+async def test_an_independent_branch_still_runs_when_another_branch_fails(tmp_path: Path) -> None:
+    # Branch-failure isolation (#4): `failing` and `independent` share no
+    # dependency edge, so a failure in one must not prevent the other from
+    # running. This is the behavior the old positional stop-the-run got wrong.
+    marker = tmp_path / "independent.txt"
+    workflow = shell_workflow(
+        ("failing", "exit 7", []),
+        ("independent", f"touch {marker}", []),
+    )
+
+    result = await execute_run(workflow, tmp_path / "runs")
+
+    assert not result.succeeded, "the run is failed because one branch failed"
+    assert marker.exists(), "an independent branch runs even though another branch failed"
+    attempted = {node_result.node_id for node_result in result.node_results}
+    assert attempted == {"failing", "independent"}
 
 
 def test_stdin_reading_node_completes_instead_of_hanging_the_run(
@@ -147,7 +167,12 @@ def test_stdin_reading_node_completes_instead_of_hanging_the_run(
 async def test_a_mid_run_crash_finalizes_state_and_appends_a_terminal_event(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    workflow = shell_workflow("echo ok", "echo never")
+    # second needs first, so first deterministically succeeds before second's
+    # spawn is attempted. (Under #4 two *independent* nodes launch concurrently,
+    # so the order in which they spawn — and thus which one the forced failure
+    # hits — would be a race; the edge pins it without weakening the contract:
+    # the surviving node is recorded succeeded, the crashing node errored.)
+    workflow = shell_workflow(("first", "echo ok", []), ("second", "echo never", ["first"]))
     real_create = asyncio.create_subprocess_shell
     spawn_count = 0
 
@@ -170,7 +195,7 @@ async def test_a_mid_run_crash_finalizes_state_and_appends_a_terminal_event(
     assert "OSError" in run["error"] and "forced spawn failure" in run["error"]
 
     nodes = {row["node_id"]: row["status"] for row in state_rows(run_dir, "SELECT * FROM node")}
-    assert nodes == {"node1": "succeeded", "node2": "errored"}
+    assert nodes == {"first": "succeeded", "second": "errored"}
 
     last_event = read_events(run_dir)[-1]
     assert last_event["type"] == "run_errored"

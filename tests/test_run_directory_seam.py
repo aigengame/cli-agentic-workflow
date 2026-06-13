@@ -161,19 +161,30 @@ def test_state_records_failed_run_node_and_attempt_exit_status(
     assert "oops" in output["stderr"]
 
 
-def test_a_node_failure_stops_the_run_before_later_nodes_execute(
+def test_a_failed_node_skips_its_dependent_but_not_an_independent_node(
     write_workflow_data: Callable[[dict[str, Any]], Path],
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    marker = tmp_path / "deployed.txt"
+    # Branch-failure isolation (#4): this replaces the old positional
+    # stop-the-run, which wrongly withheld an independent node declared after a
+    # failure. `deploy` needs the failing `build`, so it is skipped; `audit` is
+    # independent, so it still runs even though the run as a whole fails.
+    deployed = tmp_path / "deployed.txt"
+    audited = tmp_path / "audited.txt"
     workflow_file = write_workflow_data(
         {
             "name": "sample",
             "version": 1,
             "nodes": [
                 {"id": "build", "kind": "shell", "inputs": {"command": "exit 7"}},
-                {"id": "deploy", "kind": "shell", "inputs": {"command": f"touch {marker}"}},
+                {
+                    "id": "deploy",
+                    "kind": "shell",
+                    "needs": ["build"],
+                    "inputs": {"command": f"touch {deployed}"},
+                },
+                {"id": "audit", "kind": "shell", "inputs": {"command": f"touch {audited}"}},
             ],
         }
     )
@@ -181,21 +192,30 @@ def test_a_node_failure_stops_the_run_before_later_nodes_execute(
 
     exit_code, _ = invoke_run(workflow_file)
 
-    assert exit_code == 1
-    assert not marker.exists(), "the second node's command never runs after the first fails"
+    assert exit_code == 1, "the run fails because a node failed"
+    assert not deployed.exists(), "a dependent of the failed node never runs"
+    assert audited.exists(), "an independent node still runs despite a peer's failure"
     run_dir = single_run_dir(tmp_path)
     assert state_row(run_dir, "SELECT * FROM run")["status"] == "failed"
 
     connection = sqlite3.connect(run_dir / "state.sqlite")
+    connection.row_factory = sqlite3.Row
     try:
-        node_ids = [row[0] for row in connection.execute("SELECT node_id FROM node")]
+        statuses = {
+            row["node_id"]: row["status"]
+            for row in connection.execute("SELECT node_id, status FROM node")
+        }
     finally:
         connection.close()
-    assert node_ids == ["build"], "non-executed nodes are never recorded as started"
+    assert statuses == {"build": "failed", "deploy": "skipped", "audit": "succeeded"}, (
+        "the dependent is recorded skipped, distinguishable from nodes that ran"
+    )
 
     events = read_events(run_dir)
-    started_nodes = [e["data"]["node_id"] for e in events if e["type"] == "node_started"]
-    assert started_nodes == ["build"]
+    started_nodes = {e["data"]["node_id"] for e in events if e["type"] == "node_started"}
+    assert started_nodes == {"build", "audit"}, "a skipped node is never recorded as started"
+    skipped = [e["data"]["node_id"] for e in events if e["type"] == "node_skipped"]
+    assert skipped == ["deploy"], "the skipped node is recorded in the event trace too"
     assert events[-1]["type"] == "run_finished"
     assert events[-1]["data"]["status"] == "failed"
 
