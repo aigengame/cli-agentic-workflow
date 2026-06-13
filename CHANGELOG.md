@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/aigengame/cli-agentic-workflow/compare/v0.2.1...v0.3.0) (2026-06-13)
+
+
+### Features
+
+* parallel scheduling and joins in the local executor ([#53](https://github.com/aigengame/cli-agentic-workflow/issues/53)) ([320da11](https://github.com/aigengame/cli-agentic-workflow/commit/320da118bacbd65eb889a7c4455085c078fca3d7))
+
 ## [0.2.1](https://github.com/aigengame/cli-agentic-workflow/compare/v0.2.0...v0.2.1) (2026-06-13)
 
 
