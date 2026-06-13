@@ -28,6 +28,11 @@ _MISSING_CLI_HINT = (
 )
 
 
+def _node_context(invocation: AgentInvocation) -> str:
+    """The `node 'id' (adapter 'name')` prefix every AdapterError message carries."""
+    return f"node {invocation.node_id!r} (adapter {invocation.adapter!r})"
+
+
 class ClaudePrintAdapter(Adapter):
     """Invokes ``claude -p`` (Claude Code headless mode) and normalizes its result."""
 
@@ -51,7 +56,6 @@ class ClaudePrintAdapter(Adapter):
         # environment. The consequence is intentional, not a bug: running real
         # `claude` requires the workflow to declare every env var the CLI needs
         # (e.g. its auth/config vars) so they appear in invocation.env.
-        context = f"node {invocation.node_id!r} (adapter {invocation.adapter!r})"
         try:
             process = await asyncio.create_subprocess_exec(
                 *argv,
@@ -60,7 +64,7 @@ class ClaudePrintAdapter(Adapter):
                 env=dict(invocation.env),
             )
         except FileNotFoundError as exc:
-            raise AdapterError(f"{context}: {_MISSING_CLI_HINT}") from exc
+            raise AdapterError(f"{_node_context(invocation)}: {_MISSING_CLI_HINT}") from exc
         stdout_bytes, stderr_bytes = await process.communicate()
         stdout = stdout_bytes.decode("utf-8", errors="replace")
         stderr = stderr_bytes.decode("utf-8", errors="replace")
@@ -114,8 +118,7 @@ class ClaudePrintAdapter(Adapter):
             return schema.read_text(encoding="utf-8")
         except OSError as exc:
             raise AdapterError(
-                f"node {invocation.node_id!r} (adapter {invocation.adapter!r}): "
-                f"cannot read output_schema {schema}: {exc}"
+                f"{_node_context(invocation)}: cannot read output_schema {schema}: {exc}"
             ) from exc
 
     @staticmethod
@@ -133,14 +136,12 @@ class ClaudePrintAdapter(Adapter):
             wrapper = json.loads(stdout)
         except json.JSONDecodeError as exc:
             raise AdapterError(
-                f"node {invocation.node_id!r} (adapter {invocation.adapter!r}): "
-                f"expected a JSON result from 'claude -p --output-format json' but could "
-                f"not parse stdout: {exc}"
+                f"{_node_context(invocation)}: expected a JSON result from "
+                f"'claude -p --output-format json' but could not parse stdout: {exc}"
             ) from exc
         if not isinstance(wrapper, dict):
             raise AdapterError(
-                f"node {invocation.node_id!r} (adapter {invocation.adapter!r}): "
-                f"expected a JSON object from 'claude -p --output-format json', "
-                f"got {type(wrapper).__name__}"
+                f"{_node_context(invocation)}: expected a JSON object from "
+                f"'claude -p --output-format json', got {type(wrapper).__name__}"
             )
         return wrapper.get("structured_output")
