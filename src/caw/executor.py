@@ -463,11 +463,6 @@ class _Scheduler:
         self._skipped: list[str] = []
         self._skipped_blockers: dict[str, str] = {}
         self._skipped_causes: dict[str, str] = {}
-        # Which Nodes have a recorded SUCCEEDED status, regardless of whether this
-        # Run ran them: a fresh success lands in `_results`, a resume seeds a
-        # prior success. A `join: any` Node gates on >= 1 SUCCEEDED dependency, so
-        # it consults this set rather than indegree alone (#7).
-        self._succeeded: set[str] = set()
         # Per-Node Attempt bookkeeping for the in-run retry loop (#6). ``_attempt``
         # is the Attempt NUMBER the next launch of a Node uses, so re-launched
         # Nodes write distinct ``attempt`` rows ((run_id, node_id, attempt) is the
@@ -478,16 +473,14 @@ class _Scheduler:
         self._attempt: dict[str, int] = dict(attempt_seed or {})
         self._started: set[str] = set(started_seed or ())
         # A resume seeds the Nodes that already SUCCEEDED in the prior Run so they
-        # are not re-run, yet their dependents become ready (#6). Decrementing
-        # indegree for each satisfied Node's dependents mirrors the on-success
-        # path; the satisfied set is treated as ``done`` by readiness so the Node
-        # itself is never launched again. The seed maps node_id -> its succeeded
-        # status, which becomes its NodeResult status in the resumed RunResult.
+        # are not re-run, yet their dependents become ready (#6). The satisfied set
+        # is treated as ``done`` by ``_ready_nodes`` so the Node itself is never
+        # launched again, and decrementing indegree for each satisfied Node's
+        # dependents mirrors the on-success path so those dependents become ready.
+        # The seed maps node_id -> its succeeded status, which becomes its
+        # NodeResult status in the resumed RunResult.
         self._satisfied: dict[str, str] = dict(satisfied_seed or {})
         for satisfied_id in self._satisfied:
-            # A seeded satisfied Node is a prior SUCCESS, so it both unblocks its
-            # dependents and counts as a succeeded branch for a `join: any` gate.
-            self._succeeded.add(satisfied_id)
             for dependent in self._dependents.get(satisfied_id, []):
                 self._indegree[dependent] -= 1
 
@@ -662,17 +655,21 @@ class _Scheduler:
         self._skip_failed_dependents(node)
 
     def _on_success(self, node: Node) -> None:
-        self._succeeded.add(node.id)
         for dependent in self._dependents[node.id]:
             self._indegree[dependent] -= 1
 
     def _on_skip(self, node_id: str) -> None:
         """Decrement dependents' indegree when a Node is skipped (#7).
 
-        Mirrors ``_on_success`` so a ``join: any`` Node's indegree can still
-        reach 0 after one of its branches skips — its readiness is then gated
-        separately on >= 1 SUCCEEDED dependency, while a ``join: all`` Node treats
-        the skipped branch as a skip of itself.
+        Mirrors ``_on_success`` so a skip unblocks dependents the same way a
+        success does: a ``join: any`` Node's indegree can still reach 0 after one
+        branch skips, leaving it ready to run on its surviving branch. The join
+        tolerance is enforced not by an extra readiness gate but by skip
+        propagation (``_propagate_skip_to_dependents``): a ``join: any`` Node is
+        skipped — cause ``all_branches_skipped`` — only once EVERY dependency has
+        skipped, and the ``done``-set exclusion in ``_ready_nodes`` then keeps it
+        from being launched. A ``join: all`` Node is instead skipped as soon as
+        any one dependency skips.
         """
         for dependent in self._dependents[node_id]:
             self._indegree[dependent] -= 1
