@@ -90,6 +90,19 @@ class StateStore:
             (run_id, node_id),
         )
 
+    def record_node_running(self, run_id: str, node_id: str) -> None:
+        """Flip an existing Node row back to ``running`` for a re-Attempt (#6).
+
+        A retry re-launch within a Run, and a resume re-running an incomplete
+        Node, both target a Node whose row already exists, so they UPDATE its
+        status rather than INSERT (which would breach the ``(run_id, node_id)``
+        PK). The first launch of a Node still goes through ``record_node_started``.
+        """
+        self._execute(
+            "UPDATE node SET status = 'running' WHERE run_id = ? AND node_id = ?",
+            (run_id, node_id),
+        )
+
     def record_node_finished(self, run_id: str, node_id: str, status: str) -> None:
         self._execute(
             "UPDATE node SET status = ? WHERE run_id = ? AND node_id = ?",

@@ -389,12 +389,17 @@ class _Scheduler:
         events: EventLog,
         run_id: str,
         registry: AdapterRegistry,
+        *,
+        satisfied_seed: Mapping[str, str] | None = None,
+        attempt_seed: Mapping[str, int] | None = None,
+        started_seed: set[str] | None = None,
     ) -> None:
         self._state = state
         self._events = events
         self._run_id = run_id
         self._registry = registry
         self._concurrency = workflow.concurrency
+        self._by_id: dict[str, Node] = {node.id: node for node in workflow.nodes}
         # execution_order seeds a deterministic launch order among ready Nodes:
         # declaration-order tie-break, the same order `caw graph` reports.
         self._ordered = execution_order(workflow)
@@ -408,6 +413,25 @@ class _Scheduler:
         self._results: list[NodeResult] = []
         self._skipped: list[str] = []
         self._skipped_blockers: dict[str, str] = {}
+        # Per-Node Attempt bookkeeping for the in-run retry loop (#6). ``_attempt``
+        # is the Attempt NUMBER the next launch of a Node uses, so re-launched
+        # Nodes write distinct ``attempt`` rows ((run_id, node_id, attempt) is the
+        # State PK). ``_started`` records which Nodes already have a ``node`` row,
+        # so a retry re-launch does not re-INSERT it. The numbering and the
+        # node-row seed are overridable so a resume continues past the Attempts a
+        # prior run already recorded, never colliding with them.
+        self._attempt: dict[str, int] = dict(attempt_seed or {})
+        self._started: set[str] = set(started_seed or ())
+        # A resume seeds the Nodes that already SUCCEEDED in the prior Run so they
+        # are not re-run, yet their dependents become ready (#6). Decrementing
+        # indegree for each satisfied Node's dependents mirrors the on-success
+        # path; the satisfied set is treated as ``done`` by readiness so the Node
+        # itself is never launched again. The seed maps node_id -> its succeeded
+        # status, which becomes its NodeResult status in the resumed RunResult.
+        self._satisfied: dict[str, str] = dict(satisfied_seed or {})
+        for satisfied_id in self._satisfied:
+            for dependent in self._dependents.get(satisfied_id, []):
+                self._indegree[dependent] -= 1
 
     @property
     def in_flight_node_ids(self) -> tuple[str, ...]:
@@ -417,7 +441,11 @@ class _Scheduler:
     def _ready_nodes(self) -> list[Node]:
         """Nodes whose needs are all satisfied and that are neither running nor done."""
         running = {node.id for node in self._in_flight.values()}
-        done = {result.node_id for result in self._results} | set(self._skipped)
+        done = (
+            {result.node_id for result in self._results}
+            | set(self._skipped)
+            | set(self._satisfied)
+        )
         return [
             node
             for node in self._ordered
@@ -428,33 +456,96 @@ class _Scheduler:
         for node in self._ready_nodes():
             if len(self._in_flight) >= self._concurrency:
                 break
-            self._state.record_node_started(run_id=self._run_id, node_id=node.id)
-            self._events.append("node_started", {"node_id": node.id, "attempt": 1})
+            attempt = self._attempt.setdefault(node.id, 1)
+            # The ``node`` row is INSERTed once; a retry re-launch (and a resume
+            # re-run, whose row already exists) flips the existing row back to
+            # ``running`` instead, so the PK is never violated.
+            if node.id in self._started:
+                self._state.record_node_running(run_id=self._run_id, node_id=node.id)
+            else:
+                self._state.record_node_started(run_id=self._run_id, node_id=node.id)
+                self._started.add(node.id)
+            self._events.append("node_started", {"node_id": node.id, "attempt": attempt})
             task = asyncio.ensure_future(_execute_node(node, self._registry))
             self._in_flight[task] = node
 
-    def _record_finished(self, node: Node, result: NodeResult) -> None:
+    def _record_attempt(self, node: Node, result: NodeResult) -> None:
+        """Record one Attempt's outcome in State and the Event trace.
+
+        Always written, on every Attempt (the durable Attempt history #6.1), with
+        the Node's current Attempt number — distinct from a re-launch's so the
+        ``attempt`` PK never collides.
+        """
+        attempt = self._attempt[node.id]
         self._state.record_attempt(
             run_id=self._run_id,
             node_id=node.id,
-            attempt=1,
+            attempt=attempt,
             started_at=result.started_at,
             finished_at=result.finished_at,
             exit_status=result.exit_status,
             output=result.normalized_output,
         )
-        self._state.record_node_finished(
-            run_id=self._run_id, node_id=node.id, status=result.status
-        )
         self._events.append(
             "node_finished",
             {
                 "node_id": node.id,
-                "attempt": 1,
+                "attempt": attempt,
                 "exit_status": result.exit_status,
                 "status": result.status,
             },
         )
+
+    def _record_finished(self, node: Node, result: NodeResult) -> None:
+        """Record an Attempt AND drive the Node to its terminal status.
+
+        The crash-drain path (#54) finalizes a peer that completed mid-crash with
+        its real result; the in-run retry loop instead routes through
+        ``_handle_result`` so a retryable failure does not go terminal.
+        """
+        self._record_attempt(node, result)
+        self._state.record_node_finished(
+            run_id=self._run_id, node_id=node.id, status=result.status
+        )
+
+    def _retries_remaining(self, node: Node) -> bool:
+        """Whether the Node still has Attempts left under its ``retries`` budget (#6)."""
+        return self._attempt[node.id] <= node.retries
+
+    def _handle_result(self, node: Node, result: NodeResult) -> None:
+        """Process one finished Attempt: succeed, retry, or fail terminally (#6).
+
+        A succeeded Attempt unblocks dependents. A retryable failure (non-zero
+        exit or timeout) with Attempts remaining is recorded and the Node is
+        re-queued at the next Attempt number — its dependents are NOT skipped. A
+        non-retryable failure, or a retryable one with the budget exhausted, is
+        recorded terminal and skips the Node's transitive dependents, preserving
+        the #4 branch-failure semantics exactly.
+        """
+        self._record_attempt(node, result)
+        if result.succeeded:
+            self._state.record_node_finished(
+                run_id=self._run_id, node_id=node.id, status=result.status
+            )
+            self._results.append(result)
+            self._on_success(node)
+            return
+        if result.retryable and self._retries_remaining(node):
+            self._attempt[node.id] += 1
+            self._events.append(
+                "node_retrying",
+                {
+                    "node_id": node.id,
+                    "next_attempt": self._attempt[node.id],
+                    "failure_kind": result.failure_kind,
+                },
+            )
+            return
+        self._state.record_node_finished(
+            run_id=self._run_id, node_id=node.id, status=result.status
+        )
+        self._results.append(result)
+        self._skip_transitive_dependents(node)
 
     def _on_success(self, node: Node) -> None:
         for dependent in self._dependents[node.id]:
@@ -504,13 +595,7 @@ class _Scheduler:
                         crash = crash or _task_crash(task)
                         continue
                     self._in_flight.pop(task)
-                    result = task.result()
-                    self._record_finished(node, result)
-                    self._results.append(result)
-                    if result.succeeded:
-                        self._on_success(node)
-                    else:
-                        self._skip_transitive_dependents(node)
+                    self._handle_result(node, task.result())
                 if crash is not None:
                     raise crash
                 self._launch_ready()

@@ -89,6 +89,99 @@ async def test_a_node_exceeding_its_timeout_is_terminated_and_recorded_timed_out
 
 
 @pytest.mark.asyncio
+async def test_a_node_with_retries_reattempts_on_failure_and_records_each_attempt(
+    tmp_path: Path,
+) -> None:
+    # Acceptance criterion #6.1: a Node with `retries` re-attempts on failure and
+    # the attempt history is recorded in State. The command fails on its first
+    # run (no marker yet) and succeeds on its second (marker now exists), so a
+    # node with retries=1 ultimately succeeds — and BOTH attempts are recorded as
+    # distinct rows in the attempt table, the durable Attempt history.
+    marker = tmp_path / "marker"
+    command = f"if [ -e {marker} ]; then exit 0; else touch {marker}; exit 7; fi"
+    workflow = policy_shell_workflow("flaky", command, retries=1)
+
+    result = await execute_run(workflow, tmp_path / "runs")
+
+    assert result.succeeded, "the second attempt succeeded, so the run succeeds"
+    run_dir = single_run_dir(tmp_path / "runs")
+    (node,) = state_rows(run_dir, "SELECT * FROM node")
+    assert node["status"] == "succeeded", "the node's terminal status is its last attempt's"
+    attempts = state_rows(
+        run_dir,
+        "SELECT attempt, exit_status FROM attempt WHERE node_id = 'flaky' ORDER BY attempt",
+    )
+    assert [(a["attempt"], a["exit_status"]) for a in attempts] == [(1, 7), (2, 0)], (
+        "both attempts are recorded: attempt 1 failed (exit 7), attempt 2 succeeded"
+    )
+
+
+@pytest.mark.asyncio
+async def test_retries_are_exhausted_then_the_node_fails_and_skips_its_dependents(
+    tmp_path: Path,
+) -> None:
+    # The retry budget is bounded: a Node that fails EVERY Attempt exhausts its
+    # retries, goes terminal-failed, and skips its transitive dependents exactly
+    # as a non-retried failure does (#4 semantics preserved). retries=2 means
+    # three Attempts total, all exit 7; the dependent is never run.
+    marker = tmp_path / "deployed"
+    raw: dict[str, Any] = {
+        "name": "sample",
+        "version": 1,
+        "nodes": [
+            {"id": "build", "kind": "shell", "retries": 2, "inputs": {"command": "exit 7"}},
+            {
+                "id": "deploy",
+                "kind": "shell",
+                "needs": ["build"],
+                "inputs": {"command": f"touch {marker}"},
+            },
+        ],
+    }
+    workflow = normalize_workflow(raw, source="<test>")
+
+    result = await execute_run(workflow, tmp_path / "runs")
+
+    assert not result.succeeded
+    assert not marker.exists(), "the dependent of an exhausted-retry failure never runs"
+    run_dir = single_run_dir(tmp_path / "runs")
+    nodes = {row["node_id"]: row["status"] for row in state_rows(run_dir, "SELECT * FROM node")}
+    assert nodes == {"build": "failed", "deploy": "skipped"}
+    attempts = state_rows(run_dir, "SELECT attempt FROM attempt WHERE node_id = 'build'")
+    assert len(attempts) == 3, "retries=2 yields exactly three recorded attempts"
+
+
+@pytest.mark.asyncio
+async def test_an_errored_adapter_failure_is_not_retried(tmp_path: Path) -> None:
+    # Retry policy boundary (#6): an ERRORED failure (here a mock agent Node with
+    # no fixture, an AdapterError) is an Adapter/internal fault that is almost
+    # always deterministic, so it is NOT retried even with retries set — retrying
+    # it would only burn Attempts. Exactly one Attempt is recorded.
+    raw: dict[str, Any] = {
+        "name": "sample",
+        "version": 1,
+        "nodes": [
+            {
+                "id": "summarize",
+                "kind": "agent",
+                "retries": 3,
+                "inputs": {"adapter": "mock", "prompt": "do it"},
+            }
+        ],
+    }
+    workflow = normalize_workflow(raw, source="<test>")
+
+    result = await execute_run(workflow, tmp_path / "runs")
+
+    assert not result.succeeded
+    run_dir = single_run_dir(tmp_path / "runs")
+    (node,) = state_rows(run_dir, "SELECT * FROM node")
+    assert node["status"] == "errored", "an adapter fault is classified errored, not failed"
+    attempts = state_rows(run_dir, "SELECT * FROM attempt WHERE node_id = 'summarize'")
+    assert len(attempts) == 1, "an errored failure is not retried even with retries set"
+
+
+@pytest.mark.asyncio
 async def test_run_executes_nodes_in_dependency_order_not_declaration_order(
     tmp_path: Path,
 ) -> None:
