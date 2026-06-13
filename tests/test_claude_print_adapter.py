@@ -9,6 +9,7 @@ the CLI is absent.
 """
 
 import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -359,3 +360,17 @@ def test_agent_node_with_claude_print_adapter_validates() -> None:
     (node,) = workflow.nodes
     assert isinstance(node.inputs, AgentNodeInputs)
     assert node.inputs.adapter == "claude.print"
+
+
+@pytest.mark.skipif(shutil.which("claude") is None, reason="the 'claude' CLI is not installed")
+@pytest.mark.asyncio
+async def test_claude_print_real_cli_capability_check() -> None:
+    # The ONLY test that spawns a real `claude`. It auto-skips when the CLI is
+    # absent (the offline suite above is what proves the acceptance criteria). It
+    # exercises the version PROBE — offline, free, deterministic, and needing no
+    # auth — to prove the real-CLI capability-check path works end to end.
+    adapter = ClaudePrintAdapter()
+
+    version = await adapter.capability_check()
+
+    assert version, "a real `claude --version` reports a non-empty version string"
