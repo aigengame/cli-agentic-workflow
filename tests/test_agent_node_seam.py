@@ -77,6 +77,83 @@ async def test_agent_node_runs_through_mock_adapter_replaying_a_fixture(
     assert agent_result.stdout == "a one-line summary"
 
 
+@pytest.mark.asyncio
+async def test_only_declared_env_vars_reach_the_node_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("DECLARED_VAR", "declared-value")
+    monkeypatch.setenv("UNDECLARED_VAR", "undeclared-value")
+    seen_env = tmp_path / "seen_env.json"
+    # The mock Adapter writes the env it received to `echo_env_to`, standing in
+    # for the env an Agent CLI process would see.
+    fixture = write_fixture(tmp_path / "fixture.json", exit_status=0, echo_env_to=str(seen_env))
+    workflow = agent_workflow(fixture, env=["DECLARED_VAR"])
+
+    result = await execute_run(workflow, tmp_path / "runs")
+
+    assert result.succeeded
+    received = json.loads(seen_env.read_text(encoding="utf-8"))
+    assert received == {"DECLARED_VAR": "declared-value"}, (
+        "only the declared var reaches the node, with no parent-environment leakage"
+    )
+
+
+@pytest.mark.asyncio
+async def test_env_values_appear_nowhere_in_state_events_or_artifacts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sentinel = "s3cr3t-sentinel-do-not-persist"
+    monkeypatch.setenv("API_TOKEN", sentinel)
+    artifact = tmp_path / "artifact.txt"
+    artifact.write_text("a produced artifact with no secret\n", encoding="utf-8")
+    fixture = write_fixture(
+        tmp_path / "fixture.json",
+        exit_status=0,
+        stdout="done",
+        artifacts=[str(artifact)],
+    )
+    workflow = agent_workflow(fixture, env=["API_TOKEN"])
+
+    result = await execute_run(workflow, tmp_path / "runs")
+
+    assert result.succeeded
+    run_dir = single_run_dir(tmp_path / "runs")
+    state_bytes = (run_dir / "state.sqlite").read_bytes()
+    events_text = (run_dir / "events.jsonl").read_text(encoding="utf-8")
+    snapshot_text = (run_dir / "workflow.normalized.json").read_text(encoding="utf-8")
+    assert sentinel.encode() not in state_bytes, "the secret value must not reach State"
+    assert sentinel not in events_text, "the secret value must not reach Events"
+    assert sentinel not in snapshot_text, "the secret value must not reach the snapshot"
+    for indexed in result.node_results:
+        for path in indexed.artifacts:
+            assert sentinel not in Path(path).read_text(encoding="utf-8")
+
+
+def test_env_declaration_carries_names_not_values(tmp_path: Path) -> None:
+    # The workflow definition declares env NAMES; a `name=value` form is rejected
+    # so a secret value can never be authored into the inspectable definition.
+    raw: dict[str, Any] = {
+        "name": "sample",
+        "version": 1,
+        "nodes": [
+            {
+                "id": "agent",
+                "kind": "agent",
+                "inputs": {
+                    "adapter": "mock",
+                    "prompt": "do it",
+                    "env": ["DECLARED", "DECLARED"],
+                },
+            }
+        ],
+    }
+
+    with pytest.raises(WorkflowConfigError) as excinfo:
+        normalize_workflow(raw, source="<test>")
+
+    assert "duplicate env name" in str(excinfo.value)
+
+
 def write_schema(path: Path, schema: dict[str, Any]) -> Path:
     path.write_text(json.dumps(schema), encoding="utf-8")
     return path

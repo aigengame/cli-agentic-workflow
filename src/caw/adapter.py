@@ -79,15 +79,23 @@ class MockAdapter(Adapter):
     optional ``stdout``, ``stderr``, ``structured_output``, and ``artifacts``
     (a list of file paths). This lets whole Workflows and Patterns run with no
     real Agent CLI installed (#5 acceptance criteria 1 and 4).
+
+    For env-policy testing the fixture may also set ``echo_env_to``: a file path
+    the mock writes the env it received to. This stands in for the environment a
+    real Agent CLI process would observe, so a test can assert that ONLY declared
+    variables — already filtered by the kernel's env policy — reached the Node.
     """
 
     async def invoke(self, invocation: AgentInvocation) -> AgentResult:
         if invocation.fixture is None:
             raise AdapterError(f"mock adapter requires a fixture for node {invocation.node_id!r}")
-        return self._replay(invocation.fixture, invocation.node_id)
+        return self._replay(invocation)
 
     @staticmethod
-    def _replay(fixture: Path, node_id: str) -> AgentResult:
+    def _replay(invocation: AgentInvocation) -> AgentResult:
+        fixture = invocation.fixture
+        assert fixture is not None  # guarded by invoke
+        node_id = invocation.node_id
         try:
             raw = json.loads(fixture.read_text(encoding="utf-8"))
         except OSError as exc:
@@ -105,6 +113,9 @@ class MockAdapter(Adapter):
             raise AdapterError(
                 f"fixture {fixture} for node {node_id!r} must declare an integer exit_status"
             )
+        echo_env_to = raw.get("echo_env_to")
+        if isinstance(echo_env_to, str):
+            Path(echo_env_to).write_text(json.dumps(dict(invocation.env)), encoding="utf-8")
         artifacts = tuple(Path(entry) for entry in raw.get("artifacts", ()))
         return AgentResult(
             exit_status=exit_status,
