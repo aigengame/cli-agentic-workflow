@@ -30,6 +30,15 @@ validated model directly (`caw.predicate.evaluate_predicate`): there is no parse
 `eval`, so the only conditional surface is the typed algebra. A Node whose `when` evaluates
 false is marked `skipped` and never executed.
 
+A leaf whose referenced upstream produced NO output — because that upstream was itself
+SKIPPED — evaluates **false** (#74). This is reachable for a tolerant `join: any` Node whose
+`when` references a dependency that skipped: the dependency-ref invariant guarantees the ref
+is a dependency, not that the dependency ran. Treating the leaf as false folds composably
+through `all_of` / `any_of` / `not`, so the Node's predicate is evaluated normally — the Node
+runs iff another clause holds, and is otherwise skipped `when_false` — rather than crashing
+the Run. A referenced upstream that SUCCEEDED but whose output is unexpectedly missing is a
+distinct anomaly that raises a clear error, never silently false.
+
 A Node also declares a **join policy** on a separate axis from `when`: `all` (the default)
 skips the Node if ANY dependency skipped; `any` tolerates skipped upstream branches — the
 Node runs iff at least one dependency executed and succeeded, and is itself skipped (cause

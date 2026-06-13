@@ -510,7 +510,7 @@ class _Scheduler:
             if self._indegree[node.id] == 0 and node.id not in running and node.id not in done
         ]
 
-    def _output_of(self, node_id: str) -> dict[str, Any]:
+    def _output_of(self, node_id: str) -> dict[str, Any] | None:
         """The normalized output a `when` predicate reads off an upstream Node (#7).
 
         A Node this Run ran is in ``self._results`` with its in-memory
@@ -519,16 +519,32 @@ class _Scheduler:
         Either way the returned mapping is the persisted
         ``{exit_status, stdout, [structured_output]}`` shape, so the predicate
         evaluates identically in a fresh Run and a resumed one.
+
+        A dependency that was SKIPPED produced NO output, so there is nothing to
+        read: ``None`` is returned and the leaf evaluator treats it as false
+        (#74). This is reachable for a tolerant ``join: any`` Node whose `when`
+        references a dependency that skipped — the validator only guarantees a ref
+        is a dependency, not that the dependency ran. A genuine anomaly — a
+        dependency that SUCCEEDED but whose output is missing from both memory and
+        State — is the one case that must not silently become false, so it raises.
         """
         for result in self._results:
             if result.node_id == node_id:
                 return result.normalized_output
         persisted = self._state.node_output(self._run_id, node_id)
-        # A validated `when` only references dependencies, and a dependency is
-        # satisfied before its dependent's gate is evaluated, so its output is
-        # always present in `_results` or State by now.
-        assert persisted is not None, f"no recorded output for upstream node {node_id!r}"
-        return persisted
+        if persisted is not None:
+            return persisted
+        if node_id in self._skipped:
+            # A skipped dependency has no output; the leaf evaluating it is false.
+            return None
+        # Not in memory, not in State, and not skipped: the dependency is recorded
+        # SUCCEEDED yet its output is unexpectedly absent. This breaches the
+        # "a satisfied dependency's output is present at evaluation time" invariant
+        # and must surface as a clear error, never silently evaluate to false.
+        raise RuntimeError(
+            f"no recorded output for upstream node {node_id!r}, which is not skipped; "
+            f"its output should be present in memory or State at predicate evaluation"
+        )
 
     def _launch_ready(self) -> None:
         # Loop until a full pass over the ready Nodes neither launches nor skips

@@ -843,6 +843,78 @@ async def test_a_node_whose_when_predicate_is_false_is_skipped_and_never_execute
 
 
 @pytest.mark.asyncio
+async def test_an_equals_leaf_does_not_coerce_a_bool_value_to_an_int_exit_status(
+    tmp_path: Path,
+) -> None:
+    # FIX 3 (#74): Python evaluates `0 == False` as True, so an `equals` leaf must
+    # NOT coerce bool to int. `probe` exits 0 (succeeds). `match_int` gates on
+    # exit_status == 0 — a genuine int match, so it RUNS — while `match_bool` gates
+    # on exit_status == false, which must be FALSE (bool vs int mismatch) so it is
+    # SKIPPED. Without the guard `0 == False` would wrongly open `match_bool`'s
+    # gate.
+    int_marker = tmp_path / "int.txt"
+    bool_marker = tmp_path / "bool.txt"
+    workflow = conditional_workflow(
+        shell("probe", "true"),
+        shell(
+            "match_int",
+            f"touch {int_marker}",
+            needs=["probe"],
+            when={"ref": {"node": "probe", "field": "exit_status"}, "op": "equals", "value": 0},
+        ),
+        shell(
+            "match_bool",
+            f"touch {bool_marker}",
+            needs=["probe"],
+            when={
+                "ref": {"node": "probe", "field": "exit_status"},
+                "op": "equals",
+                "value": False,
+            },
+        ),
+    )
+
+    result = await execute_run(workflow, tmp_path / "runs")
+
+    assert result.succeeded
+    assert int_marker.exists(), "exit_status == 0 is a real int match, so the gate opens"
+    assert not bool_marker.exists(), "exit_status == false must not match via 0 == False coercion"
+    assert result.skipped_causes.get("match_bool") == "when_false"
+
+
+@pytest.mark.asyncio
+async def test_an_equals_on_stdout_leaf_matches_a_node_that_echoes_the_value(
+    tmp_path: Path,
+) -> None:
+    # FIX 2 (#74): `echo X` yields stdout "X\n", stored verbatim, so an
+    # `equals`-on-stdout leaf must tolerate the trailing newline or it could never
+    # match an `echo`. `classify` runs `echo billing`; `act` gates on
+    # stdout == "billing" — which must be TRUE despite the trailing newline — so
+    # `act` runs. Before the fix the leaf compared "billing\n" == "billing" and
+    # was always false.
+    marker = tmp_path / "acted.txt"
+    workflow = conditional_workflow(
+        shell("classify", "echo billing"),
+        shell(
+            "act",
+            f"touch {marker}",
+            needs=["classify"],
+            when={
+                "ref": {"node": "classify", "field": "stdout"},
+                "op": "equals",
+                "value": "billing",
+            },
+        ),
+    )
+
+    result = await execute_run(workflow, tmp_path / "runs")
+
+    assert result.succeeded
+    assert marker.exists(), "`equals` on stdout matches an echo despite the trailing newline"
+    assert result.skipped_node_ids == (), "the gate is open, so nothing is skipped"
+
+
+@pytest.mark.asyncio
 async def test_a_node_whose_when_predicate_is_true_runs_normally(tmp_path: Path) -> None:
     # The complement of the false-gate case (#7): a node whose `when` holds runs
     # like any other node. `classify` emits "shipping"; `act` runs iff the label
@@ -1188,6 +1260,141 @@ async def test_a_join_any_node_is_still_skipped_when_a_branch_fails(tmp_path: Pa
     assert result.skipped_blockers["summary"] == "boom", (
         "the tolerant join is blocked by the FAILED node, not by a skip"
     )
+
+
+@pytest.mark.asyncio
+async def test_a_when_leaf_referencing_a_skipped_upstream_evaluates_false_without_crashing(
+    tmp_path: Path,
+) -> None:
+    # FIX 1 (#74): a `when` leaf that references an upstream Node which was SKIPPED
+    # (so it produced no output) must evaluate FALSE, not crash the Run. `classify`
+    # emits "billing"; `ship` gates on "shipping" so it skips, producing no output.
+    # `summary` is a `join: any` over `ship` and `classify`, so it tolerates the
+    # skipped `ship` branch and runs on the surviving `classify` branch — but its
+    # OWN `when` is an `any_of` whose first clause references the SKIPPED `ship`
+    # (resolves false, no output) and whose second references `classify` (true), so
+    # the disjunction holds and `summary` runs. Before the fix `_output_of`
+    # asserted on the skipped `ship`'s missing output and errored the whole Run.
+    summarized = tmp_path / "summarized.txt"
+    workflow = conditional_workflow(
+        shell("classify", "echo billing"),
+        shell(
+            "ship",
+            "echo ship",
+            needs=["classify"],
+            when={
+                "ref": {"node": "classify", "field": "stdout"},
+                "op": "equals",
+                "value": "shipping",
+            },
+        ),
+        shell(
+            "summary",
+            f"touch {summarized}",
+            needs=["ship", "classify"],
+            join="any",
+            when={
+                "any_of": [
+                    {"ref": {"node": "ship", "field": "stdout"}, "op": "equals", "value": "ship"},
+                    {
+                        "ref": {"node": "classify", "field": "stdout"},
+                        "op": "contains",
+                        "value": "billing",
+                    },
+                ]
+            },
+        ),
+    )
+
+    result = await execute_run(workflow, tmp_path / "runs")
+
+    assert result.succeeded, "a leaf over a skipped upstream is false, not a Run-errored crash"
+    assert summarized.exists(), "the surviving `classify` clause kept the `any_of` true"
+    attempted = {node_result.node_id for node_result in result.node_results}
+    assert attempted == {"classify", "summary"}, "the tolerant join ran past the skipped branch"
+    assert result.skipped_node_ids == ("ship",), "only the gated-out branch was skipped"
+
+
+@pytest.mark.asyncio
+async def test_a_when_equals_leaf_referencing_a_skipped_upstream_is_false_and_skips_the_node(
+    tmp_path: Path,
+) -> None:
+    # FIX 1 (#74), the leaf-false floor: when EVERY clause of a node's `when`
+    # resolves false — here a single `equals` leaf referencing a SKIPPED upstream —
+    # the node's predicate is false and the node is skipped `when_false`, not
+    # crashed. `classify` emits "billing"; `ship` skips (gate on "shipping");
+    # `summary` is a `join: any` whose `when` is just an `equals` leaf over the
+    # skipped `ship`, which is false, so `summary` is gated out cleanly.
+    summarized = tmp_path / "summarized.txt"
+    workflow = conditional_workflow(
+        shell("classify", "echo billing"),
+        shell(
+            "ship",
+            "echo ship",
+            needs=["classify"],
+            when={
+                "ref": {"node": "classify", "field": "stdout"},
+                "op": "equals",
+                "value": "shipping",
+            },
+        ),
+        shell(
+            "summary",
+            f"touch {summarized}",
+            needs=["ship", "classify"],
+            join="any",
+            when={"ref": {"node": "ship", "field": "stdout"}, "op": "equals", "value": "ship"},
+        ),
+    )
+
+    result = await execute_run(workflow, tmp_path / "runs")
+
+    assert result.succeeded, "a false leaf over a skipped upstream closes the gate, not crashes"
+    assert not summarized.exists(), "the gate is false, so the tolerant join never runs"
+    assert result.skipped_causes["summary"] == "when_false", (
+        "a node whose every clause is false (skipped-upstream leaf) is skipped when_false"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_when_contains_leaf_referencing_a_skipped_upstream_is_false_not_a_none_substring(
+    tmp_path: Path,
+) -> None:
+    # FIX 1 (#74), the `contains` guard: a `contains` leaf over a SKIPPED upstream
+    # must be FALSE, never fall through to `str(value) in str(None)` (which would
+    # wrongly match a substring of the literal text "None"). `classify` emits
+    # "billing"; `ship` skips; `summary` (join: any) gates on ship.stdout CONTAINS
+    # "n" — which would be TRUE against "None" but must be FALSE against a skipped
+    # branch's absent output. So `summary` is skipped when_false.
+    summarized = tmp_path / "summarized.txt"
+    workflow = conditional_workflow(
+        shell("classify", "echo billing"),
+        shell(
+            "ship",
+            "echo ship",
+            needs=["classify"],
+            when={
+                "ref": {"node": "classify", "field": "stdout"},
+                "op": "equals",
+                "value": "shipping",
+            },
+        ),
+        shell(
+            "summary",
+            f"touch {summarized}",
+            needs=["ship", "classify"],
+            join="any",
+            when={"ref": {"node": "ship", "field": "stdout"}, "op": "contains", "value": "n"},
+        ),
+    )
+
+    result = await execute_run(workflow, tmp_path / "runs")
+
+    assert result.succeeded
+    assert not summarized.exists(), (
+        "`contains` over a skipped upstream is false, not a substring of the text 'None'"
+    )
+    assert result.skipped_causes["summary"] == "when_false"
 
 
 @pytest.mark.asyncio
