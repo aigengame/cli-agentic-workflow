@@ -10,7 +10,7 @@ the CLI is absent.
 
 import pytest
 
-from caw.adapter import AgentInvocation
+from caw.adapter import AdapterError, AgentInvocation
 from caw.claude_print import ClaudePrintAdapter
 
 
@@ -55,3 +55,44 @@ async def test_zero_exit_normalizes_stdout_and_stderr(
     assert result.stderr == ""
     assert result.structured_output is None
     assert result.artifacts == ()
+
+
+@pytest.mark.asyncio
+async def test_non_zero_exit_is_an_ordinary_result_not_an_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # ADR 0006: a `claude` process that RAN and exited non-zero is a normal
+    # AgentResult(exit_status=N), never an AdapterError. AdapterError is reserved
+    # for the Adapter being unable to produce a result at all.
+    patch_spawn(monkeypatch, FakeProcess(7, stdout=b"partial", stderr=b"the model refused"))
+    adapter = ClaudePrintAdapter()
+
+    result = await adapter.invoke(
+        AgentInvocation(node_id="n", adapter="claude.print", prompt="do it")
+    )
+
+    assert result.exit_status == 7
+    assert result.stdout == "partial"
+    assert result.stderr == "the model refused"
+    assert result.structured_output is None
+
+
+@pytest.mark.asyncio
+async def test_missing_cli_raises_an_actionable_setup_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A missing `claude` on PATH must be an ACTIONABLE AdapterError (a setup
+    # message telling the user how to install/enable it), NOT a raw
+    # FileNotFoundError that escapes the Adapter.
+    async def raise_not_found(*args: object, **kwargs: object) -> object:
+        raise FileNotFoundError(2, "No such file or directory", "claude")
+
+    monkeypatch.setattr("caw.claude_print.asyncio.create_subprocess_exec", raise_not_found)
+    adapter = ClaudePrintAdapter()
+
+    with pytest.raises(AdapterError) as excinfo:
+        await adapter.invoke(AgentInvocation(node_id="n", adapter="claude.print", prompt="do it"))
+
+    message = str(excinfo.value)
+    assert "claude" in message
+    assert "install" in message.lower(), "the error tells the user how to install/enable the CLI"
