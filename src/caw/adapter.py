@@ -21,7 +21,7 @@ from pathlib import Path
 # injected at run time (a populated AdapterRegistry passed to execute_run) are not
 # known at validate time; their unknown-name check stays the run-time registry
 # resolve. Real CLIs (#9 claude, #11 codex) add their names here as they land.
-BUILTIN_ADAPTER_NAMES: frozenset[str] = frozenset({"mock"})
+BUILTIN_ADAPTER_NAMES: frozenset[str] = frozenset({"mock", "claude.print"})
 
 
 class AdapterError(Exception):
@@ -177,7 +177,7 @@ class AdapterRegistry:
     """
 
     def __init__(self, adapters: Mapping[str, Adapter] | None = None) -> None:
-        self._adapters: dict[str, Adapter] = dict(adapters or {"mock": MockAdapter()})
+        self._adapters: dict[str, Adapter] = dict(adapters or _default_adapters())
 
     def resolve(self, adapter: str) -> Adapter:
         try:
@@ -196,3 +196,18 @@ class AdapterRegistry:
         known set rather than only the built-ins (#6).
         """
         return frozenset(self._adapters)
+
+
+def _default_adapters() -> dict[str, Adapter]:
+    """The built-in Adapter instances a default registry resolves.
+
+    Mirrors :data:`BUILTIN_ADAPTER_NAMES` so a default-registry run resolves
+    every built-in name. Constructing each Adapter has NO side effects — the real
+    ``claude.print`` Adapter probes the CLI lazily at invoke / capability-check
+    time (#9) — so a shell-only or offline Run never requires ``claude`` to be
+    installed. The ClaudePrintAdapter import is deferred to break the import cycle
+    (``caw.claude_print`` imports the interface from this module).
+    """
+    from caw.claude_print import ClaudePrintAdapter
+
+    return {"mock": MockAdapter(), "claude.print": ClaudePrintAdapter()}

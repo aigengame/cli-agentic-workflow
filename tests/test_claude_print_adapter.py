@@ -306,3 +306,56 @@ async def test_capability_check_on_a_missing_cli_is_an_actionable_setup_error(
         await adapter.capability_check()
 
     assert "install" in str(excinfo.value).lower()
+
+
+def test_claude_print_is_a_builtin_adapter_name() -> None:
+    # `caw validate` checks an agent node's adapter against BUILTIN_ADAPTER_NAMES
+    # at normalize time, so the name must be registered for validation to accept it.
+    from caw.adapter import BUILTIN_ADAPTER_NAMES
+
+    assert "claude.print" in BUILTIN_ADAPTER_NAMES
+
+
+def test_default_registry_resolves_claude_print_with_no_construction_side_effects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A default-registry run must resolve `claude.print`, AND constructing the
+    # registry/adapter must NOT probe the CLI — so a shell-only or offline run
+    # never requires `claude` to be installed. We assert no subprocess spawn fires
+    # during construction or resolution.
+    from caw.adapter import AdapterRegistry
+
+    def fail_if_spawned(*args: object, **kwargs: object) -> object:
+        raise AssertionError("constructing/resolving the adapter must not spawn a subprocess")
+
+    monkeypatch.setattr("caw.claude_print.asyncio.create_subprocess_exec", fail_if_spawned)
+
+    registry = AdapterRegistry()
+    adapter = registry.resolve("claude.print")
+
+    assert isinstance(adapter, ClaudePrintAdapter)
+    assert "claude.print" in registry.names
+
+
+def test_agent_node_with_claude_print_adapter_validates() -> None:
+    # An agent node declaring `adapter: claude.print` passes normalize-time
+    # validation (the #64 unknown-adapter check accepts the registered name).
+    from caw.model import AgentNodeInputs, normalize_workflow
+
+    raw = {
+        "name": "sample",
+        "version": 1,
+        "nodes": [
+            {
+                "id": "agent",
+                "kind": "agent",
+                "inputs": {"adapter": "claude.print", "prompt": "summarize the repo"},
+            }
+        ],
+    }
+
+    workflow = normalize_workflow(raw, source="<test>")
+
+    (node,) = workflow.nodes
+    assert isinstance(node.inputs, AgentNodeInputs)
+    assert node.inputs.adapter == "claude.print"
