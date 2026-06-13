@@ -10,11 +10,15 @@ stay vendor-neutral.
 
 import asyncio
 import json
+import shutil
 
 from caw.adapter import Adapter, AdapterError, AgentInvocation, AgentResult
 
-# The CLI entrypoint this Adapter drives. Resolved on PATH at invoke time (lazily),
-# never at construction, so a shell-only or offline Run never requires `claude`.
+# The CLI entrypoint this Adapter drives. Resolved to an absolute path with
+# shutil.which at invoke / capability-check time (lazily), never at construction,
+# so a shell-only or offline Run never requires `claude`. Locating the binary uses
+# the ambient PATH (infrastructure); it is deliberately NOT part of a node's env
+# allow-list, so the child still receives only invocation.env (see _resolve_cli_path).
 CLAUDE_CLI = "claude"
 
 # The actionable setup message a missing CLI surfaces. ADR 0006 reserves
@@ -33,15 +37,37 @@ def _node_context(invocation: AgentInvocation) -> str:
     return f"node {invocation.node_id!r} (adapter {invocation.adapter!r})"
 
 
+def _resolve_cli_path(context_label: str) -> str:
+    """Locate the ``claude`` CLI on the ambient PATH and return its absolute path.
+
+    Locating the tool is infrastructure: it uses the ambient environment (via
+    ``shutil.which``), NOT a node's env allow-list — exactly how ``capability_check``
+    already reasons about the ambient env. Returning an absolute path lets the
+    caller spawn it with a strict ``env=`` (the node's allow-list for ``invoke``)
+    without needing ``PATH`` declared in that allow-list and without leaking it into
+    the child. A missing CLI is the Adapter being unable to produce a result at all,
+    so it surfaces the same actionable setup AdapterError BEFORE any spawn (#9).
+    """
+    resolved = shutil.which(CLAUDE_CLI)
+    if resolved is None:
+        raise AdapterError(f"{context_label}: {_MISSING_CLI_HINT}")
+    return resolved
+
+
 class ClaudePrintAdapter(Adapter):
     """Invokes ``claude -p`` (Claude Code headless mode) and normalizes its result."""
 
     async def invoke(self, invocation: AgentInvocation) -> AgentResult:
+        # Locate the CLI on the ambient PATH (infrastructure) and spawn its absolute
+        # path, so executable lookup never depends on a PATH inside the node's env
+        # allow-list — the child still receives EXACTLY invocation.env (no PATH leak).
+        # A missing CLI surfaces the actionable setup error here, before any spawn.
+        resolved_cli = _resolve_cli_path(_node_context(invocation))
         # The prompt is positional; the node's `args` pass through verbatim —
         # caw owns no policy engine, so it neither interprets nor injects
         # sandbox/approval (or any) flags. exec (not shell): args are a list, so
         # there is no shell interpolation of the prompt or the passthrough flags.
-        argv = [CLAUDE_CLI, "-p", invocation.prompt, *invocation.args]
+        argv = [resolved_cli, "-p", invocation.prompt, *invocation.args]
         wants_structured = invocation.output_schema is not None
         if wants_structured:
             # An Output Contract is declared: ask the CLI for its single-object JSON
@@ -64,6 +90,10 @@ class ClaudePrintAdapter(Adapter):
                 env=dict(invocation.env),
             )
         except FileNotFoundError as exc:
+            # Defense-in-depth: _resolve_cli_path already gave a clean pre-spawn
+            # missing-CLI error, but a TOCTOU race (the binary vanishing between
+            # which and spawn) must still surface the actionable setup error, never
+            # a raw FileNotFoundError escaping the Adapter.
             raise AdapterError(f"{_node_context(invocation)}: {_MISSING_CLI_HINT}") from exc
         stdout_bytes, stderr_bytes = await process.communicate()
         stdout = stdout_bytes.decode("utf-8", errors="replace")
@@ -85,21 +115,26 @@ class ClaudePrintAdapter(Adapter):
     async def capability_check(self) -> str:
         """Probe the installed ``claude`` CLI and return its version string.
 
-        This is adapter INFRASTRUCTURE, not a node invocation: it probes
-        ``claude --version`` using the ambient environment to locate and run the
-        CLI (no node-declared env allow-list applies, unlike :meth:`invoke`). The
-        version is returned to the caller and kept adapter-local — it is NOT
-        persisted to State (token/cost/version surfacing is carved out to #79). A
-        missing CLI surfaces the same actionable setup AdapterError as invoke.
+        This is adapter INFRASTRUCTURE, not a node invocation: it locates the CLI on
+        the ambient PATH (via :func:`_resolve_cli_path`, the same locate-and-error
+        path :meth:`invoke` uses) and probes ``claude --version`` in the ambient
+        environment — no node-declared env allow-list applies, unlike
+        :meth:`invoke`, so the spawn passes no ``env=``. The version is returned to
+        the caller and kept adapter-local — it is NOT persisted to State (token/cost/
+        version surfacing is carved out to #79). A missing CLI surfaces the same
+        actionable setup AdapterError as invoke, before any spawn.
         """
+        resolved_cli = _resolve_cli_path("capability check")
         try:
             process = await asyncio.create_subprocess_exec(
-                CLAUDE_CLI,
+                resolved_cli,
                 "--version",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
         except FileNotFoundError as exc:
+            # Defense-in-depth for the TOCTOU race (see invoke): the binary
+            # disappearing between which and spawn still yields the setup error.
             raise AdapterError(f"capability check: {_MISSING_CLI_HINT}") from exc
         stdout_bytes, stderr_bytes = await process.communicate()
         if process.returncode != 0:

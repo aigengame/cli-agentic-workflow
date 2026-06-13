@@ -52,6 +52,9 @@ class FakeProcess:
         return self._stdout, self._stderr
 
 
+FAKE_CLAUDE_PATH = "/fake/abs/bin/claude"
+
+
 def patch_spawn(monkeypatch: pytest.MonkeyPatch, process: FakeProcess) -> dict[str, object]:
     """Patch ``asyncio.create_subprocess_exec`` to return ``process``; record args/env."""
     captured: dict[str, object] = {}
@@ -65,10 +68,21 @@ def patch_spawn(monkeypatch: pytest.MonkeyPatch, process: FakeProcess) -> dict[s
     return captured
 
 
+def patch_which(monkeypatch: pytest.MonkeyPatch, resolved: str | None = FAKE_CLAUDE_PATH) -> None:
+    """Patch ``shutil.which`` (in the adapter's namespace) to return ``resolved``.
+
+    Locating the CLI is infrastructure that uses the ambient environment, so the
+    offline suite stubs the lookup rather than depending on a real ``claude`` on
+    PATH. ``resolved=None`` models a missing CLI.
+    """
+    monkeypatch.setattr("caw.claude_print.shutil.which", lambda _name: resolved)
+
+
 @pytest.mark.asyncio
 async def test_zero_exit_normalizes_stdout_and_stderr(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    patch_which(monkeypatch)
     patch_spawn(monkeypatch, FakeProcess(0, stdout=b"a one-line summary", stderr=b""))
     adapter = ClaudePrintAdapter()
 
@@ -90,6 +104,7 @@ async def test_non_zero_exit_is_an_ordinary_result_not_an_error(
     # ADR 0006: a `claude` process that RAN and exited non-zero is a normal
     # AgentResult(exit_status=N), never an AdapterError. AdapterError is reserved
     # for the Adapter being unable to produce a result at all.
+    patch_which(monkeypatch)
     patch_spawn(monkeypatch, FakeProcess(7, stdout=b"partial", stderr=b"the model refused"))
     adapter = ClaudePrintAdapter()
 
@@ -104,14 +119,39 @@ async def test_non_zero_exit_is_an_ordinary_result_not_an_error(
 
 
 @pytest.mark.asyncio
-async def test_missing_cli_raises_an_actionable_setup_error(
+async def test_missing_cli_raises_an_actionable_setup_error_before_spawning(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # A missing `claude` on PATH must be an ACTIONABLE AdapterError (a setup
-    # message telling the user how to install/enable it), NOT a raw
-    # FileNotFoundError that escapes the Adapter.
+    # When `claude` is not on PATH (shutil.which returns None), invoke raises an
+    # ACTIONABLE AdapterError (a setup message telling the user how to install/enable
+    # it) BEFORE attempting to spawn — separating locate-the-tool from run-the-tool.
+    patch_which(monkeypatch, resolved=None)
+
+    async def fail_if_spawned(*args: object, **kwargs: object) -> object:
+        raise AssertionError("a missing CLI must error before create_subprocess_exec")
+
+    monkeypatch.setattr("caw.claude_print.asyncio.create_subprocess_exec", fail_if_spawned)
+    adapter = ClaudePrintAdapter()
+
+    with pytest.raises(AdapterError) as excinfo:
+        await adapter.invoke(AgentInvocation(node_id="n", adapter="claude.print", prompt="do it"))
+
+    message = str(excinfo.value)
+    assert "claude" in message
+    assert "install" in message.lower(), "the error tells the user how to install/enable the CLI"
+
+
+@pytest.mark.asyncio
+async def test_filenotfound_at_spawn_is_translated_as_a_toctou_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Defense-in-depth: shutil.which resolved a path, but the binary vanished before
+    # the spawn (a TOCTOU race). A raw FileNotFoundError must NOT escape the Adapter;
+    # it is translated into the same actionable setup AdapterError.
+    patch_which(monkeypatch)
+
     async def raise_not_found(*args: object, **kwargs: object) -> object:
-        raise FileNotFoundError(2, "No such file or directory", "claude")
+        raise FileNotFoundError(2, "No such file or directory", FAKE_CLAUDE_PATH)
 
     monkeypatch.setattr("caw.claude_print.asyncio.create_subprocess_exec", raise_not_found)
     adapter = ClaudePrintAdapter()
@@ -125,12 +165,34 @@ async def test_missing_cli_raises_an_actionable_setup_error(
 
 
 @pytest.mark.asyncio
+async def test_invoke_spawns_the_resolved_absolute_cli_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Locating the tool is infrastructure (use the ambient PATH), separate from the
+    # child's env policy. invoke resolves `claude` to an ABSOLUTE path via
+    # shutil.which and spawns THAT path, so OS executable lookup never depends on a
+    # PATH in the node's env allow-list. argv[1:] is unchanged.
+    patch_which(monkeypatch)
+    captured = patch_spawn(monkeypatch, FakeProcess(0, stdout=b"ok"))
+    adapter = ClaudePrintAdapter()
+
+    await adapter.invoke(AgentInvocation(node_id="n", adapter="claude.print", prompt="summarize"))
+
+    argv = captured["args"]
+    assert isinstance(argv, tuple)
+    assert argv[0] == FAKE_CLAUDE_PATH, "argv[0] is the which-resolved absolute path"
+    assert argv[1:] == ("-p", "summarize")
+
+
+@pytest.mark.asyncio
 async def test_prompt_is_positional_and_node_args_pass_through_unchanged(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # The prompt is a positional argument to `claude -p`; the node's `args`
     # (sandbox/approval/any other CLI flags) pass through to the subprocess
     # UNCHANGED. caw adds no policy engine: it neither interprets nor injects flags.
+    # argv[0] is the which-resolved absolute path; argv[1:] is prompt + passthrough.
+    patch_which(monkeypatch)
     captured = patch_spawn(monkeypatch, FakeProcess(0, stdout=b"ok"))
     adapter = ClaudePrintAdapter()
 
@@ -144,7 +206,7 @@ async def test_prompt_is_positional_and_node_args_pass_through_unchanged(
     )
 
     assert captured["args"] == (
-        "claude",
+        FAKE_CLAUDE_PATH,
         "-p",
         "summarize the repo",
         "--permission-mode",
@@ -161,7 +223,13 @@ async def test_only_the_invocation_env_reaches_the_subprocess(
     # Env policy (ADR 0006, #5): the executor hands the adapter an already-filtered
     # allow-list. The adapter passes EXACTLY that to the subprocess — never merging
     # the parent os.environ, which would leak the whole environment.
+    #
+    # Crucially the node env LACKS PATH (the normal case), yet invoke still LOCATES
+    # the CLI because shutil.which uses the ambient env (infrastructure) — separate
+    # from the child's env policy. The fix must NOT reintroduce parent-env leakage:
+    # the child still receives EXACTLY {"DECLARED_VAR": "..."} and no PATH.
     monkeypatch.setenv("PARENT_ONLY_VAR", "leaked-if-present")
+    patch_which(monkeypatch)
     captured = patch_spawn(monkeypatch, FakeProcess(0, stdout=b"ok"))
     adapter = ClaudePrintAdapter()
 
@@ -177,6 +245,7 @@ async def test_only_the_invocation_env_reaches_the_subprocess(
     assert captured["env"] == {"DECLARED_VAR": "declared-value"}, (
         "exactly the invocation env reaches the subprocess, with no parent-env leakage"
     )
+    assert "PATH" not in captured["env"], "locating the CLI does not inject PATH into the child"
 
 
 @pytest.mark.asyncio
@@ -194,6 +263,7 @@ async def test_output_schema_requests_json_and_parses_structured_output(
     stdout = claude_json_result(
         result="Returned a person.", structured_output={"name": "Alice", "age": 30}
     )
+    patch_which(monkeypatch)
     captured = patch_spawn(monkeypatch, FakeProcess(0, stdout=stdout))
     adapter = ClaudePrintAdapter()
 
@@ -218,6 +288,7 @@ async def test_no_output_schema_does_not_request_json_and_leaves_structured_outp
 ) -> None:
     # Without an output_schema the adapter does NOT request JSON output: stdout is
     # the CLI's raw text and structured_output stays None.
+    patch_which(monkeypatch)
     captured = patch_spawn(monkeypatch, FakeProcess(0, stdout=b"plain text answer"))
     adapter = ClaudePrintAdapter()
 
@@ -240,6 +311,7 @@ async def test_unparseable_json_when_a_schema_was_required_is_an_adapter_error(
     # that is not the expected JSON wrapper, the adapter cannot produce a result:
     # ADR 0006 reserves AdapterError for exactly this (output required, unparseable).
     schema = write_schema(tmp_path / "s.schema.json", {"type": "object"})
+    patch_which(monkeypatch)
     patch_spawn(monkeypatch, FakeProcess(0, stdout=b"not json at all"))
     adapter = ClaudePrintAdapter()
 
@@ -259,6 +331,7 @@ async def test_non_zero_exit_with_schema_does_not_attempt_to_parse_structured_ou
     # the adapter must NOT raise an AdapterError for unparseable output here — the
     # process failed and its exit status is the node's failure, parseability moot.
     schema = write_schema(tmp_path / "s.schema.json", {"type": "object"})
+    patch_which(monkeypatch)
     patch_spawn(monkeypatch, FakeProcess(2, stdout=b"error text, not json", stderr=b"boom"))
     adapter = ClaudePrintAdapter()
 
@@ -279,6 +352,7 @@ async def test_capability_check_records_the_cli_version(
     # adapter infrastructure (not a node invocation), so it may use the ambient
     # environment to locate and run the CLI. The version is adapter-local — returned
     # here, never persisted to State (#79 carve-out).
+    patch_which(monkeypatch)
     captured = patch_spawn(monkeypatch, FakeProcess(0, stdout=b"2.1.177 (Claude Code)\n"))
     adapter = ClaudePrintAdapter()
 
@@ -287,7 +361,7 @@ async def test_capability_check_records_the_cli_version(
     assert version == "2.1.177 (Claude Code)"
     argv = captured["args"]
     assert isinstance(argv, tuple)
-    assert argv == ("claude", "--version")
+    assert argv == (FAKE_CLAUDE_PATH, "--version")
     # Ambient environment: the probe does not pass a filtered env=... allow-list,
     # so it can locate/run the CLI like any infrastructure command.
     assert captured["env"] is None
@@ -297,10 +371,15 @@ async def test_capability_check_records_the_cli_version(
 async def test_capability_check_on_a_missing_cli_is_an_actionable_setup_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def raise_not_found(*args: object, **kwargs: object) -> object:
-        raise FileNotFoundError(2, "No such file or directory", "claude")
+    # The capability check locates the CLI the same way invoke does: when
+    # shutil.which returns None it raises the actionable setup AdapterError BEFORE
+    # spawning the version probe.
+    patch_which(monkeypatch, resolved=None)
 
-    monkeypatch.setattr("caw.claude_print.asyncio.create_subprocess_exec", raise_not_found)
+    async def fail_if_spawned(*args: object, **kwargs: object) -> object:
+        raise AssertionError("a missing CLI must error before create_subprocess_exec")
+
+    monkeypatch.setattr("caw.claude_print.asyncio.create_subprocess_exec", fail_if_spawned)
     adapter = ClaudePrintAdapter()
 
     with pytest.raises(AdapterError) as excinfo:
