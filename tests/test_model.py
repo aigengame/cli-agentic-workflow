@@ -33,6 +33,29 @@ def test_cycle_error_names_only_the_cycle_members_not_downstream_nodes() -> None
     assert "tail" not in message, "a node downstream of the cycle is not a cycle member"
 
 
+def test_execution_order_breaks_ties_among_ready_nodes_by_declaration_order() -> None:
+    # The order function's tie-break contract at its own unit seam: among nodes
+    # whose dependencies are all satisfied, declaration order decides. caw graph
+    # relies on this; the executor seam only pins the durable join-after-branches
+    # contract, leaving the deterministic tie-break to be pinned here.
+    workflow = Workflow(
+        name="sample",
+        version=1,
+        nodes=(
+            shell_node("join", "left", "right"),
+            shell_node("left"),
+            shell_node("right"),
+        ),
+    )
+
+    ordered_ids = [node.id for node in execution_order(workflow)]
+
+    assert ordered_ids == ["left", "right", "join"], (
+        "left and right are independent and both ready first; declaration order "
+        "(left before right) breaks the tie deterministically"
+    )
+
+
 def test_execution_order_raises_on_an_unpeelable_remainder_instead_of_a_partial_order() -> None:
     # A validation-bypassing constructor (model_construct, model_copy(update=...))
     # can hold a cyclic graph; ordering it must fail loudly, never return a

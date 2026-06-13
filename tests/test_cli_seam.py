@@ -14,22 +14,26 @@ runner = CliRunner()
 
 
 def linear_pipeline(marker_command: str = "echo hello") -> dict[str, Any]:
-    """A sample three-node linear pipeline: build -> test -> deploy."""
+    """A three-node linear pipeline build -> test -> deploy, declared non-topologically.
+
+    Declaration order deliberately differs from dependency order so that any
+    consumer falling back to declaration order fails the seam tests.
+    """
     return {
         "name": "sample",
         "version": 1,
         "nodes": [
+            {
+                "id": "deploy",
+                "kind": "shell",
+                "needs": ["test"],
+                "inputs": {"command": marker_command},
+            },
             {"id": "build", "kind": "shell", "inputs": {"command": marker_command}},
             {
                 "id": "test",
                 "kind": "shell",
                 "needs": ["build"],
-                "inputs": {"command": marker_command},
-            },
-            {
-                "id": "deploy",
-                "kind": "shell",
-                "needs": ["test"],
                 "inputs": {"command": marker_command},
             },
         ],
@@ -69,18 +73,24 @@ def test_validate_reports_one_ok_line_naming_the_workflow_file(
     assert "workflow.yaml" in lines[0]
 
 
+def two_node_cycle() -> dict[str, Any]:
+    """A minimal a <-> b dependency cycle: a needs b, b needs a."""
+    return {
+        "name": "sample",
+        "version": 1,
+        "nodes": [
+            {"id": "a", "kind": "shell", "needs": ["b"], "inputs": {"command": "echo a"}},
+            {"id": "b", "kind": "shell", "needs": ["a"], "inputs": {"command": "echo b"}},
+        ],
+    }
+
+
 def test_validate_invalid_workflow_exits_two_with_a_single_error_line(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    write_workflow_data: Callable[[dict[str, Any]], Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    workflow_file = tmp_path / "workflow.yaml"
-    workflow_file.write_text(
-        "name: sample\n"
-        "version: 1\n"
-        "nodes:\n"
-        "  - id: a\n    kind: shell\n    needs: [b]\n    inputs:\n      command: echo a\n"
-        "  - id: b\n    kind: shell\n    needs: [a]\n    inputs:\n      command: echo b\n",
-        encoding="utf-8",
-    )
+    workflow_file = write_workflow_data(two_node_cycle())
     monkeypatch.chdir(tmp_path)
 
     result = runner.invoke(app, ["validate", str(workflow_file)])
@@ -155,13 +165,13 @@ def test_graph_renders_a_json_plan_with_nodes_edges_and_order(
     plan = json.loads(result.output)
     assert plan["workflow"] == "sample"
     assert plan["nodes"] == [
+        {"id": "deploy", "kind": "shell", "needs": ["test"]},
         {"id": "build", "kind": "shell", "needs": []},
         {"id": "test", "kind": "shell", "needs": ["build"]},
-        {"id": "deploy", "kind": "shell", "needs": ["test"]},
-    ]
+    ], "nodes render in declaration order"
     assert plan["edges"] == [
-        {"from": "build", "to": "test"},
         {"from": "test", "to": "deploy"},
+        {"from": "build", "to": "test"},
     ]
     assert plan["topological_order"] == ["build", "test", "deploy"], (
         "the plan names the order's semantics: a topological linearization, "
@@ -676,25 +686,11 @@ def test_run_rejects_a_node_that_needs_itself(
 
 
 def test_run_rejects_a_dependency_cycle_naming_the_offending_nodes(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    write_workflow_data: Callable[[dict[str, Any]], Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    workflow_file = tmp_path / "workflow.yaml"
-    workflow_file.write_text(
-        "name: sample\n"
-        "version: 1\n"
-        "nodes:\n"
-        "  - id: a\n"
-        "    kind: shell\n"
-        "    needs: [b]\n"
-        "    inputs:\n"
-        "      command: echo a\n"
-        "  - id: b\n"
-        "    kind: shell\n"
-        "    needs: [a]\n"
-        "    inputs:\n"
-        "      command: echo b\n",
-        encoding="utf-8",
-    )
+    workflow_file = write_workflow_data(two_node_cycle())
     monkeypatch.chdir(tmp_path)
 
     result = runner.invoke(app, ["run", str(workflow_file)])
