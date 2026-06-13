@@ -590,6 +590,57 @@ def test_two_combinators_at_once_is_a_config_error() -> None:
     assert "when" in str(excinfo.value)
 
 
+def test_an_empty_all_of_combinator_is_a_config_error() -> None:
+    # FIX 4 (#74): an empty `all_of` is not a meaningful conjunction — it would
+    # validate (an empty tuple is `is not None`) and evaluate vacuously true,
+    # silently opening the gate. Reject it at validation time instead.
+    raw: dict[str, Any] = {
+        "name": "sample",
+        "version": 1,
+        "nodes": [
+            {"id": "a", "kind": "shell", "inputs": {"command": "echo x"}},
+            {
+                "id": "gate",
+                "kind": "shell",
+                "needs": ["a"],
+                "when": {"all_of": []},
+                "inputs": {"command": "echo gate"},
+            },
+        ],
+    }
+
+    with pytest.raises(WorkflowConfigError) as excinfo:
+        normalize_workflow(raw, source="workflow.yaml")
+
+    message = str(excinfo.value)
+    assert "all_of" in message, "the error names the empty combinator"
+
+
+def test_an_empty_any_of_combinator_is_a_config_error() -> None:
+    # FIX 4 (#74): an empty `any_of` would validate and evaluate vacuously false,
+    # silently closing the gate. Reject it at validation time.
+    raw: dict[str, Any] = {
+        "name": "sample",
+        "version": 1,
+        "nodes": [
+            {"id": "a", "kind": "shell", "inputs": {"command": "echo x"}},
+            {
+                "id": "gate",
+                "kind": "shell",
+                "needs": ["a"],
+                "when": {"any_of": []},
+                "inputs": {"command": "echo gate"},
+            },
+        ],
+    }
+
+    with pytest.raises(WorkflowConfigError) as excinfo:
+        normalize_workflow(raw, source="workflow.yaml")
+
+    message = str(excinfo.value)
+    assert "any_of" in message, "the error names the empty combinator"
+
+
 def test_contains_on_a_non_string_field_is_a_config_error() -> None:
     # `contains` is a substring test, valid only on a string field (#7): using it
     # against `exit_status` (an integer) is a config error, caught at validation

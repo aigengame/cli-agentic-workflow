@@ -271,6 +271,14 @@ class Predicate(BaseModel):
             raise ValueError("a leaf predicate must declare both `ref` and `op`")
         if not is_leaf and (self.op is not None or self.value is not None):
             raise ValueError("`op`/`value` belong to a leaf predicate, not a combinator")
+        # An empty `all_of`/`any_of` would validate (an empty tuple is not None)
+        # and evaluate vacuously (all([]) is true, any([]) is false), silently
+        # opening or closing the gate. Reject it: a combinator must combine at
+        # least one sub-predicate (#74).
+        if self.all_of is not None and len(self.all_of) == 0:
+            raise ValueError("`all_of` must contain at least one sub-predicate, not be empty")
+        if self.any_of is not None and len(self.any_of) == 0:
+            raise ValueError("`any_of` must contain at least one sub-predicate, not be empty")
         if (
             is_leaf
             and self.op == "contains"
