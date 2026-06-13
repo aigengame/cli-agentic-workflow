@@ -163,6 +163,47 @@ def test_cycle_message_arrows_point_in_execution_direction_like_the_json_plan_ed
     assert "dependency cycle: 'a' -> 'c' -> 'b' -> 'a'" in str(excinfo.value)
 
 
+def test_concurrency_defaults_to_a_conservative_limit_when_unspecified() -> None:
+    # A workflow that does not declare concurrency runs at the kernel's
+    # conservative default rather than unbounded or one-at-a-time.
+    raw: dict[str, Any] = {
+        "name": "sample",
+        "version": 1,
+        "nodes": [{"id": "greet", "kind": "shell", "inputs": {"command": "echo hi"}}],
+    }
+
+    workflow = normalize_workflow(raw, source="<test>")
+
+    assert workflow.concurrency == 4
+
+
+def test_concurrency_can_be_raised_in_workflow_config() -> None:
+    raw: dict[str, Any] = {
+        "name": "sample",
+        "version": 1,
+        "concurrency": 8,
+        "nodes": [{"id": "greet", "kind": "shell", "inputs": {"command": "echo hi"}}],
+    }
+
+    workflow = normalize_workflow(raw, source="<test>")
+
+    assert workflow.concurrency == 8
+
+
+def test_concurrency_below_one_is_a_config_error() -> None:
+    raw: dict[str, Any] = {
+        "name": "sample",
+        "version": 1,
+        "concurrency": 0,
+        "nodes": [{"id": "greet", "kind": "shell", "inputs": {"command": "echo hi"}}],
+    }
+
+    with pytest.raises(WorkflowConfigError) as excinfo:
+        normalize_workflow(raw, source="workflow.yaml")
+
+    assert "concurrency" in str(excinfo.value)
+
+
 def test_validation_and_ordering_scale_to_thousands_of_nodes() -> None:
     # Pattern Expanders (roadmap) compile patterns into graphs of exactly this
     # scale, and validate is sold as the fast fail-fast check. A 5,000-node

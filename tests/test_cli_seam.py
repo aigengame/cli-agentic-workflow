@@ -151,6 +151,27 @@ def test_graph_renders_a_text_plan_in_execution_order_with_needs(
     assert not (tmp_path / ".caw").exists(), "graph never creates a run directory"
 
 
+def test_graph_text_plan_shows_the_concurrency_limit(
+    write_workflow_data: Callable[[dict[str, Any]], Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #55.2: the JSON plan exposes `concurrency`, but the human-readable text plan
+    # did not, so the two formats disagreed and a user inspecting the text plan
+    # got no feedback that a non-default concurrency limit took effect.
+    plan_input = linear_pipeline()
+    plan_input["concurrency"] = 3
+    workflow_file = write_workflow_data(plan_input)
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["graph", str(workflow_file)])
+
+    assert result.exit_code == 0, result.output
+    assert "concurrency: 3" in result.output, (
+        "the text plan names the concurrency setting and its configured value"
+    )
+
+
 def test_graph_renders_a_json_plan_with_nodes_edges_and_order(
     write_workflow_data: Callable[[dict[str, Any]], Path],
     tmp_path: Path,
@@ -179,6 +200,58 @@ def test_graph_renders_a_json_plan_with_nodes_edges_and_order(
     )
     assert "order" not in plan, "the unqualified key is gone before external consumers exist"
     assert not (tmp_path / ".caw").exists()
+
+
+def test_graph_json_plan_surfaces_the_concurrency_limit(
+    write_workflow_data: Callable[[dict[str, Any]], Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan_input = linear_pipeline()
+    plan_input["concurrency"] = 3
+    workflow_file = write_workflow_data(plan_input)
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["graph", str(workflow_file), "--format", "json"])
+
+    assert result.exit_code == 0, result.output
+    plan = json.loads(result.output)
+    assert plan["concurrency"] == 3, "the machine-readable plan exposes the concurrency limit"
+
+
+def test_graph_json_plan_defaults_concurrency_when_unspecified(
+    write_workflow_data: Callable[[dict[str, Any]], Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow_file = write_workflow_data(linear_pipeline())
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["graph", str(workflow_file), "--format", "json"])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["concurrency"] == 4, "the plan shows the conservative default"
+
+
+def test_run_rejects_a_concurrency_below_one_with_a_single_error_line(
+    write_workflow_data: Callable[[dict[str, Any]], Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bad = linear_pipeline()
+    bad["concurrency"] = 0
+    workflow_file = write_workflow_data(bad)
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["run", str(workflow_file)])
+
+    assert result.exit_code == 2, "a concurrency below 1 is a config error"
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    lines = [line for line in result.output.splitlines() if line.strip()]
+    assert len(lines) == 1
+    assert lines[0].startswith("error:")
+    assert "concurrency" in lines[0], "the error names the offending field"
+    assert not (tmp_path / ".caw").exists(), "no run directory is created for invalid config"
 
 
 def test_graph_invalid_workflow_exits_two_with_a_single_error_line(
@@ -251,6 +324,45 @@ def test_run_failing_shell_node_exits_nonzero_and_reports_failure(
     assert result.exit_code != 0
     assert "failed" in result.output
     assert "exited 7" in result.output
+
+
+def test_run_output_lists_a_skipped_join_node_and_its_blocker(
+    write_workflow_data: Callable[[dict[str, Any]], Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #55.1: a fan-in where one branch fails skips the join, which is recorded
+    # `skipped` (with its blocker) in State and Events but was invisible in the
+    # run summary, which iterated only attempted nodes. The summary must list the
+    # skipped join distinctly from the attempted branches, naming the node that
+    # blocked it, so a user can tell withheld work from work that was never run.
+    workflow_file = write_workflow_data(
+        {
+            "name": "sample",
+            "version": 1,
+            "nodes": [
+                {"id": "left", "kind": "shell", "inputs": {"command": "echo left"}},
+                {"id": "right", "kind": "shell", "inputs": {"command": "exit 7"}},
+                {
+                    "id": "join",
+                    "kind": "shell",
+                    "needs": ["left", "right"],
+                    "inputs": {"command": "echo join"},
+                },
+            ],
+        }
+    )
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["run", str(workflow_file)])
+
+    assert result.exit_code == 1, result.output
+    assert "node left attempt 1 exited 0" in result.output, "an attempted branch is reported"
+    assert "node right attempt 1 exited 7" in result.output, "the failed branch is reported"
+    lines = result.output.splitlines()
+    skipped_line = next((line for line in lines if "join" in line and "skipped" in line), None)
+    assert skipped_line is not None, "the skipped join node appears in the run summary"
+    assert "right" in skipped_line, "the skipped node names the branch that blocked it"
 
 
 def test_run_failing_node_prints_its_stderr_excerpt(
