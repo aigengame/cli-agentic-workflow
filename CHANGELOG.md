@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/aigengame/cli-agentic-workflow/compare/v0.3.0...v0.4.0) (2026-06-13)
+
+
+### Features
+
+* Adapter interface, agent nodes, mock adapter, output contracts, env policy ([#60](https://github.com/aigengame/cli-agentic-workflow/issues/60)) ([f9bbdfc](https://github.com/aigengame/cli-agentic-workflow/commit/f9bbdfcc1b02ca73de6e6c794b23fb9e3d900ae4))
+
 ## [0.3.0](https://github.com/aigengame/cli-agentic-workflow/compare/v0.2.1...v0.3.0) (2026-06-13)
 
 
