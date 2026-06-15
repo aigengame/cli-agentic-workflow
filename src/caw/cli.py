@@ -45,8 +45,10 @@ from caw.executor import (
     resume_run,
 )
 from caw.model import Node, Predicate, Workflow, execution_order, normalize_workflow
+from caw.patterns import expander_names, get_expander
 from caw.report import ReportFormat, render_report
 from caw.runlayout import run_dir, runs_root
+from caw.scaffold import PATTERN_EXAMPLES, STARTER_WORKFLOW
 
 app = typer.Typer(
     name="caw",
@@ -83,6 +85,34 @@ def _load_normalized_workflow(workflow_file: Path) -> Workflow:
     except WorkflowConfigError as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=2) from exc
+
+
+def _write_scaffold(target: Path, content: str, label: str) -> None:
+    """Write a scaffolded workflow file, refusing to clobber an existing one.
+
+    Scaffolding never silently overwrites an author's file: an existing target is a
+    config-class refusal (exit 2, one ``error:`` line), mirroring the CLI's config
+    contract. ``label`` names what was scaffolded (a starter, or a pattern example).
+    """
+    if target.exists():
+        typer.echo(f"error: {target} already exists; refusing to overwrite it", err=True)
+        raise typer.Exit(code=2)
+    try:
+        target.write_text(content, encoding="utf-8")
+    except OSError as exc:
+        typer.echo(f"error: cannot write {target}: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    typer.echo(f"created {label} at {target} (validate it with `caw validate {target}`)")
+
+
+@app.command()
+def init(
+    path: Annotated[
+        Path, typer.Argument(help="Where to write the starter workflow.")
+    ] = Path("workflow.yaml"),
+) -> None:
+    """Create a minimal starter workflow that validates and runs."""
+    _write_scaffold(path, STARTER_WORKFLOW, "starter workflow")
 
 
 @app.command()
