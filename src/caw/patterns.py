@@ -179,7 +179,13 @@ def expand_pattern(raw: dict[str, Any], source: str) -> dict[str, Any]:
         raise WorkflowConfigError(
             f"invalid workflow definition in {source}: `pattern` must be a mapping"
         )
-    pattern_type = pattern.get("type")
+    if "type" not in pattern:
+        known = ", ".join(expander_names()) or "<none>"
+        raise WorkflowConfigError(
+            f"invalid workflow definition in {source}: `pattern` must declare a `type` "
+            f"(known: {known})"
+        )
+    pattern_type = pattern["type"]
     expander = get_expander(pattern_type) if isinstance(pattern_type, str) else None
     if expander is None:
         known = ", ".join(expander_names()) or "<none>"

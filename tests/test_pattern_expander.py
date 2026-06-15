@@ -229,6 +229,21 @@ def test_unknown_pattern_type_is_a_config_error_naming_the_known_patterns() -> N
     assert "pipeline" in message and "parallel" in message, "the known patterns are listed"
 
 
+def test_a_pattern_without_a_type_is_a_config_error_listing_known_patterns() -> None:
+    raw: dict[str, Any] = {
+        "name": "ci",
+        "version": 1,
+        "pattern": {"steps": []},
+    }
+
+    with pytest.raises(WorkflowConfigError) as excinfo:
+        normalize_workflow(raw, source="notype.yaml")
+
+    message = str(excinfo.value)
+    assert "must declare a `type`" in message
+    assert "pipeline" in message and "parallel" in message
+
+
 def test_bad_pattern_params_give_one_error_line_with_a_field_path() -> None:
     # An expander's params failure surfaces through the same one-line
     # `WorkflowConfigError` contract a malformed `nodes:` workflow uses, with a
