@@ -1866,9 +1866,7 @@ def _snapshot_node_env(run_dir: Path) -> object:
     entirely is still caught; an OMITTED `env` serializes as ``null`` (present but
     None), distinct from an explicit empty `env: []`.
     """
-    snapshot = json.loads(
-        (run_dir / "workflow.normalized.json").read_text(encoding="utf-8")
-    )
+    snapshot = json.loads((run_dir / "workflow.normalized.json").read_text(encoding="utf-8"))
     inputs = snapshot["workflow"]["nodes"][0]["inputs"]
     return inputs.get("env", "<<absent>>")
 
