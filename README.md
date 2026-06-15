@@ -252,14 +252,20 @@ uv run ruff check && uv run ruff format --check
 uv run mypy
 ```
 
-Tests exercise external behavior only, through three seams: the CLI itself, a
-fixture-replaying mock adapter (no tokens, no real CLIs), and the on-disk run directory.
+Tests exercise external behavior only — what a user observes through the CLI, the on-disk
+run directory, or a real agent-CLI run — never internal objects or call sequences. Coverage
+spans seams that are **co-weighted**: the CLI itself, the on-disk run directory, a
+fixture-replaying mock adapter (for behaviors a fixture can verify completely offline, no
+tokens), and a real agent-CLI **e2e** tier (for behaviors whose correctness depends on the
+real CLI). The mock complements the e2e tier; it does not replace it.
 
 ### Two-tier test suite: non-e2e and e2e
 
-Most tests are **non-e2e** and run everywhere with no real Agent CLI. A small **e2e**
-tier (`tests/e2e/`, marked `e2e`) drives a real Agent CLI end to end — a real
-`claude -p` run flowing through `caw run` into the Output Contract and State.
+The **non-e2e** tier runs everywhere with no real Agent CLI. The **e2e** tier
+(`tests/e2e/`, marked `e2e`) drives a real Agent CLI end to end — a real `claude -p` run
+flowing through `caw run` into the Output Contract and State. Because most real usage runs
+agent CLIs as nodes, e2e is mandatory coverage that grows as features land (new adapters,
+multi-node graphs, patterns) — not an afterthought.
 
 - **Local only, for now.** Cloud agent auth is not provisionable in GitHub Actions yet,
   so CI runs `pytest -m "not e2e"` and the e2e tier is a local gate. It migrates into CI

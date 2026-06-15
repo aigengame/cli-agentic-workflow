@@ -1,10 +1,13 @@
 """Real ``claude.print`` graph-run e2e tests (#86).
 
-These are the representative cases whose correctness depends on the REAL Agent CLI:
-a real ``claude -p`` invocation, its result-wrapper shape, and a real agent Node
-flowing through ``execute_run`` into the Output Contract and State. Per decision #5
-this is a small set — a structured-output run, a freeform run, and a real non-zero
-failure — NOT a 1:1 twin of every mock test (our-own-logic branches stay mock-only).
+These cover the cases whose correctness depends on the REAL Agent CLI: a real
+``claude -p`` invocation, its result-wrapper shape, and a real agent Node flowing through
+``execute_run`` into the Output Contract and State. This is a LIVING suite, not a fixed
+set: today it bootstraps three runs (structured-output, freeform, real non-zero failure)
+because ``claude.print`` is the only real node surface so far, and it grows as features
+land (codex #11, multi-node graphs, patterns, resume). Behaviors a fixture can verify
+completely and offline are covered by the mock suite instead — the two are co-weighted,
+neither privileged.
 
 Assertions are contract/structure-based, never free-text (decision #4): a structured
 run is judged by exit 0 + the kernel validating the Output Contract + the typed shape
