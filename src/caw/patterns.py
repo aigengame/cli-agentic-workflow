@@ -42,9 +42,7 @@ class PatternExpander:
     field path); ``expand`` compiles the validated params into plain node dicts.
     """
 
-    def __init__(
-        self, name: str, params_model: type[BaseModel], expand: ExpandFn
-    ) -> None:
+    def __init__(self, name: str, params_model: type[BaseModel], expand: ExpandFn) -> None:
         self.name = name
         self.params_model = params_model
         self.expand = expand
@@ -55,9 +53,7 @@ class PatternExpander:
 _EXPANDERS: dict[str, PatternExpander] = {}
 
 
-def register_expander(
-    name: str, params_model: type[BaseModel], expand: ExpandFn
-) -> None:
+def register_expander(name: str, params_model: type[BaseModel], expand: ExpandFn) -> None:
     """Register an expander under ``name`` (additive; the registry is the dispatch)."""
     _EXPANDERS[name] = PatternExpander(name, params_model, expand)
 
@@ -110,6 +106,51 @@ def _expand_pipeline(params: _PipelineParams) -> list[NodeDict]:
     return nodes
 
 
+class _ParallelParams(BaseModel):
+    """Params of the ``parallel`` expander: independent branches + an optional join.
+
+    Each branch is a plain node dict with no ``needs`` (the branches are
+    independent and run concurrently); declaring ``needs`` on a branch is rejected.
+    ``join`` is an optional plain node dict that fans the branches in — the
+    expander injects its ``needs`` (every branch id), so the join may carry its own
+    ``join`` policy (``all`` / ``any``) but not its own ``needs``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    branches: list[NodeDict] = Field(min_length=1)
+    join: NodeDict | None = None
+
+    @field_validator("branches")
+    @classmethod
+    def _branches_must_not_declare_needs(cls, branches: list[NodeDict]) -> list[NodeDict]:
+        for branch in branches:
+            if isinstance(branch, dict) and "needs" in branch:
+                raise ValueError(
+                    "a parallel branch must not declare `needs`; branches are independent"
+                )
+        return branches
+
+    @field_validator("join")
+    @classmethod
+    def _join_must_not_declare_needs(cls, join: NodeDict | None) -> NodeDict | None:
+        if isinstance(join, dict) and "needs" in join:
+            raise ValueError(
+                "a parallel join must not declare `needs`; the join fans in every branch"
+            )
+        return join
+
+
+def _expand_parallel(params: _ParallelParams) -> list[NodeDict]:
+    """Emit independent branches and (if declared) a join that needs every branch."""
+    nodes: list[NodeDict] = [dict(branch) for branch in params.branches]
+    if params.join is not None:
+        join_node = dict(params.join)
+        join_node["needs"] = [branch.get("id") for branch in params.branches]
+        nodes.append(join_node)
+    return nodes
+
+
 def expand_pattern(raw: dict[str, Any], source: str) -> dict[str, Any]:
     """Expand a ``pattern:`` block into a plain ``nodes:`` workflow, or pass through.
 
@@ -149,8 +190,7 @@ def expand_pattern(raw: dict[str, Any], source: str) -> dict[str, Any]:
         remainder = exc.error_count() - 1
         suffix = f" (+{remainder} more)" if remainder else ""
         raise WorkflowConfigError(
-            f"invalid workflow definition in {source}: pattern.{location}: "
-            f"{first['msg']}{suffix}"
+            f"invalid workflow definition in {source}: pattern.{location}: {first['msg']}{suffix}"
         ) from exc
     expanded = {key: value for key, value in raw.items() if key != "pattern"}
     expanded["nodes"] = expander.expand(params)
@@ -158,3 +198,4 @@ def expand_pattern(raw: dict[str, Any], source: str) -> dict[str, Any]:
 
 
 register_expander("pipeline", _PipelineParams, _expand_pipeline)
+register_expander("parallel", _ParallelParams, _expand_parallel)
