@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from conftest import read_events
 from typer.testing import CliRunner
 
 from caw.cli import app
@@ -76,8 +77,12 @@ def test_snapshot_carries_a_definition_checksum_over_the_normalized_workflow(
         "kind": "shell",
         # The normalized inputs carry the discriminator tag `kind` since #5 added
         # the agent Node kind: `inputs` is a discriminated union and the tag is
-        # part of its serialized form.
-        "inputs": {"kind": "shell", "command": "echo hello"},
+        # part of its serialized form. The shell-node env allow-list (#66) is part
+        # of the persisted inputs too, so a resume reconstructs the SAME env scope;
+        # an OMITTED env (this node declares none) round-trips as `null` — distinct
+        # from an explicit empty `[]` allow-list — so legacy parent-environment
+        # inheritance survives the resume rather than collapsing into "pass no vars".
+        "inputs": {"kind": "shell", "command": "echo hello", "env": None},
         "needs": [],
         # The per-Node failure-semantics policy (#6) is part of the persisted
         # snapshot so a resume reconstructs the SAME retry/timeout budgets it ran
@@ -248,11 +253,6 @@ def test_non_utf8_node_output_is_preserved_with_backslash_escapes(
     output = json.loads(attempt["output_json"])
     assert output["stdout"] == "\\xff\\xfe", "invalid UTF-8 bytes survive as backslash escapes"
     assert "�" not in output["stdout"]
-
-
-def read_events(run_dir: Path) -> list[dict[str, Any]]:
-    lines = (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
-    return [json.loads(line) for line in lines]
 
 
 def test_events_form_an_append_only_trace_of_a_succeeding_run(

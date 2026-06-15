@@ -15,6 +15,7 @@ import sqlite3
 from pathlib import Path
 
 import pytest
+from conftest import write_schema
 
 from caw.adapter import AdapterError, AdapterRegistry, AgentInvocation
 from caw.claude_print import ClaudePrintAdapter
@@ -37,11 +38,6 @@ def claude_json_result(result: str = "ok", **fields: object) -> bytes:
     }
     payload.update(fields)
     return json.dumps(payload).encode("utf-8")
-
-
-def write_schema(path: Path, schema: dict[str, object]) -> Path:
-    path.write_text(json.dumps(schema), encoding="utf-8")
-    return path
 
 
 class FakeProcess:

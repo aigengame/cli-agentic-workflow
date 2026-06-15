@@ -230,6 +230,7 @@ async def _execute_shell_node(node: Node) -> NodeResult:
         stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env=_resolve_shell_env(node.inputs.env),
         start_new_session=True,
     )
     try:
@@ -261,7 +262,7 @@ async def _execute_shell_node(node: Node) -> NodeResult:
     )
 
 
-def _resolve_declared_env(declared: tuple[str, ...]) -> dict[str, str]:
+def _resolve_declared_env(declared: tuple[str, ...] | None) -> dict[str, str]:
     """Resolve declared env var NAMES to their values from the parent environment.
 
     The env policy is allow-list-only: a Node receives a variable solely if it
@@ -270,8 +271,58 @@ def _resolve_declared_env(declared: tuple[str, ...]) -> dict[str, str]:
     name is simply omitted — never defaulted. The returned mapping is the ONLY
     environment the Adapter (and thus the Agent CLI process) sees for this Node;
     its VALUES are never persisted to State, Events, or the snapshot (#5).
+
+    An agent Node never inherits the parent environment — the Adapter always passes
+    the resolved mapping as the child's strict env — so an OMITTED ``env`` (``None``)
+    and an explicit empty allow-list (``()``) both resolve to the empty mapping
+    here; both are treated as "no declared-and-present variables".
     """
+    if not declared:
+        return {}
     return {name: os.environ[name] for name in declared if name in os.environ}
+
+
+def _resolve_shell_env(declared: tuple[str, ...] | None) -> Mapping[str, str] | None:
+    """Resolve a shell Node's env, giving it env parity with an agent Node (#66).
+
+    The shell, unlike an agent Node, CAN inherit the parent environment, so the
+    OMITTED-vs-explicit-empty distinction is observable and must be honored:
+
+    - OMITTED ``env`` (``None``, the field default) → return ``None`` so
+      ``create_subprocess_shell`` inherits the parent environment unchanged,
+      preserving the pre-#66 behavior for every shell Node that never opts into the
+      allow-list.
+    - Explicit empty ``env: []`` (``()``) → return ``{}`` so the shell receives NO
+      variables: a declared (empty) allow-list passes exactly its declared-and-present
+      names, which is none (ADR 0006). This is DISTINCT from inheritance — a parent
+      variable an omitted-``env`` Node would see is absent here.
+    - A non-empty allow-list → the shell receives EXACTLY those declared-and-present
+      variables (the same strict allow-list :func:`_resolve_declared_env` builds for
+      an agent Node), with nothing else from the parent passing through and the
+      values never persisted (#5). The declaring Node is then responsible for listing
+      every variable its command needs (e.g. ``PATH`` to locate binaries).
+    """
+    if declared is None:
+        return None
+    return _resolve_declared_env(declared)
+
+
+def _existing_artifacts(artifacts: tuple[Path, ...]) -> tuple[Path, ...]:
+    """Keep only artifact paths that are durable files that actually exist (#67).
+
+    An Artifact is a "durable file produced by a node attempt" indexed in State, so
+    the index must not over-promise: an adapter-supplied path is validated for
+    existence as a regular FILE before being indexed. A path that does not exist,
+    or that exists but is not a file (e.g. a directory), is dropped rather than
+    recorded — State then never claims a produced file that never existed.
+
+    This is the minimal EXISTENCE guard only; it deliberately does NOT scope a path
+    to the run directory, so an existing file ANYWHERE on disk is still indexed. The
+    remaining artifact lifecycle — collection, retention, and run-directory SCOPING
+    (rejecting/relocating an out-of-run-directory path) — is owned by #16, not this
+    guard.
+    """
+    return tuple(path for path in artifacts if path.is_file())
 
 
 async def _execute_agent_node(node: Node, registry: AdapterRegistry) -> NodeResult:
@@ -328,7 +379,14 @@ async def _execute_agent_node(node: Node, registry: AdapterRegistry) -> NodeResu
     stderr = result.stderr
     if exit_status == 0 and inputs.output_schema is not None:
         try:
-            validate_output_contract(inputs.output_schema, result.structured_output)
+            # Run the Output Contract off the event loop: the validator's read +
+            # parse + meta-schema-check + compile is synchronous blocking I/O (it
+            # happens once per schema path and is cached, #67), so dispatching it to
+            # a worker thread keeps a slow disk or a large schema from stalling the
+            # asyncio scheduler that is driving the Run's concurrent Nodes.
+            await asyncio.to_thread(
+                validate_output_contract, inputs.output_schema, result.structured_output
+            )
         except OutputContractError as exc:
             exit_status = 1
             stderr = f"{stderr}\n{exc}".strip() if stderr else str(exc)
@@ -340,7 +398,7 @@ async def _execute_agent_node(node: Node, registry: AdapterRegistry) -> NodeResu
         started_at=started_at,
         finished_at=_now(),
         structured_output=result.structured_output,
-        artifacts=result.artifacts,
+        artifacts=_existing_artifacts(result.artifacts),
         failure_kind=None if exit_status == 0 else FAILED,
         adapter=inputs.adapter,
     )

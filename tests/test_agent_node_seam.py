@@ -6,60 +6,23 @@ the mock Adapter replays a fixture file as a normalized result.
 """
 
 import json
-import sqlite3
 from pathlib import Path
 from typing import Any
 
 import pytest
+from conftest import (
+    agent_workflow,
+    read_events,
+    single_run_dir,
+    state_rows,
+    write_fixture,
+    write_schema,
+)
 
 from caw.adapter import Adapter, AdapterRegistry, AgentInvocation, AgentResult
 from caw.config import WorkflowConfigError
 from caw.executor import execute_run
-from caw.model import Workflow, normalize_workflow
-
-
-def single_run_dir(runs_root: Path) -> Path:
-    run_dirs = list(runs_root.iterdir())
-    assert len(run_dirs) == 1
-    return run_dirs[0]
-
-
-def state_rows(run_dir: Path, query: str) -> list[dict[str, Any]]:
-    connection = sqlite3.connect(run_dir / "state.sqlite")
-    connection.row_factory = sqlite3.Row
-    try:
-        return [dict(row) for row in connection.execute(query)]
-    finally:
-        connection.close()
-
-
-def read_events(run_dir: Path) -> list[dict[str, Any]]:
-    lines = (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
-    return [json.loads(line) for line in lines]
-
-
-def write_fixture(path: Path, **result: Any) -> Path:
-    """Write a mock-Adapter fixture file (a canned normalized result)."""
-    payload: dict[str, Any] = {"exit_status": 0, "stdout": "", "stderr": ""}
-    payload.update(result)
-    path.write_text(json.dumps(payload), encoding="utf-8")
-    return path
-
-
-def agent_workflow(fixture: Path, **inputs: Any) -> Workflow:
-    """Build a single mock-Adapter agent-Node Workflow from one fixture file."""
-    node_inputs: dict[str, Any] = {
-        "adapter": "mock",
-        "prompt": "summarize the repository",
-        "fixture": str(fixture),
-    }
-    node_inputs.update(inputs)
-    raw: dict[str, Any] = {
-        "name": "sample",
-        "version": 1,
-        "nodes": [{"id": "agent", "kind": "agent", "needs": [], "inputs": node_inputs}],
-    }
-    return normalize_workflow(raw, source="<test>")
+from caw.model import normalize_workflow
 
 
 @pytest.mark.asyncio
@@ -100,6 +63,53 @@ async def test_agent_node_structured_output_and_artifacts_are_indexed_in_state(
     output = json.loads(attempt["output_json"])
     assert output["structured_output"] == {"summary": "s"}
     assert output["artifacts"] == [str(artifact)]
+
+
+@pytest.mark.asyncio
+async def test_a_nonexistent_artifact_path_is_not_indexed_in_state(tmp_path: Path) -> None:
+    # #67: an adapter-supplied artifact path is validated for existence BEFORE being
+    # indexed in State, so State never claims a "durable file produced by the run"
+    # that never existed. A real artifact alongside a phantom one is kept; the
+    # phantom is dropped rather than over-promising durability (full lifecycle is #16).
+    real = tmp_path / "real.md"
+    real.write_text("# real\n", encoding="utf-8")
+    phantom = tmp_path / "does-not-exist.md"
+    fixture = write_fixture(
+        tmp_path / "fixture.json",
+        exit_status=0,
+        artifacts=[str(real), str(phantom)],
+    )
+    workflow = agent_workflow(fixture)
+
+    result = await execute_run(workflow, tmp_path / "runs")
+
+    assert result.succeeded
+    (agent_result,) = result.node_results
+    assert [str(p) for p in agent_result.artifacts] == [str(real)], (
+        "only the existing artifact is indexed; the phantom path is dropped"
+    )
+    run_dir = single_run_dir(tmp_path / "runs")
+    (attempt,) = state_rows(run_dir, "SELECT output_json FROM attempt")
+    output = json.loads(attempt["output_json"])
+    assert output["artifacts"] == [str(real)], "State indexes only the existing artifact"
+
+
+@pytest.mark.asyncio
+async def test_a_directory_artifact_path_is_not_indexed_as_a_durable_file(
+    tmp_path: Path,
+) -> None:
+    # #67: an Artifact is a durable FILE produced by the run; a path that exists but
+    # is a directory is not a produced file, so it is not indexed either.
+    a_dir = tmp_path / "a-directory"
+    a_dir.mkdir()
+    fixture = write_fixture(tmp_path / "fixture.json", exit_status=0, artifacts=[str(a_dir)])
+    workflow = agent_workflow(fixture)
+
+    result = await execute_run(workflow, tmp_path / "runs")
+
+    assert result.succeeded
+    (agent_result,) = result.node_results
+    assert agent_result.artifacts == (), "a directory is not a durable produced file"
 
 
 @pytest.mark.asyncio
@@ -212,24 +222,24 @@ def test_agent_invocation_repr_does_not_expose_env_values() -> None:
     assert sentinel not in rendered, "the env VALUE must not appear in the repr"
 
 
-def test_env_declaration_carries_names_not_values(tmp_path: Path) -> None:
-    # The workflow definition declares env NAMES; a `name=value` form is rejected
-    # so a secret value can never be authored into the inspectable definition.
-    raw: dict[str, Any] = {
+def _agent_env_workflow(env: list[str]) -> dict[str, Any]:
+    """A raw agent-Node workflow carrying ``env``, for env-validation tests."""
+    return {
         "name": "sample",
         "version": 1,
         "nodes": [
             {
                 "id": "agent",
                 "kind": "agent",
-                "inputs": {
-                    "adapter": "mock",
-                    "prompt": "do it",
-                    "env": ["DECLARED", "DECLARED"],
-                },
+                "inputs": {"adapter": "mock", "prompt": "do it", "env": env},
             }
         ],
     }
+
+
+def test_agent_env_declaration_rejects_a_duplicate_name(tmp_path: Path) -> None:
+    # The workflow definition declares env NAMES; a duplicate name is a config error.
+    raw = _agent_env_workflow(["DECLARED", "DECLARED"])
 
     with pytest.raises(WorkflowConfigError) as excinfo:
         normalize_workflow(raw, source="<test>")
@@ -237,9 +247,24 @@ def test_env_declaration_carries_names_not_values(tmp_path: Path) -> None:
     assert "duplicate env name" in str(excinfo.value)
 
 
-def write_schema(path: Path, schema: dict[str, Any]) -> Path:
-    path.write_text(json.dumps(schema), encoding="utf-8")
-    return path
+@pytest.mark.parametrize(
+    "name",
+    [
+        "API_TOKEN=s3cr3t",  # value-shaped: a secret value smuggled past the allow-list
+        "1INVALID",  # leading digit is not a valid POSIX env-var name
+    ],
+)
+def test_agent_env_declaration_rejects_an_invalid_env_name(name: str, tmp_path: Path) -> None:
+    # `env` is an allow-list of variable NAMES, never values. A `NAME=value` form
+    # (or any entry that is not a valid POSIX env-var name) is rejected so a
+    # secret-looking value can never be authored into the inspectable definition
+    # and persisted into the normalized snapshot.
+    raw = _agent_env_workflow([name])
+
+    with pytest.raises(WorkflowConfigError) as excinfo:
+        normalize_workflow(raw, source="<test>")
+
+    assert "is not a valid env variable name" in str(excinfo.value)
 
 
 @pytest.mark.asyncio

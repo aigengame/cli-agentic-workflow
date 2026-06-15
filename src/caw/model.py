@@ -4,6 +4,7 @@ import functools
 import hashlib
 import heapq
 import json
+import re
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, Literal
@@ -28,15 +29,68 @@ def _require_non_blank(value: str) -> str:
     return value
 
 
+# A declared env entry must be a valid POSIX environment-variable NAME: a leading
+# letter or underscore followed by letters, digits, or underscores. This rejects
+# value-shaped entries (``API_TOKEN=s3cr3t``), any embedded ``=``, leading digits,
+# spaces, and the empty string — so a secret value can never be smuggled into the
+# allow-list and persisted into the normalized snapshot (#66).
+_ENV_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _unique_valid_env_names(
+    names: tuple[str, ...] | None,
+) -> tuple[str, ...] | None:
+    """Validate a node's declared env allow-list: unique, valid env NAMES (#5, #66).
+
+    Shared by both node kinds so a shell Node's ``env`` has the same allow-list
+    semantics as an agent Node's: it declares variable NAMES, never values. Each
+    entry must be a valid POSIX environment-variable name (``^[A-Za-z_][A-Za-z0-9_]*$``)
+    — this rejects a ``NAME=value`` form, any embedded ``=``, a leading digit, a
+    space, and the empty/blank string — and a duplicate name is a config error.
+
+    ``None`` is the OMITTED-``env`` sentinel (the field default), distinct from an
+    explicit empty ``()``: it carries no names to validate and passes through so the
+    executor can preserve legacy parent-environment inheritance for an undeclared
+    Node while an explicit empty allow-list passes no variables (#66, ADR 0006).
+    """
+    if names is None:
+        return None
+    seen: set[str] = set()
+    for name in names:
+        if not _ENV_NAME_PATTERN.match(name):
+            raise ValueError(
+                f"env entry {name!r} is not a valid env variable name "
+                f"(names only, never values; must match {_ENV_NAME_PATTERN.pattern})"
+            )
+        if name in seen:
+            raise ValueError(f"duplicate env name {name!r}")
+        seen.add(name)
+    return names
+
+
 class ShellNodeInputs(BaseModel):
-    """Inputs of a shell Node."""
+    """Inputs of a shell Node.
+
+    ``env`` is a node-generic declaration of variable NAMES, never values: only the
+    named variables reach the shell process, giving a shell Node the same env
+    allow-list as an agent Node, and the env policy keeps their values out of
+    State, Events, and the snapshot (#5, #66).
+
+    The default ``None`` is the OMITTED ``env``, distinct from an explicit empty
+    ``[]``: an omitted ``env`` lets the shell inherit the parent environment
+    (legacy behavior), while an explicit empty allow-list declares that NO variable
+    crosses the seam (ADR 0006). The two serialize distinctly in the snapshot
+    (absent vs ``[]``) so a resume reconstructs the SAME env scope (#66).
+    """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     kind: Literal["shell"] = "shell"
     command: str
+    env: tuple[str, ...] | None = None
 
     _command_non_blank = field_validator("command")(_require_non_blank)
+    _env_names_valid = field_validator("env")(_unique_valid_env_names)
 
 
 class AgentNodeInputs(BaseModel):
@@ -51,7 +105,9 @@ class AgentNodeInputs(BaseModel):
     authoring typo fails as a node error rather than a crash. ``env`` is a
     declaration of variable NAMES, never values: only the named variables reach
     the node process, and the env policy keeps their values out of State, Events,
-    and Artifacts (#5).
+    and Artifacts (#5). Its default ``None`` is the OMITTED ``env``, distinct from
+    an explicit empty ``[]`` (an empty allow-list), and the two serialize distinctly
+    in the snapshot so a resume reconstructs the SAME env scope (#66).
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -60,12 +116,13 @@ class AgentNodeInputs(BaseModel):
     adapter: str
     prompt: str
     args: tuple[str, ...] = ()
-    env: tuple[str, ...] = ()
+    env: tuple[str, ...] | None = None
     output_schema: Path | None = None
     fixture: Path | None = None
 
     _adapter_non_blank = field_validator("adapter")(_require_non_blank)
     _prompt_non_blank = field_validator("prompt")(_require_non_blank)
+    _env_names_valid = field_validator("env")(_unique_valid_env_names)
 
     @field_validator("adapter")
     @classmethod
@@ -84,18 +141,6 @@ class AgentNodeInputs(BaseModel):
             allowed = ", ".join(sorted(known)) or "<none>"
             raise ValueError(f"unknown adapter {adapter!r} (known: {allowed})")
         return adapter
-
-    @field_validator("env")
-    @classmethod
-    def _env_names_must_be_unique_and_non_blank(cls, names: tuple[str, ...]) -> tuple[str, ...]:
-        seen: set[str] = set()
-        for name in names:
-            if not name.strip():
-                raise ValueError("env names must not be blank or whitespace-only")
-            if name in seen:
-                raise ValueError(f"duplicate env name {name!r}")
-            seen.add(name)
-        return names
 
 
 # The node-level `kind` is the single source of truth (#62): it selects which

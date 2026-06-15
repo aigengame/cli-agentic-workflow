@@ -12,8 +12,10 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from conftest import read_events, single_run_dir, state_rows
 
 from caw.adapter import Adapter, AdapterRegistry, AgentInvocation, AgentResult
+from caw.config import WorkflowConfigError
 from caw.executor import ResumeError, execute_run, resume_run
 from caw.model import Workflow, normalize_workflow
 
@@ -51,26 +53,6 @@ def conditional_workflow(*nodes: dict[str, Any]) -> Workflow:
 def shell(node_id: str, command: str, **fields: Any) -> dict[str, Any]:
     """A shell-node dict for ``conditional_workflow``, with optional needs/when/join."""
     return {"id": node_id, "kind": "shell", "inputs": {"command": command}, **fields}
-
-
-def single_run_dir(runs_root: Path) -> Path:
-    run_dirs = list(runs_root.iterdir())
-    assert len(run_dirs) == 1
-    return run_dirs[0]
-
-
-def state_rows(run_dir: Path, query: str) -> list[dict[str, Any]]:
-    connection = sqlite3.connect(run_dir / "state.sqlite")
-    connection.row_factory = sqlite3.Row
-    try:
-        return [dict(row) for row in connection.execute(query)]
-    finally:
-        connection.close()
-
-
-def read_events(run_dir: Path) -> list[dict[str, Any]]:
-    lines = (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
-    return [json.loads(line) for line in lines]
 
 
 def policy_shell_workflow(node_id: str, command: str, **policy: Any) -> Workflow:
@@ -1749,6 +1731,196 @@ async def test_cancelling_a_run_terminates_the_in_flight_node_subprocess(tmp_pat
     (node,) = state_rows(run_dir, "SELECT * FROM node")
     assert node["status"] == "errored"
     assert read_events(run_dir)[-1]["type"] == "run_errored"
+
+
+def shell_env_workflow(node_id: str, command: str, env: list[str]) -> Workflow:
+    """A single-shell-node Workflow declaring an env allow-list (#66).
+
+    Mirrors ``policy_shell_workflow`` but carries the node-generic ``env`` field on
+    a shell Node, so the shell-env parity tests can declare an allow-list without
+    an inline raw dict.
+    """
+    raw: dict[str, Any] = {
+        "name": "sample",
+        "version": 1,
+        "nodes": [{"id": node_id, "kind": "shell", "inputs": {"command": command, "env": env}}],
+    }
+    return normalize_workflow(raw, source="<test>")
+
+
+@pytest.mark.asyncio
+async def test_shell_node_receives_only_its_declared_env_vars(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #66: a shell Node has env parity with an agent Node — only the variables it
+    # declares (and that are present in the parent environment) reach the process,
+    # with no parent-environment leakage. The command dumps its full environment so
+    # the test can assert exactly which names crossed the seam. PATH is declared too
+    # so the command's binaries resolve under the strict allow-list — exactly the
+    # author-declares-what-it-needs contract the Agent-CLI seam already enforces.
+    monkeypatch.setenv("DECLARED_VAR", "declared-value")
+    monkeypatch.setenv("UNDECLARED_VAR", "undeclared-value")
+    dump = tmp_path / "env.dump"
+    workflow = shell_env_workflow("dump", f"env > {dump}", env=["DECLARED_VAR", "PATH"])
+
+    result = await execute_run(workflow, tmp_path / "runs")
+
+    assert result.succeeded
+    lines = dump.read_text(encoding="utf-8").splitlines()
+    names = {line.split("=", 1)[0] for line in lines if "=" in line}
+    assert "DECLARED_VAR" in names, "the declared var reaches the shell process"
+    assert "UNDECLARED_VAR" not in names, "no parent-environment leakage past the allow-list"
+
+
+@pytest.mark.asyncio
+async def test_shell_node_env_values_never_reach_state_events_or_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #66: the env policy keeps a declared variable's VALUE out of State, Events,
+    # and the snapshot for a shell Node, exactly as for an agent Node — the policy
+    # guards env injection and kernel-held values, not the command's own stdout.
+    sentinel = "s3cr3t-shell-sentinel-do-not-persist"
+    monkeypatch.setenv("SHELL_TOKEN", sentinel)
+    # The command consumes the var without echoing it, so the value is exercised
+    # but never surfaced by the node's own output.
+    workflow = shell_env_workflow("consume", 'test -n "$SHELL_TOKEN"', env=["SHELL_TOKEN"])
+
+    result = await execute_run(workflow, tmp_path / "runs")
+
+    assert result.succeeded, "the declared var was present in the shell process"
+    run_dir = single_run_dir(tmp_path / "runs")
+    state_bytes = (run_dir / "state.sqlite").read_bytes()
+    events_text = (run_dir / "events.jsonl").read_text(encoding="utf-8")
+    snapshot_text = (run_dir / "workflow.normalized.json").read_text(encoding="utf-8")
+    assert sentinel.encode() not in state_bytes, "the secret value must not reach State"
+    assert sentinel not in events_text, "the secret value must not reach Events"
+    assert sentinel not in snapshot_text, "the secret value must not reach the snapshot"
+
+
+@pytest.mark.asyncio
+async def test_shell_node_with_no_declared_env_inherits_the_parent_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #66: the allow-list ENGAGES only when a shell Node declares `env`. With no
+    # `env` declared (the default), the shell inherits the parent environment
+    # unchanged — preserving the pre-#66 behavior so existing shell workflows that
+    # rely on inherited PATH and ambient vars keep working.
+    monkeypatch.setenv("AMBIENT_VAR", "ambient-value")
+    dump = tmp_path / "env.dump"
+    workflow = shell_workflow(("dump", f"env > {dump}", []))
+
+    result = await execute_run(workflow, tmp_path / "runs")
+
+    assert result.succeeded
+    names = {
+        line.split("=", 1)[0]
+        for line in dump.read_text(encoding="utf-8").splitlines()
+        if "=" in line
+    }
+    assert "AMBIENT_VAR" in names, "an undeclared shell Node inherits the parent environment"
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "API_TOKEN=s3cr3t",  # value-shaped: a secret value smuggled past the allow-list
+        "HAS SPACE",  # a space is not a valid POSIX env-var name
+    ],
+)
+def test_shell_node_env_declaration_rejects_an_invalid_env_name(name: str) -> None:
+    # A shell Node's `env` is the same allow-list of variable NAMES as an agent
+    # Node's: a `NAME=value` form (or any non-POSIX env-var name) is rejected so a
+    # secret-looking value can never be authored into the inspectable definition.
+    with pytest.raises(WorkflowConfigError) as excinfo:
+        shell_env_workflow("dump", "env", env=[name])
+
+    assert "is not a valid env variable name" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_shell_node_with_explicit_empty_env_passes_no_variables(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # An EXPLICIT empty `env: []` is a declared (empty) allow-list, distinct from an
+    # omitted `env`: the shell receives NO variables, so a parent variable that an
+    # omitted-env Node would inherit is absent here (ADR 0006 — a declaring node
+    # receives only declared-and-present variables). The redirect (`>`) and `${..:-}`
+    # default are pure shell builtins, so they run with no PATH; writing the
+    # parameter expansion proves the parent var did NOT cross the empty allow-list.
+    monkeypatch.setenv("AMBIENT_VAR", "ambient-value")
+    dump = tmp_path / "env.dump"
+    workflow = shell_env_workflow("dump", f'echo "${{AMBIENT_VAR:-(absent)}}" > {dump}', env=[])
+
+    result = await execute_run(workflow, tmp_path / "runs")
+
+    assert result.succeeded
+    assert dump.read_text(encoding="utf-8").strip() == "(absent)", (
+        "an explicit empty env: [] passes no variables, so the parent var is absent"
+    )
+
+
+def _snapshot_node_env(run_dir: Path) -> object:
+    """The persisted snapshot's `inputs.env` for the run's sole node.
+
+    The key is read with a sentinel default so a regression where the key vanishes
+    entirely is still caught; an OMITTED `env` serializes as ``null`` (present but
+    None), distinct from an explicit empty `env: []`.
+    """
+    snapshot = json.loads((run_dir / "workflow.normalized.json").read_text(encoding="utf-8"))
+    inputs = snapshot["workflow"]["nodes"][0]["inputs"]
+    return inputs.get("env", "<<absent>>")
+
+
+@pytest.mark.asyncio
+async def test_omitted_env_and_explicit_empty_env_round_trip_distinctly_in_the_snapshot(
+    tmp_path: Path,
+) -> None:
+    # The omitted-vs-explicit-empty distinction must survive a snapshot round-trip
+    # so a resume reconstructs the SAME env scope: an OMITTED `env` serializes as
+    # `null` (legacy parent-inheritance), while an explicit `env: []` serializes as
+    # `[]` (a declared, empty allow-list — no variables). Were both `[]`, resume
+    # would silently collapse legacy inheritance into "pass no vars".
+    omitted = shell_workflow(("dump", "true", []))  # no env declared
+    explicit_empty = shell_env_workflow("dump", "true", env=[])
+
+    await execute_run(omitted, tmp_path / "omitted-runs")
+    await execute_run(explicit_empty, tmp_path / "empty-runs")
+
+    assert _snapshot_node_env(single_run_dir(tmp_path / "omitted-runs")) is None, (
+        "an omitted env serializes as null, preserving legacy parent inheritance"
+    )
+    assert _snapshot_node_env(single_run_dir(tmp_path / "empty-runs")) == [], (
+        "an explicit empty env: [] serializes as [] — a declared, empty allow-list"
+    )
+
+
+@pytest.mark.asyncio
+async def test_resume_preserves_an_explicit_empty_env_no_variables_scope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A resume reconstructs the Workflow from the snapshot, so the explicit empty
+    # allow-list must round-trip: a resumed run of an `env: []` node still receives
+    # NO variables, never silently re-inheriting the parent environment. The first
+    # run fails (so it is resume-eligible) by writing the parameter expansion and
+    # exiting non-zero; the resumed re-run overwrites the dump, which must still
+    # show the parent var absent.
+    monkeypatch.setenv("AMBIENT_VAR", "ambient-value")
+    dump = tmp_path / "env.dump"
+    workflow = shell_env_workflow(
+        "dump", f'echo "${{AMBIENT_VAR:-(absent)}}" > {dump}; exit 7', env=[]
+    )
+    runs_root = tmp_path / "runs"
+
+    first = await execute_run(workflow, runs_root)
+    assert not first.succeeded, "the first run fails, so it is resume-eligible"
+    assert dump.read_text(encoding="utf-8").strip() == "(absent)"
+
+    resumed = await resume_run(first.run_id, runs_root)
+
+    assert not resumed.succeeded, "the re-run still exits non-zero"
+    assert dump.read_text(encoding="utf-8").strip() == "(absent)", (
+        "the resumed run reconstructs the empty allow-list and still passes no vars"
+    )
 
 
 def drop_node_cause_column(run_dir: Path) -> None:
