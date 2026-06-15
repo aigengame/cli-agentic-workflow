@@ -35,17 +35,21 @@ ExpandFn = Callable[[Any], list[NodeDict]]
 
 
 class PatternExpander:
-    """One registered expander: its params model and its expand function.
+    """One registered expander: its params model, expand function, and one-line shape.
 
     ``params_model`` validates the ``pattern:`` block's expander-specific fields
     (failures surface through the one-line ``WorkflowConfigError`` contract with a
-    field path); ``expand`` compiles the validated params into plain node dicts.
+    field path); ``expand`` compiles the validated params into plain node dicts;
+    ``shape`` is the one-line description ``caw patterns list`` shows.
     """
 
-    def __init__(self, name: str, params_model: type[BaseModel], expand: ExpandFn) -> None:
+    def __init__(
+        self, name: str, params_model: type[BaseModel], expand: ExpandFn, shape: str
+    ) -> None:
         self.name = name
         self.params_model = params_model
         self.expand = expand
+        self.shape = shape
 
 
 # THE registry primitive: name -> expander. `register_expander` is the sole way to
@@ -53,9 +57,11 @@ class PatternExpander:
 _EXPANDERS: dict[str, PatternExpander] = {}
 
 
-def register_expander(name: str, params_model: type[BaseModel], expand: ExpandFn) -> None:
+def register_expander(
+    name: str, params_model: type[BaseModel], expand: ExpandFn, shape: str
+) -> None:
     """Register an expander under ``name`` (additive; the registry is the dispatch)."""
-    _EXPANDERS[name] = PatternExpander(name, params_model, expand)
+    _EXPANDERS[name] = PatternExpander(name, params_model, expand, shape)
 
 
 def expander_names() -> tuple[str, ...]:
@@ -197,5 +203,12 @@ def expand_pattern(raw: dict[str, Any], source: str) -> dict[str, Any]:
     return expanded
 
 
-register_expander("pipeline", _PipelineParams, _expand_pipeline)
-register_expander("parallel", _ParallelParams, _expand_parallel)
+register_expander(
+    "pipeline", _PipelineParams, _expand_pipeline, "ordered steps chained into a linear chain"
+)
+register_expander(
+    "parallel",
+    _ParallelParams,
+    _expand_parallel,
+    "independent branches run concurrently, optionally joined downstream",
+)

@@ -108,3 +108,85 @@ def test_init_refuses_to_overwrite_an_existing_file(
     assert len(lines) == 1
     assert lines[0].startswith("error:")
     assert existing.read_text(encoding="utf-8") == "name: mine\n", "the file is untouched"
+
+
+def test_patterns_list_lists_the_registered_built_in_patterns() -> None:
+    # AC: `caw patterns list` shows the available patterns. It is driven off the
+    # registry, so every registered expander appears (and #13's additions show up
+    # automatically) — at minimum `pipeline` and `parallel` for #8.
+    from caw.patterns import expander_names
+
+    result = runner.invoke(app, ["patterns", "list"])
+
+    assert result.exit_code == 0, result.output
+    for name in ("pipeline", "parallel"):
+        assert name in result.output, f"the registered pattern {name!r} is listed"
+    assert all(name in result.output for name in expander_names()), (
+        "the list is driven off the registry, not a hardcoded subset"
+    )
+
+
+@pytest.mark.parametrize(
+    ("pattern", "filename"), [("pipeline", "pipeline.yaml"), ("parallel", "parallel.yaml")]
+)
+def test_patterns_init_scaffolds_an_example_that_validates_and_runs_to_success(
+    pattern: str, filename: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # AC: `caw patterns init <name>` scaffolds a COMPLETE, runnable example (not an
+    # abstract template). Scaffold it, then validate AND run it offline — a real
+    # `caw run` to success (exit 0, succeeded), proving the example is runnable, not
+    # merely well-formed.
+    monkeypatch.chdir(tmp_path)
+
+    scaffolded = runner.invoke(app, ["patterns", "init", pattern])
+    assert scaffolded.exit_code == 0, scaffolded.output
+
+    example = tmp_path / filename
+    assert example.is_file(), f"the {pattern} example is written to {filename} by default"
+
+    validated = runner.invoke(app, ["validate", str(example)])
+    assert validated.exit_code == 0, validated.output
+
+    ran = runner.invoke(app, ["run", str(example)])
+    assert ran.exit_code == 0, ran.output
+    assert "succeeded" in ran.output
+
+
+def test_patterns_init_to_an_explicit_path_writes_there(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "my-pipeline.yaml"
+
+    result = runner.invoke(app, ["patterns", "init", "pipeline", str(target)])
+
+    assert result.exit_code == 0, result.output
+    assert target.is_file()
+
+
+def test_patterns_init_unknown_pattern_is_a_config_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["patterns", "init", "loopy"])
+
+    assert result.exit_code == 2
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    lines = [line for line in result.output.splitlines() if line.strip()]
+    assert len(lines) == 1
+    assert lines[0].startswith("error:")
+    assert "loopy" in lines[0], "the error names the unknown pattern"
+
+
+def test_patterns_init_refuses_to_overwrite_an_existing_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    existing = tmp_path / "pipeline.yaml"
+    existing.write_text("name: mine\n", encoding="utf-8")
+
+    result = runner.invoke(app, ["patterns", "init", "pipeline"])
+
+    assert result.exit_code == 2
+    assert existing.read_text(encoding="utf-8") == "name: mine\n", "the file is untouched"
