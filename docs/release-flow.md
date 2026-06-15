@@ -25,6 +25,13 @@ release-please as the single version authority (see
 [ADR 0005](adr/0005-release-and-versioning-model.md)). Releases are driven by
 [Conventional Commits](https://www.conventionalcommits.org/).
 
+Only code-facing types cut a release: `feat` (minor pre-1.0), and
+`fix` / `perf` / `deps` / `revert` (patch). `docs`, `chore`, `refactor`, `style`,
+`test`, `build`, and `ci` are marked `hidden` in `release-please-config.json`'s
+`changelog-sections`, so a docs- or chore-only merge does NOT open a Release PR.
+This override is deliberate: the `python` release type would otherwise treat `docs`
+as a releasable unit and cut a patch for a docs-only change.
+
 ### Automatic path (default)
 
 1. Conventional commits land on `main`; the `release-please` job opens or updates
