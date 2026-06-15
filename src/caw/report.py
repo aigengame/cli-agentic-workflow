@@ -48,13 +48,17 @@ def _conclusion_nodes(run_dir: Path) -> tuple[str | None, list[dict[str, Any]]]:
     """The run status and each node's outcome, read from State.
 
     A node's ``exit_status`` / ``artifacts`` come from its latest Attempt's
-    persisted output; a skipped or never-attempted node has none. ``error`` carries
-    a non-succeeded node's stderr so the report can surface why it failed.
+    persisted output; a skipped or never-attempted node has none. ``cause`` carries a
+    skipped node's reason (``when_false`` / ``blocked`` / ``all_branches_skipped``, #7)
+    so the three skip reasons read distinctly. ``error`` carries a non-succeeded
+    node's stderr so the report can surface why it failed. State is opened read-only —
+    a report never mutates it (#12).
     """
     run_id = run_dir.name
-    with StateStore(run_dir / "state.sqlite") as state:
+    with StateStore(run_dir / "state.sqlite", read_only=True) as state:
         status = state.run_status(run_id)
         node_statuses = state.node_statuses(run_id)
+        causes = state.node_causes(run_id)
         outputs = {node_id: state.node_output(run_id, node_id) for node_id in node_statuses}
     nodes = []
     for node_id in sorted(node_statuses):
@@ -67,6 +71,7 @@ def _conclusion_nodes(run_dir: Path) -> tuple[str | None, list[dict[str, Any]]]:
                 "id": node_id,
                 "status": node_status,
                 "exit_status": output.get("exit_status"),
+                "cause": causes.get(node_id),
                 "structured_output": output.get("structured_output"),
                 "artifacts": list(output.get("artifacts", [])),
                 "error": stderr if failed and stderr else None,
@@ -105,7 +110,7 @@ def _render_text(report: dict[str, Any]) -> str:
     """Plain text: the conclusion first, then the trace under a distinct heading."""
     lines = [f"run {report['run_id']}: {report['status']}", "nodes:"]
     for node in report["nodes"]:
-        lines.append(f"  {node['id']}: {node['status']}{_exit_suffix(node)}")
+        lines.append(f"  {node['id']}: {node['status']}{_node_detail(node)}")
     lines.append("trace:")
     for event in report["trace"]:
         lines.append(f"  {event['seq']:>4} {event['type']}")
@@ -123,7 +128,7 @@ def _render_markdown(report: dict[str, Any]) -> str:
 
     out += ["", "## Nodes", ""]
     for node in report["nodes"]:
-        out.append(f"- {node['id']} — {node['status']}{_exit_suffix(node)}")
+        out.append(f"- {node['id']} — {node['status']}{_node_detail(node)}")
 
     out += ["", "## Artifacts", ""]
     artifacts = [(node["id"], path) for node in report["nodes"] for path in node["artifacts"]]
@@ -139,9 +144,18 @@ def _render_markdown(report: dict[str, Any]) -> str:
     return "\n".join(out)
 
 
-def _exit_suffix(node: dict[str, Any]) -> str:
-    """``" (exit N)"`` when the node has a recorded exit status, else empty."""
-    return f" (exit {node['exit_status']})" if node["exit_status"] is not None else ""
+def _node_detail(node: dict[str, Any]) -> str:
+    """The parenthetical after a node's status: its exit code, or its skip cause.
+
+    A node that ran shows ``(exit N)``; a skipped node shows its cause
+    (``(when_false)`` / ``(blocked)`` / ``(all_branches_skipped)``, #7) so the three
+    skip reasons read distinctly; a node with neither shows nothing.
+    """
+    if node["exit_status"] is not None:
+        return f" (exit {node['exit_status']})"
+    if node["cause"]:
+        return f" ({node['cause']})"
+    return ""
 
 
 _RENDERERS: dict[ReportFormat, Callable[[dict[str, Any]], str]] = {

@@ -145,6 +145,75 @@ def test_report_surfaces_a_failed_runs_status_and_errors(
     assert "kaboom" in boom["error"]
 
 
+def test_report_surfaces_skip_causes_distinctly(
+    write_workflow_data: Callable[[dict[str, Any]], Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #12 / ADR 0007: a skipped node's report carries the cause persisted in State,
+    # so `when_false` and `blocked` read distinctly — not as a generic `skipped`.
+    # classify emits "billing"; gate's `when` (stdout == "shipping") is false → gate
+    # is skipped `when_false`; downstream needs gate → skipped `blocked`.
+    workflow_file = write_workflow_data(
+        {
+            "name": "sample",
+            "version": 1,
+            "nodes": [
+                {"id": "classify", "kind": "shell", "inputs": {"command": "echo billing"}},
+                {
+                    "id": "gate",
+                    "kind": "shell",
+                    "needs": ["classify"],
+                    "when": {
+                        "ref": {"node": "classify", "field": "stdout"},
+                        "op": "equals",
+                        "value": "shipping",
+                    },
+                    "inputs": {"command": "echo gate"},
+                },
+                {
+                    "id": "downstream",
+                    "kind": "shell",
+                    "needs": ["gate"],
+                    "inputs": {"command": "echo downstream"},
+                },
+            ],
+        }
+    )
+    monkeypatch.chdir(tmp_path)
+    assert runner.invoke(app, ["run", str(workflow_file)]).exit_code == 0
+    run_id = _run_dir_name(tmp_path)
+
+    report = json.loads(runner.invoke(app, ["report", run_id, "--format", "json"]).output)
+    by_id = {node["id"]: node for node in report["nodes"]}
+    assert by_id["gate"]["status"] == "skipped" and by_id["gate"]["cause"] == "when_false"
+    assert by_id["downstream"]["status"] == "skipped" and by_id["downstream"]["cause"] == "blocked"
+
+    markdown = runner.invoke(app, ["report", run_id, "--format", "markdown"]).output
+    assert "gate — skipped (when_false)" in markdown
+    assert "downstream — skipped (blocked)" in markdown
+
+
+def test_report_refuses_a_run_dir_without_state_and_creates_no_database(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #12: reports render from persisted State only. A run directory missing its
+    # state.sqlite is refused (exit 2, one `error:` line) — never silently rendered
+    # from a freshly-created empty database (the read-only, persisted-data contract).
+    monkeypatch.chdir(tmp_path)
+    incomplete = tmp_path / ".caw" / "runs" / "incomplete"
+    incomplete.mkdir(parents=True)
+
+    result = runner.invoke(app, ["report", "incomplete"])
+
+    assert result.exit_code == 2
+    lines = [line for line in result.output.splitlines() if line.strip()]
+    assert len(lines) == 1 and lines[0].startswith("error:")
+    assert "incomplete" in lines[0], "the error names the run id"
+    assert not (incomplete / "state.sqlite").exists(), "reporting must not create a database"
+
+
 def test_report_unknown_run_id_is_refused_with_one_error_line(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

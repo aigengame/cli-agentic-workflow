@@ -293,11 +293,19 @@ def report(
 ) -> None:
     """Render a report of a persisted run from its State and Events, without re-running it.
 
-    An unknown run id is refused as a config-class error (exit 2) with a single
-    ``error:`` line, mirroring ``resume``; a report never executes anything.
+    An unknown run id, or a run directory whose State is missing, is refused as a
+    config-class error (exit 2) with a single ``error:`` line, mirroring ``resume``; a
+    report renders only from persisted data and never executes or mutates anything.
     """
     directory = run_dir(run_id)
     if not directory.is_dir():
         typer.echo(f"error: no run directory for run id {run_id!r} under {runs_root()}", err=True)
+        raise typer.Exit(code=2)
+    if not (directory / "state.sqlite").is_file():
+        typer.echo(
+            f"error: run directory for run id {run_id!r} has no state.sqlite "
+            f"(incomplete or corrupt run); nothing to report",
+            err=True,
+        )
         raise typer.Exit(code=2)
     typer.echo(render_report(directory, format))
