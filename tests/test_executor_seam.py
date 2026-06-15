@@ -1749,3 +1749,58 @@ async def test_cancelling_a_run_terminates_the_in_flight_node_subprocess(tmp_pat
     (node,) = state_rows(run_dir, "SELECT * FROM node")
     assert node["status"] == "errored"
     assert read_events(run_dir)[-1]["type"] == "run_errored"
+
+
+def drop_node_cause_column(run_dir: Path) -> None:
+    """Rewrite a run directory's `node` table to the pre-`cause` schema (#76).
+
+    PR #74 added the `node.cause` column via `CREATE TABLE IF NOT EXISTS` only,
+    which is a no-op against a `node` table that already exists, so a run directory
+    created by a caw version before that column simply has no `cause` column. This
+    reproduces that stale schema by rebuilding the table without `cause` while
+    preserving its rows, so a resume reopens a genuinely pre-`cause` State.
+    """
+    connection = sqlite3.connect(run_dir / "state.sqlite")
+    try:
+        connection.executescript(
+            "PRAGMA foreign_keys = OFF;"
+            "CREATE TABLE node_legacy ("
+            "  run_id TEXT NOT NULL REFERENCES run (run_id),"
+            "  node_id TEXT NOT NULL,"
+            "  status TEXT NOT NULL,"
+            "  PRIMARY KEY (run_id, node_id)"
+            ");"
+            "INSERT INTO node_legacy (run_id, node_id, status)"
+            "  SELECT run_id, node_id, status FROM node;"
+            "DROP TABLE node;"
+            "ALTER TABLE node_legacy RENAME TO node;"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+@pytest.mark.asyncio
+async def test_resuming_a_run_whose_node_table_predates_the_cause_column_is_refused(
+    tmp_path: Path,
+) -> None:
+    # Cross-schema resume guard (#76): PR #74 added `node.cause` with no migration,
+    # so a run directory created before that column has a `node` table without it.
+    # Resume then drives the first terminal node through `record_node_finished`,
+    # which always writes `cause`, raising a raw `sqlite3.OperationalError: no such
+    # column: cause` that crashes the resume. Resume must instead REFUSE up front
+    # with an actionable ResumeError naming the stale schema, like the other #70
+    # resume guards. The first run fails so it is resume-eligible, then its `node`
+    # table is rewritten to the pre-`cause` schema.
+    runs_root = tmp_path / "runs"
+    workflow = shell_workflow("exit 7")
+    first = await execute_run(workflow, runs_root)
+    assert not first.succeeded, "the first run fails, so it is resume-eligible"
+
+    run_dir = single_run_dir(runs_root)
+    drop_node_cause_column(run_dir)
+
+    with pytest.raises(ResumeError, match="schema") as excinfo:
+        await resume_run(first.run_id, runs_root)
+    # The raw sqlite error must not leak; the refusal stands on its own.
+    assert not isinstance(excinfo.value.__cause__, sqlite3.OperationalError)

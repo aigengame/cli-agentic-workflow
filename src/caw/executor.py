@@ -1004,6 +1004,21 @@ async def resume_run(
                 f"run {run_id!r} is not resumable (status: {prior_status}); "
                 f"only an interrupted or failed run can be resumed"
             )
+        # Cross-schema resume guard (#76): the `node.cause` column was added (#7)
+        # without a migration, so a run directory created before it has a `node`
+        # table lacking `cause`. The first terminal Node write would then crash with
+        # a raw `sqlite3.OperationalError` mid-resume, after the Run row has already
+        # flipped back to `running`, leaving an interrupted run in a worse state.
+        # caw is pre-1.0 with no documented state-schema-stability guarantee, so
+        # resume refuses such a stale directory up front with an actionable error
+        # rather than migrating it in place.
+        if not state.node_table_has_cause():
+            raise ResumeError(
+                f"run directory {run_dir} predates a State schema change "
+                f"(the `node` table has no `cause` column) and cannot be resumed; "
+                f"this run was created by an older caw version whose State schema is "
+                f"not forward-compatible with this version"
+            )
         node_statuses = state.node_statuses(run_id)
         max_attempts = state.max_attempt_per_node(run_id)
         # A `succeeded` Node is done; every other recorded Node is re-run. A re-run
