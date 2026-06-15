@@ -99,12 +99,30 @@ class ClaudePrintAdapter(Adapter):
         stdout = stdout_bytes.decode("utf-8", errors="replace")
         stderr = stderr_bytes.decode("utf-8", errors="replace")
         exit_status = process.returncode if process.returncode is not None else -1
-        # Parse structured output only on a successful, structured-requested run:
+        # Parse the result wrapper only on a successful, structured-requested run:
         # a non-zero exit is already a node failure (ADR 0006), so unparseable
         # stdout from a failed process is moot and must NOT mask the real exit.
         structured_output: object | None = None
         if wants_structured and exit_status == 0:
-            structured_output = self._extract_structured_output(stdout, invocation)
+            wrapper = self._parse_result_wrapper(stdout, invocation)
+            # Defense-in-depth (#9 review follow-up): `claude` is EXPECTED to exit
+            # non-zero when the wrapper reports `is_error: true`, so the process exit
+            # code is the PRIMARY failure signal and already catches the common case
+            # (a non-zero exit never reaches here — the wrapper is not even parsed).
+            # This guards the uncertain edge where the process exits 0 yet the wrapper
+            # says `is_error: true` — known for some subtypes such as `error_max_turns`
+            # (ref anthropics/claude-code-action#823). It is NOT the primary path.
+            if wrapper.get("is_error") is True:
+                # Normalize to a FAILED node: force a non-zero exit_status, drop the
+                # structured_output (a failed node carries no trustworthy output,
+                # matching the existing non-zero-exit behavior — and the kernel skips
+                # Output Contract validation for a non-zero exit per #63), and append
+                # an actionable annotation to stderr (preserving any the process
+                # emitted). stdout keeps the raw wrapper so the trace stays complete.
+                exit_status = 1
+                stderr = self._annotate_cli_error(stderr, wrapper)
+            else:
+                structured_output = wrapper.get("structured_output")
         return AgentResult(
             exit_status=exit_status,
             stdout=stdout,
@@ -157,15 +175,23 @@ class ClaudePrintAdapter(Adapter):
             ) from exc
 
     @staticmethod
-    def _extract_structured_output(stdout: str, invocation: AgentInvocation) -> object | None:
-        """Parse the CLI's JSON result wrapper and return its `structured_output`.
+    def _parse_result_wrapper(stdout: str, invocation: AgentInvocation) -> dict[str, object]:
+        """Parse the CLI's single JSON result wrapper and return it as a dict.
 
-        The CLI prints a single JSON object whose top-level `structured_output`
-        field holds the schema-shaped value (separate from the freeform `result`
-        text). Unparseable stdout when structured output was REQUIRED means the
-        adapter cannot produce a result — an AdapterError, per ADR 0006. The value
-        is returned as-is (including JSON null); the kernel is the sole arbiter of
-        whether it satisfies the Output Contract.
+        The CLI prints a single JSON object carrying the freeform `result` text, a
+        top-level `structured_output` field (the schema-shaped value, when a
+        `--json-schema` was supplied), and the run status (`is_error`, `subtype`).
+        `invoke` reads those fields off the returned dict to extract the structured
+        output OR — on the `is_error: true` edge — normalize the result to a failed
+        node (#9 review follow-up). Unparseable stdout (or a non-object wrapper) when
+        structured output was REQUIRED means the adapter cannot produce a result — an
+        AdapterError, per ADR 0006. The wrapper is returned as-is; the kernel remains
+        the sole arbiter of whether `structured_output` satisfies the Output Contract.
+
+        Detecting `is_error` REQUIRES this JSON wrapper, so that check is scoped to the
+        structured path; the freeform path (no `output_schema`) has no wrapper to
+        inspect and relies on the exit code + stderr alone. Unifying wrapper parsing
+        for the freeform path is deferred — #79 parses this same wrapper for usage/cost.
         """
         try:
             wrapper = json.loads(stdout)
@@ -179,4 +205,18 @@ class ClaudePrintAdapter(Adapter):
                 f"{_node_context(invocation)}: expected a JSON object from "
                 f"'claude -p --output-format json', got {type(wrapper).__name__}"
             )
-        return wrapper.get("structured_output")
+        return wrapper
+
+    @staticmethod
+    def _annotate_cli_error(stderr: str, wrapper: dict[str, object]) -> str:
+        """Append an actionable `claude reported an error` annotation to `stderr`.
+
+        Names the wrapper's `subtype` when present (e.g. `error_max_turns`) so the
+        failure is diagnosable from the trace, and PRESERVES any stderr the process
+        already emitted by appending rather than clobbering (#9 review follow-up).
+        """
+        subtype = wrapper.get("subtype")
+        annotation = "claude reported an error"
+        if isinstance(subtype, str) and subtype:
+            annotation += f" (subtype: {subtype})"
+        return f"{stderr}\n{annotation}" if stderr else annotation

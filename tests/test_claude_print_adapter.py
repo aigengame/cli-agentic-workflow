@@ -345,6 +345,60 @@ async def test_non_zero_exit_with_schema_does_not_attempt_to_parse_structured_ou
 
 
 @pytest.mark.asyncio
+async def test_zero_exit_but_wrapper_reports_error_normalizes_to_a_failed_node(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Defense-in-depth (#9 review follow-up): `claude` is EXPECTED to exit non-zero
+    # when the wrapper says `is_error: true`, so the exit code already catches the
+    # common case. But some error subtypes can accompany a ZERO exit, so on the
+    # structured path the adapter also inspects the wrapper: exit 0 + is_error true
+    # is normalized to a FAILED node — exit_status forced non-zero, structured_output
+    # dropped (a failed node carries no trustworthy output, matching the existing
+    # non-zero-exit behavior), and an actionable annotation appended to stderr.
+    schema = write_schema(tmp_path / "s.schema.json", {"type": "object"})
+    stdout = claude_json_result(
+        result="partial work",
+        is_error=True,
+        structured_output={"name": "Alice"},
+    )
+    patch_which(monkeypatch)
+    patch_spawn(monkeypatch, FakeProcess(0, stdout=stdout))
+    adapter = ClaudePrintAdapter()
+
+    result = await adapter.invoke(
+        AgentInvocation(node_id="n", adapter="claude.print", prompt="p", output_schema=schema)
+    )
+
+    assert result.exit_status != 0
+    assert result.structured_output is None
+    assert "error" in result.stderr.lower(), "stderr carries an actionable CLI-error annotation"
+    # The raw JSON wrapper is preserved in stdout so the trace retains full CLI output.
+    assert result.stdout == stdout.decode("utf-8")
+
+
+@pytest.mark.asyncio
+async def test_zero_exit_error_wrapper_names_the_subtype_and_preserves_process_stderr(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The actionable annotation names the wrapper's `subtype` (e.g. error_max_turns)
+    # so the failure is diagnosable from the trace, AND it preserves any stderr the
+    # process already emitted by appending rather than clobbering (#9 review follow-up).
+    schema = write_schema(tmp_path / "s.schema.json", {"type": "object"})
+    stdout = claude_json_result(result="hit the cap", is_error=True, subtype="error_max_turns")
+    patch_which(monkeypatch)
+    patch_spawn(monkeypatch, FakeProcess(0, stdout=stdout, stderr=b"prior process noise"))
+    adapter = ClaudePrintAdapter()
+
+    result = await adapter.invoke(
+        AgentInvocation(node_id="n", adapter="claude.print", prompt="p", output_schema=schema)
+    )
+
+    assert result.exit_status != 0
+    assert "error_max_turns" in result.stderr, "the annotation names the wrapper subtype"
+    assert "prior process noise" in result.stderr, "existing process stderr is preserved"
+
+
+@pytest.mark.asyncio
 async def test_capability_check_records_the_cli_version(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
