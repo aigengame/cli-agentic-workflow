@@ -25,6 +25,7 @@ from typing import Any
 import pytest
 
 from caw.adapter import AdapterRegistry
+from caw.claude_print import ClaudePrintAdapter
 from caw.executor import FAILED, RunResult, execute_run
 from caw.model import Workflow, normalize_workflow
 from caw.state import StateStore
@@ -165,3 +166,18 @@ async def test_real_failure_non_zero_path(agent: str, tmp_path: Path) -> None:
     with StateStore(runs_root / result.run_id / "state.sqlite") as state:
         statuses = state.node_statuses(result.run_id)
     assert statuses[_NODE_ID] == "failed", "the non-zero exit is recorded as FAILED in State"
+
+
+@pytest.mark.asyncio
+async def test_capability_check_reports_a_version(agent: str) -> None:
+    # The real-CLI capability probe (`claude --version`): adapter infrastructure that
+    # is free and tokenless, but still real-CLI-dependent — so it belongs in the e2e
+    # tier (fail, never skip), not the mock suite. NOTE: capability_check is currently
+    # claude.print-specific (not on the base Adapter), so this drives ClaudePrintAdapter
+    # directly; today `claude` is the only wired agent, so a non-claude CAW_E2E_AGENT
+    # already fails earlier at the require_agent_cli / adapter-resolution guard.
+    harness.require_agent_cli(agent)
+
+    version = await ClaudePrintAdapter().capability_check()
+
+    assert version.strip(), "a real capability check reports a non-empty version string"
