@@ -103,6 +103,53 @@ async def test_agent_node_structured_output_and_artifacts_are_indexed_in_state(
 
 
 @pytest.mark.asyncio
+async def test_a_nonexistent_artifact_path_is_not_indexed_in_state(tmp_path: Path) -> None:
+    # #67: an adapter-supplied artifact path is validated for existence BEFORE being
+    # indexed in State, so State never claims a "durable file produced by the run"
+    # that never existed. A real artifact alongside a phantom one is kept; the
+    # phantom is dropped rather than over-promising durability (full lifecycle is #16).
+    real = tmp_path / "real.md"
+    real.write_text("# real\n", encoding="utf-8")
+    phantom = tmp_path / "does-not-exist.md"
+    fixture = write_fixture(
+        tmp_path / "fixture.json",
+        exit_status=0,
+        artifacts=[str(real), str(phantom)],
+    )
+    workflow = agent_workflow(fixture)
+
+    result = await execute_run(workflow, tmp_path / "runs")
+
+    assert result.succeeded
+    (agent_result,) = result.node_results
+    assert [str(p) for p in agent_result.artifacts] == [str(real)], (
+        "only the existing artifact is indexed; the phantom path is dropped"
+    )
+    run_dir = single_run_dir(tmp_path / "runs")
+    (attempt,) = state_rows(run_dir, "SELECT output_json FROM attempt")
+    output = json.loads(attempt["output_json"])
+    assert output["artifacts"] == [str(real)], "State indexes only the existing artifact"
+
+
+@pytest.mark.asyncio
+async def test_a_directory_artifact_path_is_not_indexed_as_a_durable_file(
+    tmp_path: Path,
+) -> None:
+    # #67: an Artifact is a durable FILE produced by the run; a path that exists but
+    # is a directory is not a produced file, so it is not indexed either.
+    a_dir = tmp_path / "a-directory"
+    a_dir.mkdir()
+    fixture = write_fixture(tmp_path / "fixture.json", exit_status=0, artifacts=[str(a_dir)])
+    workflow = agent_workflow(fixture)
+
+    result = await execute_run(workflow, tmp_path / "runs")
+
+    assert result.succeeded
+    (agent_result,) = result.node_results
+    assert agent_result.artifacts == (), "a directory is not a durable produced file"
+
+
+@pytest.mark.asyncio
 async def test_agent_node_records_an_attempt_and_node_events_like_a_shell_node(
     tmp_path: Path,
 ) -> None:

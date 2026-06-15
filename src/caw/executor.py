@@ -296,6 +296,20 @@ def _resolve_shell_env(declared: tuple[str, ...]) -> Mapping[str, str] | None:
     return _resolve_declared_env(declared)
 
 
+def _existing_artifacts(artifacts: tuple[Path, ...]) -> tuple[Path, ...]:
+    """Keep only artifact paths that are durable files that actually exist (#67).
+
+    An Artifact is a "durable file produced by a node attempt" indexed in State, so
+    the index must not over-promise: an adapter-supplied path is validated for
+    existence as a regular FILE before being indexed. A path that does not exist,
+    or that exists but is not a file (e.g. a directory), is dropped rather than
+    recorded — State then never claims a produced file that never existed. The full
+    artifact lifecycle (collection, retention, run-directory scoping) is deferred to
+    #16; this is the minimal existence guard.
+    """
+    return tuple(path for path in artifacts if path.is_file())
+
+
 async def _execute_agent_node(node: Node, registry: AdapterRegistry) -> NodeResult:
     """Run an agent Node through its Adapter and validate its Output Contract.
 
@@ -350,7 +364,14 @@ async def _execute_agent_node(node: Node, registry: AdapterRegistry) -> NodeResu
     stderr = result.stderr
     if exit_status == 0 and inputs.output_schema is not None:
         try:
-            validate_output_contract(inputs.output_schema, result.structured_output)
+            # Run the Output Contract off the event loop: the validator's read +
+            # parse + meta-schema-check + compile is synchronous blocking I/O (it
+            # happens once per schema path and is cached, #67), so dispatching it to
+            # a worker thread keeps a slow disk or a large schema from stalling the
+            # asyncio scheduler that is driving the Run's concurrent Nodes.
+            await asyncio.to_thread(
+                validate_output_contract, inputs.output_schema, result.structured_output
+            )
         except OutputContractError as exc:
             exit_status = 1
             stderr = f"{stderr}\n{exc}".strip() if stderr else str(exc)
@@ -362,7 +383,7 @@ async def _execute_agent_node(node: Node, registry: AdapterRegistry) -> NodeResu
         started_at=started_at,
         finished_at=_now(),
         structured_output=result.structured_output,
-        artifacts=result.artifacts,
+        artifacts=_existing_artifacts(result.artifacts),
         failure_kind=None if exit_status == 0 else FAILED,
         adapter=inputs.adapter,
     )

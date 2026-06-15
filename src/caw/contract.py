@@ -6,9 +6,17 @@ JSON Schema draft 2020-12; the kernel loads it and validates the Node's
 structured output with the ``jsonschema`` library when the Node completes and
 before its dependents run. A violation fails the Node and the error names the
 failed contract (its schema path) so a user can see which contract was breached.
+
+The schema file is read, parsed, meta-schema-checked, and compiled into a
+validator ONCE per resolved path and cached, so repeated node attempts (and
+repeated runs in one process) reuse the compiled validator instead of paying the
+read+parse+compile cost every time (#67). The compile is the only blocking I/O on
+the path; the executor runs it off the event loop (see
+``caw.executor._execute_agent_node``).
 """
 
 import json
+from functools import lru_cache
 from pathlib import Path
 
 from jsonschema import Draft202012Validator
@@ -33,27 +41,61 @@ class OutputContractError(Exception):
     """
 
 
+@lru_cache(maxsize=64)
+def _compile_validator_cached(resolved: str, _mtime_ns: int) -> Draft202012Validator:
+    """Read, parse, meta-schema-check, and compile a validator for a schema file.
+
+    Memoized on the resolved path AND the file's modification stamp, so the
+    expensive read+parse+check+construct runs once per (path, contents) and is
+    reused across attempts and runs in the same process; rewriting the same path
+    bumps the mtime and recompiles rather than serving a stale validator (#67).
+    The ``_mtime_ns`` argument is a cache key only — :func:`compile_output_validator`
+    stats the file and passes it.
+    """
+    path = Path(resolved)
+    try:
+        schema = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise OutputContractError(f"cannot read output contract {path}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise OutputContractError(f"invalid JSON in output contract {path}: {exc}") from exc
+    try:
+        Draft202012Validator.check_schema(schema)
+    except SchemaError as exc:
+        reason = " ".join(str(exc.message).split())
+        raise OutputContractError(
+            f"output contract {path} is not a valid JSON Schema: {reason}"
+        ) from exc
+    return Draft202012Validator(schema, registry=_OFFLINE_REGISTRY)
+
+
+def compile_output_validator(schema_path: Path) -> Draft202012Validator:
+    """Return the compiled, cached validator for the schema file at ``schema_path``.
+
+    The read+parse+meta-schema-check+construct happens once per resolved path and
+    cached contents (#67); a cache hit returns the SAME validator object. A missing
+    or malformed schema file raises :class:`OutputContractError` naming the
+    contract, exactly as validation does, so the caller handles one error type.
+    """
+    try:
+        mtime_ns = schema_path.stat().st_mtime_ns
+    except OSError as exc:
+        # A missing/unstatable file cannot be compiled; surface the same
+        # contract-naming error the read path would, before touching the cache.
+        raise OutputContractError(f"cannot read output contract {schema_path}: {exc}") from exc
+    return _compile_validator_cached(str(schema_path), mtime_ns)
+
+
 def validate_output_contract(schema_path: Path, structured_output: object) -> None:
     """Validate ``structured_output`` against the JSON Schema at ``schema_path``.
 
     Raises :class:`OutputContractError` naming the contract on any breach: an
     unreadable or non-JSON schema file, a schema that is itself invalid against
     draft 2020-12, missing structured output, or an instance the schema rejects.
+    The compiled validator is loaded once per schema path and cached
+    (:func:`compile_output_validator`).
     """
-    try:
-        schema = json.loads(schema_path.read_text(encoding="utf-8"))
-    except OSError as exc:
-        raise OutputContractError(f"cannot read output contract {schema_path}: {exc}") from exc
-    except json.JSONDecodeError as exc:
-        raise OutputContractError(f"invalid JSON in output contract {schema_path}: {exc}") from exc
-
-    try:
-        Draft202012Validator.check_schema(schema)
-    except SchemaError as exc:
-        reason = " ".join(str(exc.message).split())
-        raise OutputContractError(
-            f"output contract {schema_path} is not a valid JSON Schema: {reason}"
-        ) from exc
+    validator = compile_output_validator(schema_path)
 
     # `structured_output` is validated as-is — including ``None`` (JSON null) —
     # against the declared schema. A schema permitting null (e.g. type
@@ -62,7 +104,7 @@ def validate_output_contract(schema_path: Path, structured_output: object) -> No
     # violation, so the schema is the sole arbiter of what the contract allows
     # (#63), and the None-vs-absent distinction is left to the schema author.
     try:
-        Draft202012Validator(schema, registry=_OFFLINE_REGISTRY).validate(structured_output)
+        validator.validate(structured_output)
     except ValidationError as exc:
         location = exc.json_path or "$"
         reason = " ".join(str(exc.message).split())

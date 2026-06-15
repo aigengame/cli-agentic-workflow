@@ -11,12 +11,43 @@ from typing import Any
 
 import pytest
 
-from caw.contract import OutputContractError, validate_output_contract
+from caw.contract import (
+    OutputContractError,
+    compile_output_validator,
+    validate_output_contract,
+)
 
 
 def write_schema(path: Path, schema: dict[str, Any]) -> Path:
     path.write_text(json.dumps(schema), encoding="utf-8")
     return path
+
+
+def test_the_compiled_validator_is_cached_and_reused_across_calls(tmp_path: Path) -> None:
+    # #67: the schema file is read, parsed, meta-schema-checked, and compiled into a
+    # validator ONCE per resolved path, then reused across node attempts — not
+    # re-read and re-compiled on every call. Object identity proves the reuse.
+    schema = write_schema(tmp_path / "s.json", {"type": "object", "required": ["x"]})
+
+    first = compile_output_validator(schema)
+    second = compile_output_validator(schema)
+
+    assert first is second, "the compiled validator is cached and reused for the same path"
+
+
+def test_a_changed_schema_file_is_recompiled_not_served_stale(tmp_path: Path) -> None:
+    # The cache is keyed by path AND the file's modification stamp, so rewriting the
+    # same path (e.g. across runs in one process) recompiles rather than serving a
+    # stale validator. A definition that no longer requires `x` must accept `{}`.
+    schema = tmp_path / "s.json"
+    write_schema(schema, {"type": "object", "required": ["x"]})
+    first = compile_output_validator(schema)
+
+    write_schema(schema, {"type": "object"})
+    second = compile_output_validator(schema)
+
+    assert first is not second, "a changed schema file is recompiled, not served stale"
+    validate_output_contract(schema, {})  # the relaxed schema now accepts an empty object
 
 
 def test_valid_instance_passes_silently(tmp_path: Path) -> None:
