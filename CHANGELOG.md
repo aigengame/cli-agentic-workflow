@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.1](https://github.com/aigengame/cli-agentic-workflow/compare/v0.6.0...v0.6.1) (2026-06-15)
+
+
+### Documentation
+
+* **readme:** add Installation and Quickstart, mark live vs planned CLI ([#81](https://github.com/aigengame/cli-agentic-workflow/issues/81)) ([ed7b127](https://github.com/aigengame/cli-agentic-workflow/commit/ed7b1276693cb5a15914d3e15dfd749058f1c23a))
+
 ## [0.6.0](https://github.com/aigengame/cli-agentic-workflow/compare/v0.5.1...v0.6.0) (2026-06-13)
 
 
