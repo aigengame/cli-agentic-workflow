@@ -40,7 +40,14 @@ CREATE TABLE IF NOT EXISTS attempt (
 class StateStore:
     """Owns the State database of one Run."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, read_only: bool = False) -> None:
+        # A Reporter renders from persisted State and must never mutate it (#12), so
+        # ``read_only`` opens the database with the SQLite ``mode=ro`` URI: no schema
+        # creation, no commit, and a missing file raises rather than being created
+        # (the writing path would silently create an empty database).
+        if read_only:
+            self._connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+            return
         self._connection = sqlite3.connect(path)
         try:
             self._connection.execute("PRAGMA foreign_keys = ON")
@@ -187,6 +194,21 @@ class StateStore:
             str(node_id): str(status)
             for node_id, status in self._connection.execute(
                 "SELECT node_id, status FROM node WHERE run_id = ?", (run_id,)
+            )
+        }
+
+    def node_causes(self, run_id: str) -> dict[str, str | None]:
+        """Map each recorded Node of a Run to its skip cause, or ``None``.
+
+        A skipped Node records WHY it was skipped (#7) — ``when_false``, ``blocked``,
+        or ``all_branches_skipped``; every other Node has no cause. A Reporter reads
+        this so the three skip reasons render distinctly rather than as a generic
+        ``skipped`` (ADR 0007).
+        """
+        return {
+            str(node_id): (None if cause is None else str(cause))
+            for node_id, cause in self._connection.execute(
+                "SELECT node_id, cause FROM node WHERE run_id = ?", (run_id,)
             )
         }
 

@@ -203,7 +203,7 @@ caw report <run-id> --format markdown
 | `caw run <file>` | Execute a workflow run | ✅ now |
 | `caw resume <run-id>` | Continue an interrupted or failed run, re-running only incomplete nodes | ✅ now |
 | `caw init` | Create a minimal starter workflow | 🚧 planned |
-| `caw report <run-id>` | Render a report (markdown, json, jsonl, text) from persisted state | 🚧 planned |
+| `caw report <run-id>` | Render a report (markdown, json, jsonl, text) from persisted state | ✅ now |
 | `caw patterns list` | List built-in workflow patterns | 🚧 planned |
 | `caw patterns init <name>` | Scaffold a complete runnable example of a pattern | 🚧 planned |
 
