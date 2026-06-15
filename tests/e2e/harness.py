@@ -21,10 +21,13 @@ import os
 import shutil
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Protocol
 
 import pytest
 
 from caw.executor import RunResult
+from caw.state import StateStore
 
 
 class E2EConfigError(Exception):
@@ -154,6 +157,12 @@ def agent_env_names() -> tuple[str, ...]:
     return tuple(os.environ)
 
 
+def is_transient_text(text: str) -> bool:
+    """Whether ``text`` carries a transient-failure marker (network / 5xx / rate-limit)."""
+    lowered = text.lower()
+    return any(marker in lowered for marker in _TRANSIENT_MARKERS)
+
+
 def is_transient_failure(result: RunResult) -> bool:
     """Whether ``result`` failed for a TRANSIENT reason (network / 5xx / rate-limit).
 
@@ -164,10 +173,8 @@ def is_transient_failure(result: RunResult) -> bool:
     """
     if result.succeeded:
         return False
-    failed_stderr = "\n".join(
-        node.stderr for node in result.node_results if not node.succeeded
-    ).lower()
-    return any(marker in failed_stderr for marker in _TRANSIENT_MARKERS)
+    failed_stderr = "\n".join(node.stderr for node in result.node_results if not node.succeeded)
+    return is_transient_text(failed_stderr)
 
 
 async def run_with_transient_retry(
@@ -190,3 +197,81 @@ async def run_with_transient_retry(
         result = await run()
         attempts += 1
     return result
+
+
+class CliResult(Protocol):
+    """The slice of a Typer/Click invocation result the CLI retry helper needs.
+
+    ``output`` is a read-only property on the concrete Click/Typer result, so it is
+    declared as one here for structural compatibility.
+    """
+
+    exit_code: int
+
+    @property
+    def output(self) -> str: ...
+
+
+def latest_run_dir(runs_root: Path) -> Path | None:
+    """The most recently written run directory under ``runs_root``, or None if none.
+
+    ``caw run`` materializes a NEW run dir per invocation, so a retried CLI e2e leaves
+    several; assertions must target the latest attempt. Chosen by mtime, which is robust
+    even when two run ids share a same-second timestamp prefix.
+    """
+    if not runs_root.exists():
+        return None
+    dirs = [path for path in runs_root.iterdir() if path.is_dir()]
+    return max(dirs, key=lambda path: path.stat().st_mtime) if dirs else None
+
+
+def cli_run_is_transient(run_dir: Path) -> bool:
+    """Whether the Run persisted in ``run_dir`` failed for a TRANSIENT reason.
+
+    The CLI returns only an exit code, so transient detection reads the Run's State: a
+    failed / errored / timed_out Node whose persisted stderr carries a transient marker
+    (network / 5xx / rate-limit). A deterministic failure — a bad flag, a plain non-zero
+    exit, a node timeout — carries none and is not retried, the same policy as
+    :func:`is_transient_failure` applies on the in-process seam.
+    """
+    state_path = run_dir / "state.sqlite"
+    if not state_path.exists():
+        return False
+    run_id = run_dir.name
+    stderrs: list[str] = []
+    with StateStore(state_path) as state:
+        for node_id, status in state.node_statuses(run_id).items():
+            if status not in {"failed", "errored", "timed_out"}:
+                continue
+            output = state.node_output(run_id, node_id)
+            value = output.get("stderr") if output is not None else None
+            if isinstance(value, str):
+                stderrs.append(value)
+    return any(is_transient_text(text) for text in stderrs)
+
+
+def run_cli_with_transient_retry(
+    invoke: Callable[[], CliResult],
+    runs_root: Path,
+    *,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+) -> tuple[CliResult, Path | None]:
+    """Invoke a ``caw`` CLI command, retrying ONLY on a transient Run failure.
+
+    The CLI-seam analogue of :func:`run_with_transient_retry` (decision #6): each
+    ``invoke`` runs the command (``caw run`` writes a fresh run dir), and a non-zero
+    exit is retried only when the latest Run's State shows a transient failure
+    (:func:`cli_run_is_transient`). Returns the final result and the latest run dir —
+    the attempt to assert on, which resolves the multiple-run-dir a retry creates.
+    Assertion/contract checks live in the caller, AFTER this returns, so they are never
+    retried.
+    """
+    result = invoke()
+    attempts = 1
+    while attempts < max_attempts and result.exit_code != 0:
+        run_dir = latest_run_dir(runs_root)
+        if run_dir is None or not cli_run_is_transient(run_dir):
+            break
+        result = invoke()
+        attempts += 1
+    return result, latest_run_dir(runs_root)

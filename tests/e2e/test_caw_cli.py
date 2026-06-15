@@ -7,15 +7,16 @@ e2e in ``test_claude_print_graph_runs.py`` call ``execute_run`` directly; this f
 closes the CLI-entrypoint gap.) Part of the living e2e suite, co-weighted with the
 mock suite that covers what a fixture can verify offline.
 
-LIMITATION (reported, not worked around): a ``when`` predicate cannot today gate on
-a real agent's ``structured_output``. The shipped algebra references a WHOLE field
-(``stdout`` / ``exit_status`` / ``structured_output``) compared to a SCALAR value,
-with ``contains`` valid only on ``stdout`` (``model.py`` ``PredicateField`` /
-``Predicate.value`` / ``_STRING_PREDICATE_FIELDS``); there is no sub-field path, and
-``claude`` rejects a scalar top-level ``--json-schema`` (it returns ``is_error``).
-So the strongest model-driven gate on a real agent is ``stdout``/``contains``, used
-here — it still exercises a downstream node's fate being decided by what the real
-agent actually emitted.
+The multi-node test gates a downstream node on the agent node's ``exit_status`` — a
+STRUCTURAL field of its output — so the assertion is deterministic and free of
+model-text matching (#86 decision #4). Gating on the agent's CONTENT (a sub-field of
+``structured_output``) is not expressible today: the predicate algebra references a
+WHOLE field against a SCALAR value with no sub-path (``model.py`` ``PredicateField`` /
+``Predicate.value``), tracked in #89 — so content-driven branching is deferred there.
+
+Real agent calls go through ``harness.run_cli_with_transient_retry`` so a transient
+network / 5xx / rate-limit blip is retried (decision #6), like the graph-run e2e; the
+helper also returns the latest run dir, resolving the several a retry materializes.
 """
 
 from __future__ import annotations
@@ -35,13 +36,6 @@ runner = CliRunner()
 
 # A generous per-Node budget so ordinary model latency never trips the kernel timeout.
 _AGENT_TIMEOUT_S = 300.0
-
-
-def _single_run_dir(tmp_path: Path) -> Path:
-    """The one run directory ``caw run`` materialized under ``<cwd>/.caw/runs``."""
-    run_dirs = list((tmp_path / ".caw" / "runs").iterdir())
-    assert len(run_dirs) == 1, f"expected exactly one run dir, got {run_dirs}"
-    return run_dirs[0]
 
 
 def _agent_node(node_id: str, agent: str, *, prompt: str) -> dict[str, Any]:
@@ -70,40 +64,37 @@ def test_caw_run_drives_a_real_agent_graph_with_when_gating(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # `caw run` (the real CLI entrypoint) over a multi-node graph: a real agent node
-    # produces stdout, and two downstream shell nodes are gated by `when` on that real
-    # stdout — one matches (must run), one does not (must skip). This covers the CLI
-    # entrypoint + multi-node data flow + a downstream fate decided by real agent
-    # output, all through `caw run`, asserted on State (not model text).
+    # runs, and two downstream shell nodes are gated by `when` on the agent node's
+    # `exit_status` — one matches (must run), one does not (must skip). Covers the CLI
+    # entrypoint + multi-node data flow + a downstream fate decided by a real agent
+    # node's (structural) output, asserted on State. exit_status is deterministic, so
+    # there is NO model-text matching (#86 decision #4); content gating awaits #89.
     harness.require_agent_cli(agent)
     workflow_file = write_workflow_data(
         {
             "name": "e2e-graph",
             "version": 1,
             "nodes": [
-                _agent_node(
-                    "answer",
-                    agent,
-                    prompt="Reply with exactly the single uppercase word FOUR and nothing else.",
-                ),
+                _agent_node("answer", agent, prompt="Reply with the single word OK."),
                 {
-                    "id": "on_match",
+                    "id": "on_success",
                     "kind": "shell",
                     "needs": ["answer"],
                     "when": {
-                        "ref": {"node": "answer", "field": "stdout"},
-                        "op": "contains",
-                        "value": "FOUR",
+                        "ref": {"node": "answer", "field": "exit_status"},
+                        "op": "equals",
+                        "value": 0,
                     },
-                    "inputs": {"command": "echo matched"},
+                    "inputs": {"command": "echo ran"},
                 },
                 {
-                    "id": "on_other",
+                    "id": "on_failure",
                     "kind": "shell",
                     "needs": ["answer"],
                     "when": {
-                        "ref": {"node": "answer", "field": "stdout"},
-                        "op": "contains",
-                        "value": "FIVE",
+                        "ref": {"node": "answer", "field": "exit_status"},
+                        "op": "equals",
+                        "value": 1,
                     },
                     "inputs": {"command": "echo nope"},
                 },
@@ -111,20 +102,21 @@ def test_caw_run_drives_a_real_agent_graph_with_when_gating(
         }
     )
     monkeypatch.chdir(tmp_path)
+    runs_root = tmp_path / ".caw" / "runs"
 
-    result = runner.invoke(app, ["run", str(workflow_file)])
+    result, run_dir = harness.run_cli_with_transient_retry(
+        lambda: runner.invoke(app, ["run", str(workflow_file)]), runs_root
+    )
 
     assert result.exit_code == 0, f"caw run failed: {result.output}"
-    run_dir = _single_run_dir(tmp_path)
-    run_id = run_dir.name
+    assert run_dir is not None
     with StateStore(run_dir / "state.sqlite") as state:
-        statuses = state.node_statuses(run_id)
-        answer_output = state.node_output(run_id, "answer")
+        statuses = state.node_statuses(run_dir.name)
     assert statuses["answer"] == "succeeded", "the real agent node ran and succeeded"
-    assert statuses["on_match"] == "succeeded", "the gate matching the real agent stdout ran"
-    assert statuses["on_other"] == "skipped", "the non-matching gate was skipped (when_false)"
-    assert answer_output is not None
-    assert "FOUR" in answer_output["stdout"], "the gate decision is driven by real agent output"
+    assert statuses["on_success"] == "succeeded", "the gate on exit_status == 0 ran"
+    assert statuses["on_failure"] == "skipped", (
+        "the gate on exit_status == 1 was skipped (when_false)"
+    )
 
 
 def test_caw_resume_reuses_a_succeeded_real_agent_node(
@@ -135,8 +127,10 @@ def test_caw_resume_reuses_a_succeeded_real_agent_node(
 ) -> None:
     # Resume must NOT re-invoke a real agent node that already succeeded. A real agent
     # node `gen` succeeds (one real call), then a downstream shell `boom` fails. `caw
-    # resume` re-runs only the incomplete node: `gen` is seeded satisfied (attempt
-    # stays 1 — no second token spend), `boom` re-runs (attempt 2). Proven from State.
+    # resume` re-runs only the incomplete node: `gen` stays at attempt 1 (no second
+    # token spend), `boom` re-runs (attempt 2). Proven from State. The first `caw run`
+    # is wrapped in CLI transient retry (it makes the real agent call); the resume is
+    # not — resume re-runs only `boom` (shell), so it makes no agent call.
     harness.require_agent_cli(agent)
     workflow_file = write_workflow_data(
         {
@@ -154,11 +148,14 @@ def test_caw_resume_reuses_a_succeeded_real_agent_node(
         }
     )
     monkeypatch.chdir(tmp_path)
+    runs_root = tmp_path / ".caw" / "runs"
 
-    first = runner.invoke(app, ["run", str(workflow_file)])
+    first, run_dir = harness.run_cli_with_transient_retry(
+        lambda: runner.invoke(app, ["run", str(workflow_file)]), runs_root
+    )
 
     assert first.exit_code == 1, f"the first run must fail at boom: {first.output}"
-    run_dir = _single_run_dir(tmp_path)
+    assert run_dir is not None
     run_id = run_dir.name
     with StateStore(run_dir / "state.sqlite") as state:
         statuses_before = state.node_statuses(run_id)

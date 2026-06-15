@@ -13,6 +13,7 @@ root ``conftest.py``; ``tests/e2e/__init__.py`` makes ``e2e`` a package).
 
 from __future__ import annotations
 
+import os
 import shutil
 import tomllib
 from collections.abc import Awaitable, Callable
@@ -20,7 +21,9 @@ from pathlib import Path
 
 import pytest
 from e2e import harness
+from typer.testing import CliRunner, Result
 
+from caw.cli import app
 from caw.executor import FAILED, NodeResult, RunResult
 
 RunFactory = Callable[[], Awaitable[RunResult]]
@@ -271,3 +274,103 @@ def test_strict_markers_is_enabled() -> None:
     addopts = _pytest_ini_options().get("addopts", "")
     rendered = " ".join(addopts) if isinstance(addopts, list) else str(addopts)
     assert "--strict-markers" in rendered
+
+
+# --- CLI-seam transient retry (#86 decision #6, PR #88 review finding 1) -----------
+#
+# These exercise the CLI retry helpers against REAL run State produced by `caw run`
+# over SHELL nodes — deterministic, offline, no agent CLI — so the retry path the e2e
+# CLI tests rely on is itself verified in CI.
+
+
+def test_is_transient_text_matches_only_transient_markers() -> None:
+    assert harness.is_transient_text("API Error: 429 rate limit exceeded") is True
+    assert harness.is_transient_text("503 Service Unavailable") is True
+    assert harness.is_transient_text("error: unknown option '--nope'") is False
+
+
+def test_latest_run_dir_picks_the_most_recent_by_mtime(tmp_path: Path) -> None:
+    runs = tmp_path / "runs"
+    runs.mkdir()
+    older = runs / "20260101T000000Z-aaaa"
+    newer = runs / "20260101T000001Z-bbbb"
+    older.mkdir()
+    newer.mkdir()
+    os.utime(older, (1000, 1000))
+    os.utime(newer, (2000, 2000))
+
+    assert harness.latest_run_dir(runs) == newer
+    assert harness.latest_run_dir(tmp_path / "absent") is None
+
+
+def _run_cli(runner: CliRunner, workflow_file: Path) -> Result:
+    return runner.invoke(app, ["run", str(workflow_file)])
+
+
+def test_cli_run_is_transient_true_for_a_transient_node_stderr(
+    write_workflow: Callable[[str], Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    workflow_file = write_workflow("echo '503 Service Unavailable' >&2; exit 1")
+
+    result = _run_cli(CliRunner(), workflow_file)
+
+    assert result.exit_code != 0
+    run_dir = harness.latest_run_dir(tmp_path / ".caw" / "runs")
+    assert run_dir is not None
+    assert harness.cli_run_is_transient(run_dir) is True
+
+
+def test_cli_run_is_transient_false_for_a_plain_failure(
+    write_workflow: Callable[[str], Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    workflow_file = write_workflow("exit 1")
+
+    result = _run_cli(CliRunner(), workflow_file)
+
+    assert result.exit_code != 0
+    run_dir = harness.latest_run_dir(tmp_path / ".caw" / "runs")
+    assert run_dir is not None
+    assert harness.cli_run_is_transient(run_dir) is False
+
+
+def test_run_cli_with_transient_retry_retries_a_transient_failure_to_the_bound(
+    write_workflow: Callable[[str], Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    workflow_file = write_workflow("echo '503 Service Unavailable' >&2; exit 1")
+    runner = CliRunner()
+    calls = [0]
+
+    def invoke() -> Result:
+        calls[0] += 1
+        return _run_cli(runner, workflow_file)
+
+    result, run_dir = harness.run_cli_with_transient_retry(
+        invoke, tmp_path / ".caw" / "runs", max_attempts=3
+    )
+
+    assert result.exit_code != 0
+    assert calls[0] == 3, "a transient CLI failure is retried up to the bound"
+    assert run_dir is not None
+
+
+def test_run_cli_with_transient_retry_does_not_retry_a_deterministic_failure(
+    write_workflow: Callable[[str], Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    workflow_file = write_workflow("exit 1")
+    runner = CliRunner()
+    calls = [0]
+
+    def invoke() -> Result:
+        calls[0] += 1
+        return _run_cli(runner, workflow_file)
+
+    result, _ = harness.run_cli_with_transient_retry(
+        invoke, tmp_path / ".caw" / "runs", max_attempts=3
+    )
+
+    assert result.exit_code != 0
+    assert calls[0] == 1, "a deterministic CLI failure is never retried"
