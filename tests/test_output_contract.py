@@ -29,6 +29,22 @@ def test_the_compiled_validator_is_cached_and_reused_across_calls(tmp_path: Path
     assert first is second, "the compiled validator is cached and reused for the same path"
 
 
+def test_equivalent_paths_to_the_same_file_share_one_compiled_validator(tmp_path: Path) -> None:
+    # #67: the cache is keyed on the RESOLVED path, as documented — so two
+    # different string spellings of the same file (here a `.` / `..` detour) compile
+    # ONCE and return the SAME validator object, rather than paying the
+    # read+parse+compile cost twice for one underlying schema.
+    sub = tmp_path / "schemas"
+    sub.mkdir()
+    schema = write_schema(sub / "s.json", {"type": "object", "required": ["x"]})
+    equivalent = tmp_path / "schemas" / ".." / "schemas" / "s.json"
+
+    first = compile_output_validator(schema)
+    second = compile_output_validator(equivalent)
+
+    assert first is second, "equivalent paths to one file share a single compiled validator"
+
+
 def test_a_changed_schema_file_is_recompiled_not_served_stale(tmp_path: Path) -> None:
     # The cache is keyed by path AND the file's modification stamp, so rewriting the
     # same path (e.g. across runs in one process) recompiles rather than serving a

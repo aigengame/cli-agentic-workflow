@@ -45,12 +45,20 @@ class OutputContractError(Exception):
 def _compile_validator_cached(resolved: str, _mtime_ns: int) -> Draft202012Validator:
     """Read, parse, meta-schema-check, and compile a validator for a schema file.
 
-    Memoized on the resolved path AND the file's modification stamp, so the
+    Memoized on the RESOLVED path AND the file's modification stamp, so the
     expensive read+parse+check+construct runs once per (path, contents) and is
-    reused across attempts and runs in the same process; rewriting the same path
-    bumps the mtime and recompiles rather than serving a stale validator (#67).
-    The ``_mtime_ns`` argument is a cache key only — :func:`compile_output_validator`
-    stats the file and passes it.
+    reused across attempts and runs in the same process; two equivalent spellings of
+    one file (a ``.`` / ``..`` detour, a symlink) resolve to the same key and share
+    a single validator, and rewriting the same path bumps the mtime and recompiles
+    rather than serving a stale validator (#67). The ``_mtime_ns`` argument is a
+    cache key only — :func:`compile_output_validator` resolves and stats the file
+    and passes both.
+
+    ``lru_cache`` is not single-flight: two nodes that cold-miss the SAME schema
+    concurrently can each run this compile and one result is discarded. That is
+    harmless — the compile is idempotent (read + parse + construct a fresh validator
+    from the same file) with no shared mutable state — so a duplicate compile costs a
+    little CPU but never affects correctness, and is not worth a lock.
     """
     path = Path(resolved)
     try:
@@ -72,18 +80,24 @@ def _compile_validator_cached(resolved: str, _mtime_ns: int) -> Draft202012Valid
 def compile_output_validator(schema_path: Path) -> Draft202012Validator:
     """Return the compiled, cached validator for the schema file at ``schema_path``.
 
-    The read+parse+meta-schema-check+construct happens once per resolved path and
-    cached contents (#67); a cache hit returns the SAME validator object. A missing
-    or malformed schema file raises :class:`OutputContractError` naming the
-    contract, exactly as validation does, so the caller handles one error type.
+    The read+parse+meta-schema-check+construct happens once per RESOLVED path and
+    cached contents (#67); a cache hit returns the SAME validator object, and two
+    equivalent spellings of one file share that single validator. A missing or
+    malformed schema file raises :class:`OutputContractError` naming the contract,
+    exactly as validation does, so the caller handles one error type.
     """
     try:
-        mtime_ns = schema_path.stat().st_mtime_ns
+        # Resolve so equivalent spellings of one file (`.`/`..` detours, symlinks)
+        # collapse to a single cache key, matching the documented resolved-path
+        # caching. ``resolve()`` also stats the path, so a missing/unstatable file
+        # raises here and surfaces the same contract-naming error as the read path.
+        resolved = schema_path.resolve(strict=True)
+        mtime_ns = resolved.stat().st_mtime_ns
     except OSError as exc:
         # A missing/unstatable file cannot be compiled; surface the same
         # contract-naming error the read path would, before touching the cache.
         raise OutputContractError(f"cannot read output contract {schema_path}: {exc}") from exc
-    return _compile_validator_cached(str(schema_path), mtime_ns)
+    return _compile_validator_cached(str(resolved), mtime_ns)
 
 
 def validate_output_contract(schema_path: Path, structured_output: object) -> None:
