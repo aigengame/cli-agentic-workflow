@@ -9,8 +9,11 @@ stay vendor-neutral.
 """
 
 import asyncio
+import contextlib
 import json
+import os
 import shutil
+import signal
 
 from caw.adapter import Adapter, AdapterError, AgentInvocation, AgentResult
 
@@ -54,6 +57,38 @@ def _resolve_cli_path(context_label: str) -> str:
     return resolved
 
 
+async def _communicate_or_kill(
+    process: "asyncio.subprocess.Process",
+) -> tuple[bytes, bytes]:
+    """``communicate`` on ``process``, killing+reaping its tree on cancellation/timeout.
+
+    The kernel wraps ``invoke`` in ``asyncio.timeout``; when the budget expires the
+    awaited ``communicate`` is cancelled (``CancelledError``) — and a bare
+    ``TimeoutError`` can surface the same way — leaving the spawned ``claude`` (and
+    any grandchild it launched) running. We catch ``BaseException`` (covers both),
+    kill the WHOLE process tree by group and reap it so no orphan is left, then
+    re-raise so the executor still classifies the node correctly.
+
+    The process is spawned with ``start_new_session=True`` so the whole tree shares a
+    process group that ``os.killpg`` signals; a grandchild's inherited stdout pipe
+    would otherwise keep this call blocked for its full lifetime. A process that
+    already exited (``returncode`` set) needs no kill; ``ProcessLookupError`` is
+    suppressed for the race where it exits between the check and the signal.
+
+    NOTE: this mirrors the executor's private ``_kill_and_reap``; it is duplicated
+    rather than imported because ``caw.executor`` imports this adapter, so importing
+    back would create an import cycle. Consolidating the two copies is tracked in #83.
+    """
+    try:
+        return await process.communicate()
+    except BaseException:
+        if process.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+        await process.wait()
+        raise
+
+
 class ClaudePrintAdapter(Adapter):
     """Invokes ``claude -p`` (Claude Code headless mode) and normalizes its result."""
 
@@ -85,9 +120,13 @@ class ClaudePrintAdapter(Adapter):
         try:
             process = await asyncio.create_subprocess_exec(
                 *argv,
+                stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=dict(invocation.env),
+                # Own session/process group so the whole tree can be killed by group
+                # if the kernel's timeout cancels this invoke (see _communicate_or_kill).
+                start_new_session=True,
             )
         except FileNotFoundError as exc:
             # Defense-in-depth: _resolve_cli_path already gave a clean pre-spawn
@@ -95,9 +134,15 @@ class ClaudePrintAdapter(Adapter):
             # which and spawn) must still surface the actionable setup error, never
             # a raw FileNotFoundError escaping the Adapter.
             raise AdapterError(f"{_node_context(invocation)}: {_MISSING_CLI_HINT}") from exc
-        stdout_bytes, stderr_bytes = await process.communicate()
-        stdout = stdout_bytes.decode("utf-8", errors="replace")
-        stderr = stderr_bytes.decode("utf-8", errors="replace")
+        # communicate, killing+reaping the tree on cancellation/timeout so no orphan
+        # claude process is left behind (mirrors the executor's shell-node handling).
+        stdout_bytes, stderr_bytes = await _communicate_or_kill(process)
+        # backslashreplace (not replace): this stdout feeds State and downstream
+        # `when` predicates, so an undecodable byte must decode RECOVERABLY (`\xff`)
+        # rather than collapse to an irreversible U+FFFD — matching the executor's
+        # shell-node decode.
+        stdout = stdout_bytes.decode("utf-8", errors="backslashreplace")
+        stderr = stderr_bytes.decode("utf-8", errors="backslashreplace")
         exit_status = process.returncode if process.returncode is not None else -1
         # Parse the result wrapper only on a successful, structured-requested run:
         # a non-zero exit is already a node failure (ADR 0006), so unparseable
@@ -121,8 +166,25 @@ class ClaudePrintAdapter(Adapter):
                 # emitted). stdout keeps the raw wrapper so the trace stays complete.
                 exit_status = 1
                 stderr = self._annotate_cli_error(stderr, wrapper)
+            elif "structured_output" not in wrapper:
+                # The adapter asked for structured output (via --json-schema) but the
+                # wrapper carries NO `structured_output` key — the CLI produced none,
+                # so the adapter cannot produce a result (an AdapterError, consistent
+                # with the unparseable-when-required case above). Crucially we must
+                # distinguish an ABSENT key from an explicit JSON `null`: collapsing
+                # both to None via .get() would defeat the kernel's deliberate
+                # null-vs-absent distinction (the kernel's schema is the sole arbiter
+                # of whether a present null satisfies the Output Contract, ADR 0006).
+                raise AdapterError(
+                    f"{_node_context(invocation)}: 'claude -p --output-format json' "
+                    "produced no 'structured_output' field but one was required by "
+                    "the node's output_schema"
+                )
             else:
-                structured_output = wrapper.get("structured_output")
+                # The key is present: pass its value through AS-IS, including an
+                # explicit JSON null (-> Python None). The kernel re-validates it
+                # against the Output Contract (ADR 0006).
+                structured_output = wrapper["structured_output"]
         return AgentResult(
             exit_status=exit_status,
             stdout=stdout,
@@ -147,21 +209,25 @@ class ClaudePrintAdapter(Adapter):
             process = await asyncio.create_subprocess_exec(
                 resolved_cli,
                 "--version",
+                stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                # Own session/process group so a cancelled probe can be killed by
+                # group, leaving no orphan (see _communicate_or_kill).
+                start_new_session=True,
             )
         except FileNotFoundError as exc:
             # Defense-in-depth for the TOCTOU race (see invoke): the binary
             # disappearing between which and spawn still yields the setup error.
             raise AdapterError(f"capability check: {_MISSING_CLI_HINT}") from exc
-        stdout_bytes, stderr_bytes = await process.communicate()
+        stdout_bytes, stderr_bytes = await _communicate_or_kill(process)
         if process.returncode != 0:
-            stderr = stderr_bytes.decode("utf-8", errors="replace").strip()
+            stderr = stderr_bytes.decode("utf-8", errors="backslashreplace").strip()
             raise AdapterError(
                 f"capability check: 'claude --version' exited "
                 f"{process.returncode}: {stderr or '<no stderr>'}"
             )
-        return stdout_bytes.decode("utf-8", errors="replace").strip()
+        return stdout_bytes.decode("utf-8", errors="backslashreplace").strip()
 
     @staticmethod
     def _read_schema(invocation: AgentInvocation) -> str:
@@ -214,9 +280,13 @@ class ClaudePrintAdapter(Adapter):
         Names the wrapper's `subtype` when present (e.g. `error_max_turns`) so the
         failure is diagnosable from the trace, and PRESERVES any stderr the process
         already emitted by appending rather than clobbering (#9 review follow-up).
+        The process stderr is rstripped before the join so a process whose stderr
+        already ends in a newline does not get a doubled/trailing blank line: the
+        is_error path forces exit_status=1, so the executor's exit==0-only `.strip()`
+        never cleans this persisted stderr.
         """
         subtype = wrapper.get("subtype")
         annotation = "claude reported an error"
         if isinstance(subtype, str) and subtype:
             annotation += f" (subtype: {subtype})"
-        return f"{stderr}\n{annotation}" if stderr else annotation
+        return f"{stderr.rstrip()}\n{annotation}" if stderr.strip() else annotation

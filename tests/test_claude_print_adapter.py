@@ -8,8 +8,10 @@ the only seams, and they are monkeypatched here. A separate online test
 the CLI is absent.
 """
 
+import asyncio
 import json
 import shutil
+import signal
 from pathlib import Path
 
 import pytest
@@ -41,18 +43,55 @@ def write_schema(path: Path, schema: dict[str, object]) -> Path:
 
 
 class FakeProcess:
-    """A stand-in for ``asyncio.subprocess.Process`` recording its spawn call."""
+    """A stand-in for ``asyncio.subprocess.Process`` recording its spawn call.
 
-    def __init__(self, returncode: int, stdout: bytes = b"", stderr: bytes = b"") -> None:
+    ``communicate_raises`` lets a test model the kernel's ``asyncio.timeout``
+    cancelling the awaited ``invoke`` (``communicate`` raises ``CancelledError`` /
+    ``TimeoutError``). A still-running process (``returncode=None``) records whether
+    its tree was killed and reaped via ``pid``/``wait``, so a test can assert the
+    adapter cleans up instead of orphaning the subprocess.
+    """
+
+    def __init__(
+        self,
+        returncode: int | None,
+        stdout: bytes = b"",
+        stderr: bytes = b"",
+        communicate_raises: BaseException | None = None,
+    ) -> None:
         self.returncode = returncode
+        self.pid = 4242
         self._stdout = stdout
         self._stderr = stderr
+        self._communicate_raises = communicate_raises
+        self.waited = False
 
     async def communicate(self, input: bytes | None = None) -> tuple[bytes, bytes]:
+        if self._communicate_raises is not None:
+            raise self._communicate_raises
         return self._stdout, self._stderr
+
+    async def wait(self) -> int:
+        # Reaping a killed process: record the reap and settle the returncode so a
+        # second kill is a no-op, mirroring asyncio.subprocess.Process.wait().
+        self.waited = True
+        if self.returncode is None:
+            self.returncode = -9
+        return self.returncode
 
 
 FAKE_CLAUDE_PATH = "/fake/abs/bin/claude"
+
+
+def patch_killpg(monkeypatch: pytest.MonkeyPatch) -> list[tuple[int, int]]:
+    """Patch ``os.killpg`` in the adapter namespace; record (pid, signal) calls."""
+    calls: list[tuple[int, int]] = []
+
+    def fake_killpg(pid: int, sig: int) -> None:
+        calls.append((pid, sig))
+
+    monkeypatch.setattr("caw.claude_print.os.killpg", fake_killpg)
+    return calls
 
 
 def patch_spawn(monkeypatch: pytest.MonkeyPatch, process: FakeProcess) -> dict[str, object]:
@@ -62,6 +101,7 @@ def patch_spawn(monkeypatch: pytest.MonkeyPatch, process: FakeProcess) -> dict[s
     async def fake_exec(*args: object, **kwargs: object) -> FakeProcess:
         captured["args"] = args
         captured["env"] = kwargs.get("env")
+        captured["kwargs"] = kwargs
         return process
 
     monkeypatch.setattr("caw.claude_print.asyncio.create_subprocess_exec", fake_exec)
@@ -119,6 +159,26 @@ async def test_non_zero_exit_is_an_ordinary_result_not_an_error(
 
 
 @pytest.mark.asyncio
+async def test_invalid_utf8_bytes_decode_recoverably_not_with_replacement_chars(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # stdout/stderr feed State and downstream `when` predicates, so an undecodable
+    # byte must decode RECOVERABLY (backslashreplace -> `\xff`), like the executor's
+    # shell node, not irreversibly (replace -> U+FFFD which loses the original byte).
+    patch_which(monkeypatch)
+    patch_spawn(monkeypatch, FakeProcess(0, stdout=b"out\xff", stderr=b"err\xfe"))
+    adapter = ClaudePrintAdapter()
+
+    result = await adapter.invoke(
+        AgentInvocation(node_id="n", adapter="claude.print", prompt="do it")
+    )
+
+    assert "�" not in result.stdout and "�" not in result.stderr, "no lossy U+FFFD"
+    assert result.stdout == "out\\xff"
+    assert result.stderr == "err\\xfe"
+
+
+@pytest.mark.asyncio
 async def test_missing_cli_raises_an_actionable_setup_error_before_spawning(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -139,6 +199,123 @@ async def test_missing_cli_raises_an_actionable_setup_error_before_spawning(
     message = str(excinfo.value)
     assert "claude" in message
     assert "install" in message.lower(), "the error tells the user how to install/enable the CLI"
+
+
+@pytest.mark.asyncio
+async def test_invoke_spawns_in_its_own_session_with_isolated_stdin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The spawn must start a new session (so the whole process tree can be signalled
+    # by process group on cancellation/timeout) and isolate stdin (DEVNULL) so the
+    # child cannot block reading the parent's stdin — mirroring the executor's shell
+    # node.
+    patch_which(monkeypatch)
+    captured = patch_spawn(monkeypatch, FakeProcess(0, stdout=b"ok"))
+    adapter = ClaudePrintAdapter()
+
+    await adapter.invoke(AgentInvocation(node_id="n", adapter="claude.print", prompt="p"))
+
+    kwargs = captured["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert kwargs.get("start_new_session") is True
+    assert kwargs.get("stdin") == asyncio.subprocess.DEVNULL
+
+
+@pytest.mark.asyncio
+async def test_capability_check_spawns_in_its_own_session_with_isolated_stdin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The version probe spawns the same way: a new session for process-group teardown
+    # on cancellation, and isolated stdin so the probe never blocks on parent stdin.
+    patch_which(monkeypatch)
+    captured = patch_spawn(monkeypatch, FakeProcess(0, stdout=b"2.1.0\n"))
+    adapter = ClaudePrintAdapter()
+
+    await adapter.capability_check()
+
+    kwargs = captured["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert kwargs.get("start_new_session") is True
+    assert kwargs.get("stdin") == asyncio.subprocess.DEVNULL
+
+
+@pytest.mark.asyncio
+async def test_invoke_kills_and_reaps_the_subprocess_tree_on_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # When the kernel's asyncio.timeout cancels the awaited invoke, CancelledError is
+    # raised at communicate(). The adapter must KILL the whole process tree by group
+    # (os.killpg ... SIGKILL) and REAP it (wait), leaving no orphan, then re-raise —
+    # mirroring the executor's _kill_and_reap. A still-running process has
+    # returncode=None.
+    patch_which(monkeypatch)
+    killed = patch_killpg(monkeypatch)
+    process = FakeProcess(None, communicate_raises=asyncio.CancelledError())
+    patch_spawn(monkeypatch, process)
+    adapter = ClaudePrintAdapter()
+
+    with pytest.raises(asyncio.CancelledError):
+        await adapter.invoke(AgentInvocation(node_id="n", adapter="claude.print", prompt="p"))
+
+    assert killed == [(process.pid, signal.SIGKILL)], "the process tree is killed by group"
+    assert process.waited is True, "the killed process is reaped (no orphan)"
+
+
+@pytest.mark.asyncio
+async def test_invoke_kills_and_reaps_on_timeout_error_too(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A TimeoutError surfacing at communicate() (BaseException path) is cleaned up the
+    # same way and re-raised, so the executor's TIMED_OUT classification still sees it.
+    patch_which(monkeypatch)
+    killed = patch_killpg(monkeypatch)
+    process = FakeProcess(None, communicate_raises=TimeoutError())
+    patch_spawn(monkeypatch, process)
+    adapter = ClaudePrintAdapter()
+
+    with pytest.raises(TimeoutError):
+        await adapter.invoke(AgentInvocation(node_id="n", adapter="claude.print", prompt="p"))
+
+    assert killed and process.waited is True
+
+
+@pytest.mark.asyncio
+async def test_invoke_cancellation_after_process_already_exited_does_not_kill(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # If the process already exited (returncode set) when cancellation surfaces, there
+    # is nothing to kill — only reap. Mirrors _kill_and_reap's returncode-None guard.
+    patch_which(monkeypatch)
+    killed = patch_killpg(monkeypatch)
+    process = FakeProcess(0, communicate_raises=asyncio.CancelledError())
+    patch_spawn(monkeypatch, process)
+    adapter = ClaudePrintAdapter()
+
+    with pytest.raises(asyncio.CancelledError):
+        await adapter.invoke(AgentInvocation(node_id="n", adapter="claude.print", prompt="p"))
+
+    assert killed == [], "a process that already exited is not killed"
+    assert process.waited is True, "it is still reaped"
+
+
+@pytest.mark.asyncio
+async def test_capability_check_kills_and_reaps_the_subprocess_on_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The version probe gets the same cleanup: cancellation at communicate() kills the
+    # tree by group and reaps it before re-raising, so a cancelled capability check
+    # leaves no orphan probe process.
+    patch_which(monkeypatch)
+    killed = patch_killpg(monkeypatch)
+    process = FakeProcess(None, communicate_raises=asyncio.CancelledError())
+    patch_spawn(monkeypatch, process)
+    adapter = ClaudePrintAdapter()
+
+    with pytest.raises(asyncio.CancelledError):
+        await adapter.capability_check()
+
+    assert killed == [(process.pid, signal.SIGKILL)]
+    assert process.waited is True
 
 
 @pytest.mark.asyncio
@@ -283,6 +460,54 @@ async def test_output_schema_requests_json_and_parses_structured_output(
 
 
 @pytest.mark.asyncio
+async def test_explicit_json_null_structured_output_passes_through_as_none(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # When the wrapper carries an EXPLICIT `structured_output: null`, the adapter
+    # passes it through as Python None — it does NOT raise. The kernel's schema is
+    # the sole arbiter of whether null satisfies the Output Contract (ADR 0006); a
+    # schema permitting null passes, one requiring content fails downstream.
+    schema = write_schema(tmp_path / "s.schema.json", {"type": ["object", "null"]})
+    stdout = claude_json_result(result="produced null", structured_output=None)
+    patch_which(monkeypatch)
+    patch_spawn(monkeypatch, FakeProcess(0, stdout=stdout))
+    adapter = ClaudePrintAdapter()
+
+    result = await adapter.invoke(
+        AgentInvocation(node_id="n", adapter="claude.print", prompt="p", output_schema=schema)
+    )
+
+    assert result.exit_status == 0
+    assert result.structured_output is None
+
+
+@pytest.mark.asyncio
+async def test_absent_structured_output_key_when_required_is_an_adapter_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A zero-exit, non-is_error structured run whose wrapper has NO
+    # `structured_output` key means the CLI was asked for structured output (via
+    # --json-schema) but produced none. The adapter cannot produce a result — an
+    # AdapterError, consistent with the unparseable-when-required case. This must NOT
+    # collapse an ABSENT key to None (which would defeat the kernel's null-vs-absent
+    # distinction); the explicit-null case is handled separately.
+    schema = write_schema(tmp_path / "s.schema.json", {"type": "object"})
+    stdout = claude_json_result(result="forgot the structured output")  # no structured_output key
+    patch_which(monkeypatch)
+    patch_spawn(monkeypatch, FakeProcess(0, stdout=stdout))
+    adapter = ClaudePrintAdapter()
+
+    with pytest.raises(AdapterError) as excinfo:
+        await adapter.invoke(
+            AgentInvocation(node_id="n", adapter="claude.print", prompt="p", output_schema=schema)
+        )
+
+    message = str(excinfo.value)
+    assert "n" in message
+    assert "structured_output" in message
+
+
+@pytest.mark.asyncio
 async def test_no_output_schema_does_not_request_json_and_leaves_structured_output_none(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -399,6 +624,31 @@ async def test_zero_exit_error_wrapper_names_the_subtype_and_preserves_process_s
 
 
 @pytest.mark.asyncio
+async def test_zero_exit_error_wrapper_stderr_ending_in_newline_has_no_blank_line(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The is_error path forces exit_status=1, so the executor's exit==0-only `.strip()`
+    # never cleans the persisted stderr. When the process stderr already ends in a
+    # newline, the annotation must NOT introduce a doubled/trailing blank line — yet
+    # it must still name the subtype.
+    schema = write_schema(tmp_path / "s.schema.json", {"type": "object"})
+    stdout = claude_json_result(result="hit the cap", is_error=True, subtype="error_max_turns")
+    patch_which(monkeypatch)
+    patch_spawn(monkeypatch, FakeProcess(0, stdout=stdout, stderr=b"prior process noise\n"))
+    adapter = ClaudePrintAdapter()
+
+    result = await adapter.invoke(
+        AgentInvocation(node_id="n", adapter="claude.print", prompt="p", output_schema=schema)
+    )
+
+    assert "error_max_turns" in result.stderr, "the annotation still names the wrapper subtype"
+    assert "\n\n" not in result.stderr, "no blank line between the process stderr and annotation"
+    assert result.stderr == (
+        "prior process noise\nclaude reported an error (subtype: error_max_turns)"
+    )
+
+
+@pytest.mark.asyncio
 async def test_capability_check_records_the_cli_version(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -448,6 +698,16 @@ def test_claude_print_is_a_builtin_adapter_name() -> None:
     from caw.adapter import BUILTIN_ADAPTER_NAMES
 
     assert "claude.print" in BUILTIN_ADAPTER_NAMES
+
+
+def test_default_registry_resolves_exactly_the_builtin_adapter_names() -> None:
+    # BUILTIN_ADAPTER_NAMES (the validate-time set) and _default_adapters (the
+    # run-time registry) are two hand-maintained mirrors: a future adapter added to
+    # one but not the other silently drifts the validate-time set from what a
+    # default run actually resolves. Pin their agreement so that drift fails here.
+    from caw.adapter import BUILTIN_ADAPTER_NAMES, AdapterRegistry
+
+    assert AdapterRegistry().names == BUILTIN_ADAPTER_NAMES
 
 
 def test_default_registry_resolves_claude_print_with_no_construction_side_effects(
