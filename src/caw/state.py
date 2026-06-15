@@ -40,7 +40,14 @@ CREATE TABLE IF NOT EXISTS attempt (
 class StateStore:
     """Owns the State database of one Run."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, read_only: bool = False) -> None:
+        # A Reporter renders from persisted State and must never mutate it (#12), so
+        # ``read_only`` opens the database with the SQLite ``mode=ro`` URI: no schema
+        # creation, no commit, and a missing file raises rather than being created
+        # (the writing path would silently create an empty database).
+        if read_only:
+            self._connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+            return
         self._connection = sqlite3.connect(path)
         try:
             self._connection.execute("PRAGMA foreign_keys = ON")
@@ -163,6 +170,20 @@ class StateStore:
             (run_id, node_id, attempt, started_at, finished_at, exit_status, json.dumps(output)),
         )
 
+    def node_table_has_cause(self) -> bool:
+        """Whether the `node` table carries the `cause` column (#76).
+
+        The `cause` column was added (#7) via ``CREATE TABLE IF NOT EXISTS`` only,
+        which is a no-op against a `node` table that already exists, so a run
+        directory created before that column has a `node` table lacking it. Every
+        terminal Node write goes through ``record_node_finished``, which always
+        sets `cause`, so a missing column makes the FIRST such write crash with a
+        raw ``sqlite3.OperationalError``. Resume reads this to refuse a pre-`cause`
+        run directory up front with an actionable error instead (#76).
+        """
+        columns = self._connection.execute("PRAGMA table_info(node)").fetchall()
+        return any(column[1] == "cause" for column in columns)
+
     def run_status(self, run_id: str) -> str | None:
         """The recorded status of a Run, or ``None`` if no such Run exists.
 
@@ -187,6 +208,21 @@ class StateStore:
             str(node_id): str(status)
             for node_id, status in self._connection.execute(
                 "SELECT node_id, status FROM node WHERE run_id = ?", (run_id,)
+            )
+        }
+
+    def node_causes(self, run_id: str) -> dict[str, str | None]:
+        """Map each recorded Node of a Run to its skip cause, or ``None``.
+
+        A skipped Node records WHY it was skipped (#7) — ``when_false``, ``blocked``,
+        or ``all_branches_skipped``; every other Node has no cause. A Reporter reads
+        this so the three skip reasons render distinctly rather than as a generic
+        ``skipped`` (ADR 0007).
+        """
+        return {
+            str(node_id): (None if cause is None else str(cause))
+            for node_id, cause in self._connection.execute(
+                "SELECT node_id, cause FROM node WHERE run_id = ?", (run_id,)
             )
         }
 
