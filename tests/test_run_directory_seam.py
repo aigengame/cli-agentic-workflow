@@ -76,8 +76,10 @@ def test_snapshot_carries_a_definition_checksum_over_the_normalized_workflow(
         "kind": "shell",
         # The normalized inputs carry the discriminator tag `kind` since #5 added
         # the agent Node kind: `inputs` is a discriminated union and the tag is
-        # part of its serialized form.
-        "inputs": {"kind": "shell", "command": "echo hello"},
+        # part of its serialized form. The shell-node env allow-list (#66) is part
+        # of the persisted inputs too, so a resume reconstructs the SAME env scope;
+        # the default (no declared env) round-trips explicitly as an empty list.
+        "inputs": {"kind": "shell", "command": "echo hello", "env": []},
         "needs": [],
         # The per-Node failure-semantics policy (#6) is part of the persisted
         # snapshot so a resume reconstructs the SAME retry/timeout budgets it ran

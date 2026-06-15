@@ -230,6 +230,7 @@ async def _execute_shell_node(node: Node) -> NodeResult:
         stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env=_resolve_shell_env(node.inputs.env),
         start_new_session=True,
     )
     try:
@@ -272,6 +273,27 @@ def _resolve_declared_env(declared: tuple[str, ...]) -> dict[str, str]:
     its VALUES are never persisted to State, Events, or the snapshot (#5).
     """
     return {name: os.environ[name] for name in declared if name in os.environ}
+
+
+def _resolve_shell_env(declared: tuple[str, ...]) -> Mapping[str, str] | None:
+    """Resolve a shell Node's env, giving it env parity with an agent Node (#66).
+
+    When the Node declares an env allow-list, the shell process receives EXACTLY
+    those declared-and-present variables — the same strict allow-list an agent Node
+    gets via :func:`_resolve_declared_env`, with nothing else from the parent
+    environment passing through and the values never persisted (#5). Like the
+    Agent-CLI seam, this makes a declaring Node responsible for listing every
+    variable its command needs (e.g. ``PATH`` to locate binaries), so an
+    allow-list never silently leaks the parent environment.
+
+    When the Node declares NO env (the default ``()``), the shell inherits the
+    parent environment unchanged — ``None`` defers to ``create_subprocess_shell``'s
+    default inheritance — preserving the pre-#66 behavior for every shell Node that
+    does not opt into the allow-list.
+    """
+    if not declared:
+        return None
+    return _resolve_declared_env(declared)
 
 
 async def _execute_agent_node(node: Node, registry: AdapterRegistry) -> NodeResult:

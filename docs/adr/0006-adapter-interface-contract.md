@@ -4,7 +4,7 @@ Status: Accepted
 Date: 2026-06-13
 Related: `docs/adr/0001-local-first-python-bash-workflow-kernel.md`,
 `docs/adr/0003-asyncio-executor-concurrency-model.md`,
-`docs/adr/0004-python-stack-and-toolchain.md`, issues #5, #9, #11, #16
+`docs/adr/0004-python-stack-and-toolchain.md`, issues #5, #9, #11, #16, #66
 
 ADR 0001 keeps Agent CLIs external and integrated through Adapters but left the Adapter
 boundary unspecified. This records the contract, since #9 (claude), #11 (codex), and the
@@ -45,6 +45,25 @@ Three contract rules bind every Adapter:
 - The `env` in `AgentInvocation` is the allow-list the kernel already filtered to declared,
   present names; the Adapter passes exactly that to the Agent CLI process and the kernel
   never persists its values (#5).
+
+The env allow-list is **node-generic, not Agent-CLI-only**. Both an agent Node and a shell
+Node declare `env` as a list of variable NAMES (never values), and the kernel resolves it
+identically through one policy: a Node's process receives only the variables it declared and
+that are present in the parent environment, the values never reach State, Events, or the
+snapshot, and `AgentInvocation`'s repr redacts them (#5, #66, #65). An agent Node's allow-list
+is always passed to the Agent CLI process; a shell Node's allow-list ENGAGES only when it
+declares `env` — a shell Node that declares none inherits the parent environment unchanged, so
+existing shell Workflows that rely on ambient `PATH`/vars keep working. A declaring Node (agent
+or shell) is then responsible for listing every variable its command/CLI needs, including
+`PATH` for a shell command's binaries — exactly the contract the `claude.print` Adapter already
+documents — so an opted-in allow-list never silently leaks the parent environment.
+
+The policy guards env INJECTION and kernel-held values; it is **not output redaction**. A Node
+that echoes a secret into its own stdout or structured output — an Agent CLI printing a token,
+or a shell command running `echo "$API_TOKEN"` — persists that value verbatim in State and the
+trace. Keeping a secret out of a Node's output is the workflow author's responsibility, not the
+kernel's: the allow-list controls what enters the process, never what the process chooses to
+emit.
 
 The v0.1 implementation is one `MockAdapter` that replays a fixture file as an
 `AgentResult`, so Workflows and Patterns run with no Agent CLI installed.

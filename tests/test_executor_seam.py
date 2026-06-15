@@ -1749,3 +1749,90 @@ async def test_cancelling_a_run_terminates_the_in_flight_node_subprocess(tmp_pat
     (node,) = state_rows(run_dir, "SELECT * FROM node")
     assert node["status"] == "errored"
     assert read_events(run_dir)[-1]["type"] == "run_errored"
+
+
+def shell_env_workflow(node_id: str, command: str, env: list[str]) -> Workflow:
+    """A single-shell-node Workflow declaring an env allow-list (#66).
+
+    Mirrors ``policy_shell_workflow`` but carries the node-generic ``env`` field on
+    a shell Node, so the shell-env parity tests can declare an allow-list without
+    an inline raw dict.
+    """
+    raw: dict[str, Any] = {
+        "name": "sample",
+        "version": 1,
+        "nodes": [{"id": node_id, "kind": "shell", "inputs": {"command": command, "env": env}}],
+    }
+    return normalize_workflow(raw, source="<test>")
+
+
+@pytest.mark.asyncio
+async def test_shell_node_receives_only_its_declared_env_vars(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #66: a shell Node has env parity with an agent Node — only the variables it
+    # declares (and that are present in the parent environment) reach the process,
+    # with no parent-environment leakage. The command dumps its full environment so
+    # the test can assert exactly which names crossed the seam. PATH is declared too
+    # so the command's binaries resolve under the strict allow-list — exactly the
+    # author-declares-what-it-needs contract the Agent-CLI seam already enforces.
+    monkeypatch.setenv("DECLARED_VAR", "declared-value")
+    monkeypatch.setenv("UNDECLARED_VAR", "undeclared-value")
+    dump = tmp_path / "env.dump"
+    workflow = shell_env_workflow("dump", f"env > {dump}", env=["DECLARED_VAR", "PATH"])
+
+    result = await execute_run(workflow, tmp_path / "runs")
+
+    assert result.succeeded
+    lines = dump.read_text(encoding="utf-8").splitlines()
+    names = {line.split("=", 1)[0] for line in lines if "=" in line}
+    assert "DECLARED_VAR" in names, "the declared var reaches the shell process"
+    assert "UNDECLARED_VAR" not in names, "no parent-environment leakage past the allow-list"
+
+
+@pytest.mark.asyncio
+async def test_shell_node_env_values_never_reach_state_events_or_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #66: the env policy keeps a declared variable's VALUE out of State, Events,
+    # and the snapshot for a shell Node, exactly as for an agent Node — the policy
+    # guards env injection and kernel-held values, not the command's own stdout.
+    sentinel = "s3cr3t-shell-sentinel-do-not-persist"
+    monkeypatch.setenv("SHELL_TOKEN", sentinel)
+    # The command consumes the var without echoing it, so the value is exercised
+    # but never surfaced by the node's own output.
+    workflow = shell_env_workflow("consume", 'test -n "$SHELL_TOKEN"', env=["SHELL_TOKEN"])
+
+    result = await execute_run(workflow, tmp_path / "runs")
+
+    assert result.succeeded, "the declared var was present in the shell process"
+    run_dir = single_run_dir(tmp_path / "runs")
+    state_bytes = (run_dir / "state.sqlite").read_bytes()
+    events_text = (run_dir / "events.jsonl").read_text(encoding="utf-8")
+    snapshot_text = (run_dir / "workflow.normalized.json").read_text(encoding="utf-8")
+    assert sentinel.encode() not in state_bytes, "the secret value must not reach State"
+    assert sentinel not in events_text, "the secret value must not reach Events"
+    assert sentinel not in snapshot_text, "the secret value must not reach the snapshot"
+
+
+@pytest.mark.asyncio
+async def test_shell_node_with_no_declared_env_inherits_the_parent_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #66: the allow-list ENGAGES only when a shell Node declares `env`. With no
+    # `env` declared (the default), the shell inherits the parent environment
+    # unchanged — preserving the pre-#66 behavior so existing shell workflows that
+    # rely on inherited PATH and ambient vars keep working.
+    monkeypatch.setenv("AMBIENT_VAR", "ambient-value")
+    dump = tmp_path / "env.dump"
+    workflow = shell_workflow(("dump", f"env > {dump}", []))
+
+    result = await execute_run(workflow, tmp_path / "runs")
+
+    assert result.succeeded
+    names = {
+        line.split("=", 1)[0]
+        for line in dump.read_text(encoding="utf-8").splitlines()
+        if "=" in line
+    }
+    assert "AMBIENT_VAR" in names, "an undeclared shell Node inherits the parent environment"
