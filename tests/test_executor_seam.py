@@ -4,7 +4,6 @@ import asyncio
 import json
 import os
 import signal
-import sqlite3
 import subprocess
 import sys
 from collections.abc import Callable
@@ -12,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from conftest import read_events, single_run_dir, state_rows
 
 from caw.adapter import Adapter, AdapterRegistry, AgentInvocation, AgentResult
 from caw.executor import ResumeError, execute_run, resume_run
@@ -51,26 +51,6 @@ def conditional_workflow(*nodes: dict[str, Any]) -> Workflow:
 def shell(node_id: str, command: str, **fields: Any) -> dict[str, Any]:
     """A shell-node dict for ``conditional_workflow``, with optional needs/when/join."""
     return {"id": node_id, "kind": "shell", "inputs": {"command": command}, **fields}
-
-
-def single_run_dir(runs_root: Path) -> Path:
-    run_dirs = list(runs_root.iterdir())
-    assert len(run_dirs) == 1
-    return run_dirs[0]
-
-
-def state_rows(run_dir: Path, query: str) -> list[dict[str, Any]]:
-    connection = sqlite3.connect(run_dir / "state.sqlite")
-    connection.row_factory = sqlite3.Row
-    try:
-        return [dict(row) for row in connection.execute(query)]
-    finally:
-        connection.close()
-
-
-def read_events(run_dir: Path) -> list[dict[str, Any]]:
-    lines = (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
-    return [json.loads(line) for line in lines]
 
 
 def policy_shell_workflow(node_id: str, command: str, **policy: Any) -> Workflow:

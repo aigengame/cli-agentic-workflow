@@ -5,22 +5,16 @@ draft 2020-12 file and validates a Node's structured output, raising
 `OutputContractError` naming the failed contract on any breach.
 """
 
-import json
 from pathlib import Path
-from typing import Any
 
 import pytest
+from conftest import write_schema
 
 from caw.contract import (
     OutputContractError,
     compile_output_validator,
     validate_output_contract,
 )
-
-
-def write_schema(path: Path, schema: dict[str, Any]) -> Path:
-    path.write_text(json.dumps(schema), encoding="utf-8")
-    return path
 
 
 def test_the_compiled_validator_is_cached_and_reused_across_calls(tmp_path: Path) -> None:

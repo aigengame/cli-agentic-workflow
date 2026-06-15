@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from conftest import read_events
 from typer.testing import CliRunner
 
 from caw.cli import app
@@ -250,11 +251,6 @@ def test_non_utf8_node_output_is_preserved_with_backslash_escapes(
     output = json.loads(attempt["output_json"])
     assert output["stdout"] == "\\xff\\xfe", "invalid UTF-8 bytes survive as backslash escapes"
     assert "�" not in output["stdout"]
-
-
-def read_events(run_dir: Path) -> list[dict[str, Any]]:
-    lines = (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
-    return [json.loads(line) for line in lines]
 
 
 def test_events_form_an_append_only_trace_of_a_succeeding_run(
