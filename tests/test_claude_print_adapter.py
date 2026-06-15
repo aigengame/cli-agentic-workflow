@@ -3,14 +3,13 @@
 These prove the Adapter normalizes ``claude -p`` invocations into vendor-neutral
 :class:`AgentResult`s and reports an actionable setup error for a missing CLI,
 WITHOUT a real ``claude`` on PATH: the subprocess spawn and the version probe are
-the only seams, and they are monkeypatched here. A separate online test
-(``test_claude_print_real_cli``) exercises a real ``claude`` and auto-skips when
-the CLI is absent.
+the only seams, and they are monkeypatched here. Real-CLI coverage lives in the
+``e2e`` tier (``tests/e2e/``), which runs a real ``claude`` locally and FAILS — never
+skips — when the CLI is unavailable (#86).
 """
 
 import asyncio
 import json
-import shutil
 import signal
 import sqlite3
 from pathlib import Path
@@ -873,17 +872,3 @@ async def test_claude_print_node_runs_end_to_end_through_the_default_registry(
     assert persisted["structured_output"] == {"name": "Alice"}, (
         "the node's persisted State output carries the adapter's structured output"
     )
-
-
-@pytest.mark.skipif(shutil.which("claude") is None, reason="the 'claude' CLI is not installed")
-@pytest.mark.asyncio
-async def test_claude_print_real_cli_capability_check() -> None:
-    # The ONLY test that spawns a real `claude`. It auto-skips when the CLI is
-    # absent (the offline suite above is what proves the acceptance criteria). It
-    # exercises the version PROBE — offline, free, deterministic, and needing no
-    # auth — to prove the real-CLI capability-check path works end to end.
-    adapter = ClaudePrintAdapter()
-
-    version = await adapter.capability_check()
-
-    assert version, "a real `claude --version` reports a non-empty version string"

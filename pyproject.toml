@@ -44,3 +44,7 @@ files = ["src", "tests"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "strict"
+addopts = "--strict-markers"
+markers = [
+    "e2e: real-agent-CLI end-to-end test; local-only, requires an authenticated agent CLI selected by CAW_E2E_AGENT (#86). Excluded in CI via `pytest -m 'not e2e'`.",
+]

@@ -65,7 +65,12 @@ The v0.1 implementation is one `MockAdapter` that replays a fixture file as an
 
 - #9 and #11 implement `Adapter.invoke` for real CLIs and register under their names; no
   executor, State, or Event change is needed.
-- The mock Adapter is the permanent offline test seam for agent-Node and pattern tests.
+- The mock Adapter is an offline test seam that **complements** real agent-CLI e2e (#86),
+  not a replacement for it: use the mock where a behavior can be verified completely and
+  deterministically offline (our-own-logic, edge/error branches), and the e2e tier for
+  behaviors whose correctness depends on the real CLI. The two are co-weighted — neither is
+  a privileged "primary" seam. (Corrected from an earlier "permanent" framing that
+  over-weighted the mock and let real-CLI coverage lapse.)
 - `AgentResult.artifacts` is indexed minimally in State now; the full artifact lifecycle
   (collection, cleanup, retention) is deferred to #16.
 - The data-class contract is internal, not a published plugin API; it may evolve as real

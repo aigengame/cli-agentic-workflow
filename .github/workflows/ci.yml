@@ -32,5 +32,8 @@ jobs:
         run: uv run ruff format --check .
       - name: Type check
         run: uv run mypy
-      - name: Tests
-        run: uv run pytest
+      - name: Tests (non-e2e)
+        # Agent e2e is a local-only gate for now: cloud agent auth is not
+        # provisionable in GitHub Actions yet, so CI runs the non-e2e tier and the
+        # suite migrates into CI once auth lands (#86, docs/release-flow.md).
+        run: uv run pytest -m "not e2e"
