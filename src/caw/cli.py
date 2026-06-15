@@ -45,6 +45,8 @@ from caw.executor import (
     resume_run,
 )
 from caw.model import Node, Predicate, Workflow, execution_order, normalize_workflow
+from caw.report import ReportFormat, render_report
+from caw.runlayout import run_dir, runs_root
 
 app = typer.Typer(
     name="caw",
@@ -254,9 +256,8 @@ def _report_and_exit(result: RunResult, workflow_label: str) -> None:
 def run(workflow_file: Path) -> None:
     """Run a workflow file and print a plain-text result."""
     workflow = _load_normalized_workflow(workflow_file)
-    runs_root = Path.cwd() / ".caw" / "runs"
     try:
-        result = asyncio.run(execute_run(workflow, runs_root))
+        result = asyncio.run(execute_run(workflow, runs_root()))
     except (OSError, sqlite3.Error) as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=3) from exc
@@ -272,9 +273,8 @@ def resume(run_id: str) -> None:
     succeeded is not resumable and is refused as a config-class error (exit 2)
     with a single ``error:`` line, never re-executing it.
     """
-    runs_root = Path.cwd() / ".caw" / "runs"
     try:
-        result = asyncio.run(resume_run(run_id, runs_root))
+        result = asyncio.run(resume_run(run_id, runs_root()))
     except ResumeError as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=2) from exc
@@ -282,3 +282,22 @@ def resume(run_id: str) -> None:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=3) from exc
     _report_and_exit(result, workflow_label=run_id)
+
+
+@app.command()
+def report(
+    run_id: str,
+    format: Annotated[
+        ReportFormat, typer.Option(help="Render the report as JSON.")
+    ] = ReportFormat.json,
+) -> None:
+    """Render a report of a persisted run from its State and Events, without re-running it.
+
+    An unknown run id is refused as a config-class error (exit 2) with a single
+    ``error:`` line, mirroring ``resume``; a report never executes anything.
+    """
+    directory = run_dir(run_id)
+    if not directory.is_dir():
+        typer.echo(f"error: no run directory for run id {run_id!r} under {runs_root()}", err=True)
+        raise typer.Exit(code=2)
+    typer.echo(render_report(directory, format))
