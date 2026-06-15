@@ -79,8 +79,10 @@ def test_snapshot_carries_a_definition_checksum_over_the_normalized_workflow(
         # the agent Node kind: `inputs` is a discriminated union and the tag is
         # part of its serialized form. The shell-node env allow-list (#66) is part
         # of the persisted inputs too, so a resume reconstructs the SAME env scope;
-        # the default (no declared env) round-trips explicitly as an empty list.
-        "inputs": {"kind": "shell", "command": "echo hello", "env": []},
+        # an OMITTED env (this node declares none) round-trips as `null` — distinct
+        # from an explicit empty `[]` allow-list — so legacy parent-environment
+        # inheritance survives the resume rather than collapsing into "pass no vars".
+        "inputs": {"kind": "shell", "command": "echo hello", "env": None},
         "needs": [],
         # The per-Node failure-semantics policy (#6) is part of the persisted
         # snapshot so a resume reconstructs the SAME retry/timeout budgets it ran

@@ -15,6 +15,7 @@ import pytest
 from conftest import read_events, single_run_dir, state_rows
 
 from caw.adapter import Adapter, AdapterRegistry, AgentInvocation, AgentResult
+from caw.config import WorkflowConfigError
 from caw.executor import ResumeError, execute_run, resume_run
 from caw.model import Workflow, normalize_workflow
 
@@ -1817,6 +1818,111 @@ async def test_shell_node_with_no_declared_env_inherits_the_parent_environment(
         if "=" in line
     }
     assert "AMBIENT_VAR" in names, "an undeclared shell Node inherits the parent environment"
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "API_TOKEN=s3cr3t",  # value-shaped: a secret value smuggled past the allow-list
+        "HAS SPACE",  # a space is not a valid POSIX env-var name
+    ],
+)
+def test_shell_node_env_declaration_rejects_an_invalid_env_name(name: str) -> None:
+    # A shell Node's `env` is the same allow-list of variable NAMES as an agent
+    # Node's: a `NAME=value` form (or any non-POSIX env-var name) is rejected so a
+    # secret-looking value can never be authored into the inspectable definition.
+    with pytest.raises(WorkflowConfigError) as excinfo:
+        shell_env_workflow("dump", "env", env=[name])
+
+    assert "is not a valid env variable name" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_shell_node_with_explicit_empty_env_passes_no_variables(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # An EXPLICIT empty `env: []` is a declared (empty) allow-list, distinct from an
+    # omitted `env`: the shell receives NO variables, so a parent variable that an
+    # omitted-env Node would inherit is absent here (ADR 0006 — a declaring node
+    # receives only declared-and-present variables). The redirect (`>`) and `${..:-}`
+    # default are pure shell builtins, so they run with no PATH; writing the
+    # parameter expansion proves the parent var did NOT cross the empty allow-list.
+    monkeypatch.setenv("AMBIENT_VAR", "ambient-value")
+    dump = tmp_path / "env.dump"
+    workflow = shell_env_workflow("dump", f'echo "${{AMBIENT_VAR:-(absent)}}" > {dump}', env=[])
+
+    result = await execute_run(workflow, tmp_path / "runs")
+
+    assert result.succeeded
+    assert dump.read_text(encoding="utf-8").strip() == "(absent)", (
+        "an explicit empty env: [] passes no variables, so the parent var is absent"
+    )
+
+
+def _snapshot_node_env(run_dir: Path) -> object:
+    """The persisted snapshot's `inputs.env` for the run's sole node.
+
+    The key is read with a sentinel default so a regression where the key vanishes
+    entirely is still caught; an OMITTED `env` serializes as ``null`` (present but
+    None), distinct from an explicit empty `env: []`.
+    """
+    snapshot = json.loads(
+        (run_dir / "workflow.normalized.json").read_text(encoding="utf-8")
+    )
+    inputs = snapshot["workflow"]["nodes"][0]["inputs"]
+    return inputs.get("env", "<<absent>>")
+
+
+@pytest.mark.asyncio
+async def test_omitted_env_and_explicit_empty_env_round_trip_distinctly_in_the_snapshot(
+    tmp_path: Path,
+) -> None:
+    # The omitted-vs-explicit-empty distinction must survive a snapshot round-trip
+    # so a resume reconstructs the SAME env scope: an OMITTED `env` serializes as
+    # `null` (legacy parent-inheritance), while an explicit `env: []` serializes as
+    # `[]` (a declared, empty allow-list — no variables). Were both `[]`, resume
+    # would silently collapse legacy inheritance into "pass no vars".
+    omitted = shell_workflow(("dump", "true", []))  # no env declared
+    explicit_empty = shell_env_workflow("dump", "true", env=[])
+
+    await execute_run(omitted, tmp_path / "omitted-runs")
+    await execute_run(explicit_empty, tmp_path / "empty-runs")
+
+    assert _snapshot_node_env(single_run_dir(tmp_path / "omitted-runs")) is None, (
+        "an omitted env serializes as null, preserving legacy parent inheritance"
+    )
+    assert _snapshot_node_env(single_run_dir(tmp_path / "empty-runs")) == [], (
+        "an explicit empty env: [] serializes as [] — a declared, empty allow-list"
+    )
+
+
+@pytest.mark.asyncio
+async def test_resume_preserves_an_explicit_empty_env_no_variables_scope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A resume reconstructs the Workflow from the snapshot, so the explicit empty
+    # allow-list must round-trip: a resumed run of an `env: []` node still receives
+    # NO variables, never silently re-inheriting the parent environment. The first
+    # run fails (so it is resume-eligible) by writing the parameter expansion and
+    # exiting non-zero; the resumed re-run overwrites the dump, which must still
+    # show the parent var absent.
+    monkeypatch.setenv("AMBIENT_VAR", "ambient-value")
+    dump = tmp_path / "env.dump"
+    workflow = shell_env_workflow(
+        "dump", f'echo "${{AMBIENT_VAR:-(absent)}}" > {dump}; exit 7', env=[]
+    )
+    runs_root = tmp_path / "runs"
+
+    first = await execute_run(workflow, runs_root)
+    assert not first.succeeded, "the first run fails, so it is resume-eligible"
+    assert dump.read_text(encoding="utf-8").strip() == "(absent)"
+
+    resumed = await resume_run(first.run_id, runs_root)
+
+    assert not resumed.succeeded, "the re-run still exits non-zero"
+    assert dump.read_text(encoding="utf-8").strip() == "(absent)", (
+        "the resumed run reconstructs the empty allow-list and still passes no vars"
+    )
 
 
 def drop_node_cause_column(run_dir: Path) -> None:

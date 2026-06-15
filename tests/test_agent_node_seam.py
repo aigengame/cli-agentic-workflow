@@ -222,29 +222,49 @@ def test_agent_invocation_repr_does_not_expose_env_values() -> None:
     assert sentinel not in rendered, "the env VALUE must not appear in the repr"
 
 
-def test_env_declaration_carries_names_not_values(tmp_path: Path) -> None:
-    # The workflow definition declares env NAMES; a `name=value` form is rejected
-    # so a secret value can never be authored into the inspectable definition.
-    raw: dict[str, Any] = {
+def _agent_env_workflow(env: list[str]) -> dict[str, Any]:
+    """A raw agent-Node workflow carrying ``env``, for env-validation tests."""
+    return {
         "name": "sample",
         "version": 1,
         "nodes": [
             {
                 "id": "agent",
                 "kind": "agent",
-                "inputs": {
-                    "adapter": "mock",
-                    "prompt": "do it",
-                    "env": ["DECLARED", "DECLARED"],
-                },
+                "inputs": {"adapter": "mock", "prompt": "do it", "env": env},
             }
         ],
     }
+
+
+def test_agent_env_declaration_rejects_a_duplicate_name(tmp_path: Path) -> None:
+    # The workflow definition declares env NAMES; a duplicate name is a config error.
+    raw = _agent_env_workflow(["DECLARED", "DECLARED"])
 
     with pytest.raises(WorkflowConfigError) as excinfo:
         normalize_workflow(raw, source="<test>")
 
     assert "duplicate env name" in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "API_TOKEN=s3cr3t",  # value-shaped: a secret value smuggled past the allow-list
+        "1INVALID",  # leading digit is not a valid POSIX env-var name
+    ],
+)
+def test_agent_env_declaration_rejects_an_invalid_env_name(name: str, tmp_path: Path) -> None:
+    # `env` is an allow-list of variable NAMES, never values. A `NAME=value` form
+    # (or any entry that is not a valid POSIX env-var name) is rejected so a
+    # secret-looking value can never be authored into the inspectable definition
+    # and persisted into the normalized snapshot.
+    raw = _agent_env_workflow([name])
+
+    with pytest.raises(WorkflowConfigError) as excinfo:
+        normalize_workflow(raw, source="<test>")
+
+    assert "is not a valid env variable name" in str(excinfo.value)
 
 
 @pytest.mark.asyncio

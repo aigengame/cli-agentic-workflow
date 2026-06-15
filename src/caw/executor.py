@@ -262,7 +262,7 @@ async def _execute_shell_node(node: Node) -> NodeResult:
     )
 
 
-def _resolve_declared_env(declared: tuple[str, ...]) -> dict[str, str]:
+def _resolve_declared_env(declared: tuple[str, ...] | None) -> dict[str, str]:
     """Resolve declared env var NAMES to their values from the parent environment.
 
     The env policy is allow-list-only: a Node receives a variable solely if it
@@ -271,27 +271,38 @@ def _resolve_declared_env(declared: tuple[str, ...]) -> dict[str, str]:
     name is simply omitted — never defaulted. The returned mapping is the ONLY
     environment the Adapter (and thus the Agent CLI process) sees for this Node;
     its VALUES are never persisted to State, Events, or the snapshot (#5).
+
+    An agent Node never inherits the parent environment — the Adapter always passes
+    the resolved mapping as the child's strict env — so an OMITTED ``env`` (``None``)
+    and an explicit empty allow-list (``()``) both resolve to the empty mapping
+    here; both are treated as "no declared-and-present variables".
     """
+    if not declared:
+        return {}
     return {name: os.environ[name] for name in declared if name in os.environ}
 
 
-def _resolve_shell_env(declared: tuple[str, ...]) -> Mapping[str, str] | None:
+def _resolve_shell_env(declared: tuple[str, ...] | None) -> Mapping[str, str] | None:
     """Resolve a shell Node's env, giving it env parity with an agent Node (#66).
 
-    When the Node declares an env allow-list, the shell process receives EXACTLY
-    those declared-and-present variables — the same strict allow-list an agent Node
-    gets via :func:`_resolve_declared_env`, with nothing else from the parent
-    environment passing through and the values never persisted (#5). Like the
-    Agent-CLI seam, this makes a declaring Node responsible for listing every
-    variable its command needs (e.g. ``PATH`` to locate binaries), so an
-    allow-list never silently leaks the parent environment.
+    The shell, unlike an agent Node, CAN inherit the parent environment, so the
+    OMITTED-vs-explicit-empty distinction is observable and must be honored:
 
-    When the Node declares NO env (the default ``()``), the shell inherits the
-    parent environment unchanged — ``None`` defers to ``create_subprocess_shell``'s
-    default inheritance — preserving the pre-#66 behavior for every shell Node that
-    does not opt into the allow-list.
+    - OMITTED ``env`` (``None``, the field default) → return ``None`` so
+      ``create_subprocess_shell`` inherits the parent environment unchanged,
+      preserving the pre-#66 behavior for every shell Node that never opts into the
+      allow-list.
+    - Explicit empty ``env: []`` (``()``) → return ``{}`` so the shell receives NO
+      variables: a declared (empty) allow-list passes exactly its declared-and-present
+      names, which is none (ADR 0006). This is DISTINCT from inheritance — a parent
+      variable an omitted-``env`` Node would see is absent here.
+    - A non-empty allow-list → the shell receives EXACTLY those declared-and-present
+      variables (the same strict allow-list :func:`_resolve_declared_env` builds for
+      an agent Node), with nothing else from the parent passing through and the
+      values never persisted (#5). The declaring Node is then responsible for listing
+      every variable its command needs (e.g. ``PATH`` to locate binaries).
     """
-    if not declared:
+    if declared is None:
         return None
     return _resolve_declared_env(declared)
 
@@ -303,9 +314,13 @@ def _existing_artifacts(artifacts: tuple[Path, ...]) -> tuple[Path, ...]:
     the index must not over-promise: an adapter-supplied path is validated for
     existence as a regular FILE before being indexed. A path that does not exist,
     or that exists but is not a file (e.g. a directory), is dropped rather than
-    recorded — State then never claims a produced file that never existed. The full
-    artifact lifecycle (collection, retention, run-directory scoping) is deferred to
-    #16; this is the minimal existence guard.
+    recorded — State then never claims a produced file that never existed.
+
+    This is the minimal EXISTENCE guard only; it deliberately does NOT scope a path
+    to the run directory, so an existing file ANYWHERE on disk is still indexed. The
+    remaining artifact lifecycle — collection, retention, and run-directory SCOPING
+    (rejecting/relocating an out-of-run-directory path) — is owned by #16, not this
+    guard.
     """
     return tuple(path for path in artifacts if path.is_file())
 

@@ -50,13 +50,27 @@ The env allow-list is **node-generic, not Agent-CLI-only**. Both an agent Node a
 Node declare `env` as a list of variable NAMES (never values), and the kernel resolves it
 identically through one policy: a Node's process receives only the variables it declared and
 that are present in the parent environment, the values never reach State, Events, or the
-snapshot, and `AgentInvocation`'s repr redacts them (#5, #66, #65). An agent Node's allow-list
-is always passed to the Agent CLI process; a shell Node's allow-list ENGAGES only when it
-declares `env` — a shell Node that declares none inherits the parent environment unchanged, so
-existing shell Workflows that rely on ambient `PATH`/vars keep working. A declaring Node (agent
-or shell) is then responsible for listing every variable its command/CLI needs, including
-`PATH` for a shell command's binaries — exactly the contract the `claude.print` Adapter already
-documents — so an opted-in allow-list never silently leaks the parent environment.
+snapshot, and `AgentInvocation`'s repr redacts them (#5, #66, #65). A declared entry must be a
+valid POSIX environment-variable name (`^[A-Za-z_][A-Za-z0-9_]*$`); a value-shaped entry such as
+`API_TOKEN=s3cr3t`, an embedded `=`, a leading digit, or a space is rejected at normalize time,
+so a secret value can never be smuggled into the allow-list and persisted into the snapshot
+(#66). A declaring Node (agent or shell) is then responsible for listing every variable its
+command/CLI needs, including `PATH` for a shell command's binaries — exactly the contract the
+`claude.print` Adapter already documents — so an opted-in allow-list never silently leaks the
+parent environment.
+
+An OMITTED `env` and an EXPLICIT empty `env: []` are **distinct, not collapsed** (#66). An
+agent Node's allow-list is always passed to the Agent CLI process, so for an agent Node both
+omitted and empty mean "pass no declared variable" — an agent Node never inherits the parent
+environment. A shell Node, which CAN inherit, honors the distinction: an OMITTED `env` inherits
+the parent environment unchanged (the legacy default, so existing shell Workflows that rely on
+ambient `PATH`/vars keep working), while an explicit empty `env: []` is a declared (empty)
+allow-list and the shell receives **no variables at all** — a declaring node receives only its
+declared-and-present variables, which for an empty list is none. To make the distinction
+representable and survive a resume, the `env` field default is `None` (omitted), not `[]`, and
+the normalized snapshot serializes an omitted `env` as `null` (distinct from `[]`), so a resume
+reconstructs the SAME env scope rather than silently turning legacy inheritance into "pass no
+vars".
 
 The policy guards env INJECTION and kernel-held values; it is **not output redaction**. A Node
 that echoes a secret into its own stdout or structured output — an Agent CLI printing a token,
