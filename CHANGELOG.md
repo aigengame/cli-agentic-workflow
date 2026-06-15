@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.8.0](https://github.com/aigengame/cli-agentic-workflow/compare/v0.7.0...v0.8.0) (2026-06-15)
+
+
+### Features
+
+* reporters and `caw report` in four formats ([#12](https://github.com/aigengame/cli-agentic-workflow/issues/12)) ([#90](https://github.com/aigengame/cli-agentic-workflow/issues/90)) ([604bcba](https://github.com/aigengame/cli-agentic-workflow/commit/604bcba1f5fd5983fab65bf979d19c52c39a989c))
+
+
+### Bug Fixes
+
+* refuse resume of pre-cause State schema with actionable error ([#91](https://github.com/aigengame/cli-agentic-workflow/issues/91)) ([720071b](https://github.com/aigengame/cli-agentic-workflow/commit/720071bf38e45c28e6455c8bbda7f85741fd9ed6)), closes [#76](https://github.com/aigengame/cli-agentic-workflow/issues/76)
+
 ## [0.7.0](https://github.com/aigengame/cli-agentic-workflow/compare/v0.6.0...v0.7.0) (2026-06-15)
 
 
