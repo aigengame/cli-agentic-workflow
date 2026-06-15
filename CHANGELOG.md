@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.0](https://github.com/aigengame/cli-agentic-workflow/compare/v0.6.0...v0.7.0) (2026-06-15)
+
+
+### Features
+
+* claude.print adapter for claude -p ([#80](https://github.com/aigengame/cli-agentic-workflow/issues/80)) ([9b5198f](https://github.com/aigengame/cli-agentic-workflow/commit/9b5198ff6f6360d968453f6ecb66481837069003))
+
 ## [0.6.0](https://github.com/aigengame/cli-agentic-workflow/compare/v0.5.1...v0.6.0) (2026-06-13)
 
 
