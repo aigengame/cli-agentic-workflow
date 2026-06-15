@@ -12,12 +12,15 @@ import asyncio
 import json
 import shutil
 import signal
+import sqlite3
 from pathlib import Path
 
 import pytest
 
-from caw.adapter import AdapterError, AgentInvocation
+from caw.adapter import AdapterError, AdapterRegistry, AgentInvocation
 from caw.claude_print import ClaudePrintAdapter
+from caw.executor import execute_run
+from caw.model import normalize_workflow
 
 
 def claude_json_result(result: str = "ok", **fields: object) -> bytes:
@@ -280,11 +283,15 @@ async def test_invoke_kills_and_reaps_on_timeout_error_too(
 
 
 @pytest.mark.asyncio
-async def test_invoke_cancellation_after_process_already_exited_does_not_kill(
+async def test_invoke_cancellation_kills_group_even_if_leader_already_exited(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # If the process already exited (returncode set) when cancellation surfaces, there
-    # is nothing to kill — only reap. Mirrors _kill_and_reap's returncode-None guard.
+    # The leader's `returncode` being set does NOT mean the process GROUP is dead: a
+    # grandchild can have inherited the stdout/stderr pipe and still be alive, keeping
+    # `communicate()` blocked until cancellation surfaces. So on cancellation the
+    # group is ALWAYS signalled (os.killpg ... SIGKILL) — regardless of the leader's
+    # returncode — and then reaped, before re-raising. Killing only when returncode
+    # is None would orphan that surviving grandchild.
     patch_which(monkeypatch)
     killed = patch_killpg(monkeypatch)
     process = FakeProcess(0, communicate_raises=asyncio.CancelledError())
@@ -294,8 +301,33 @@ async def test_invoke_cancellation_after_process_already_exited_does_not_kill(
     with pytest.raises(asyncio.CancelledError):
         await adapter.invoke(AgentInvocation(node_id="n", adapter="claude.print", prompt="p"))
 
-    assert killed == [], "a process that already exited is not killed"
+    assert killed == [(process.pid, signal.SIGKILL)], (
+        "the group is killed even though the leader already exited (a grandchild may survive)"
+    )
     assert process.waited is True, "it is still reaped"
+
+
+@pytest.mark.asyncio
+async def test_invoke_cancellation_suppresses_process_lookup_when_group_is_gone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # When the WHOLE process group is already gone, os.killpg raises
+    # ProcessLookupError. That race must be suppressed (there is nothing left to
+    # kill) and the original exception must still propagate after reaping.
+    patch_which(monkeypatch)
+
+    def killpg_no_such_group(pid: int, sig: int) -> None:
+        raise ProcessLookupError(3, "No such process")
+
+    monkeypatch.setattr("caw.claude_print.os.killpg", killpg_no_such_group)
+    process = FakeProcess(None, communicate_raises=asyncio.CancelledError())
+    patch_spawn(monkeypatch, process)
+    adapter = ClaudePrintAdapter()
+
+    with pytest.raises(asyncio.CancelledError):
+        await adapter.invoke(AgentInvocation(node_id="n", adapter="claude.print", prompt="p"))
+
+    assert process.waited is True, "the process is still reaped after the suppressed lookup error"
 
 
 @pytest.mark.asyncio
@@ -358,17 +390,19 @@ async def test_invoke_spawns_the_resolved_absolute_cli_path(
     argv = captured["args"]
     assert isinstance(argv, tuple)
     assert argv[0] == FAKE_CLAUDE_PATH, "argv[0] is the which-resolved absolute path"
-    assert argv[1:] == ("-p", "summarize")
+    assert argv[1:] == ("-p", "--", "summarize"), "the prompt is last, after the `--` separator"
 
 
 @pytest.mark.asyncio
 async def test_prompt_is_positional_and_node_args_pass_through_unchanged(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # The prompt is a positional argument to `claude -p`; the node's `args`
-    # (sandbox/approval/any other CLI flags) pass through to the subprocess
-    # UNCHANGED. caw adds no policy engine: it neither interprets nor injects flags.
-    # argv[0] is the which-resolved absolute path; argv[1:] is prompt + passthrough.
+    # The prompt is the trailing positional argument to `claude -p`, placed AFTER a
+    # `--` end-of-options separator; the node's `args` (sandbox/approval/any other CLI
+    # flags) pass through to the subprocess UNCHANGED, BEFORE the `--`. caw adds no
+    # policy engine: it neither interprets nor injects flags. argv[0] is the
+    # which-resolved absolute path; the passthrough flags precede `--`, the prompt
+    # follows it.
     patch_which(monkeypatch)
     captured = patch_spawn(monkeypatch, FakeProcess(0, stdout=b"ok"))
     adapter = ClaudePrintAdapter()
@@ -385,12 +419,35 @@ async def test_prompt_is_positional_and_node_args_pass_through_unchanged(
     assert captured["args"] == (
         FAKE_CLAUDE_PATH,
         "-p",
-        "summarize the repo",
         "--permission-mode",
         "acceptEdits",
         "--add-dir",
         "/tmp/x",
+        "--",
+        "summarize the repo",
     )
+
+
+@pytest.mark.asyncio
+async def test_leading_dash_prompt_is_protected_by_the_end_of_options_separator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A prompt that begins with `-` (e.g. "--help") must NEVER be parsed by `claude`
+    # as a flag (`claude -p --help` would print help). The `--` end-of-options
+    # separator guarantees the prompt is treated as a positional: `--` is present in
+    # argv and the prompt is the LAST argv element, so nothing after it can be read
+    # as an option.
+    patch_which(monkeypatch)
+    captured = patch_spawn(monkeypatch, FakeProcess(0, stdout=b"ok"))
+    adapter = ClaudePrintAdapter()
+
+    await adapter.invoke(AgentInvocation(node_id="n", adapter="claude.print", prompt="--help"))
+
+    argv = captured["args"]
+    assert isinstance(argv, tuple)
+    assert "--" in argv, "the end-of-options separator protects a leading-dash prompt"
+    assert argv[-1] == "--help", "the prompt is the last argv element, never parsed as a flag"
+    assert argv[argv.index("--") + 1] == "--help", "the prompt immediately follows the separator"
 
 
 @pytest.mark.asyncio
@@ -455,6 +512,17 @@ async def test_output_schema_requests_json_and_parses_structured_output(
     assert "--output-format" in argv and argv[argv.index("--output-format") + 1] == "json"
     schema_text = schema.read_text(encoding="utf-8")
     assert "--json-schema" in argv and argv[argv.index("--json-schema") + 1] == schema_text
+    # The structured flags precede the `--` separator; the prompt is still last.
+    assert argv == (
+        FAKE_CLAUDE_PATH,
+        "-p",
+        "--output-format",
+        "json",
+        "--json-schema",
+        schema_text,
+        "--",
+        "make a person",
+    )
     assert result.exit_status == 0
     assert result.structured_output == {"name": "Alice", "age": 30}
 
@@ -753,6 +821,58 @@ def test_agent_node_with_claude_print_adapter_validates() -> None:
     (node,) = workflow.nodes
     assert isinstance(node.inputs, AgentNodeInputs)
     assert node.inputs.adapter == "claude.print"
+
+
+@pytest.mark.asyncio
+async def test_claude_print_node_runs_end_to_end_through_the_default_registry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The full offline path: an `agent` node with `adapter: claude.print` and an
+    # `output_schema`, run through `execute_run` with the DEFAULT AdapterRegistry()
+    # (no wiring). The CLI lookup and the subprocess spawn are the only seams — both
+    # monkeypatched — so no real `claude` is needed. This proves path node -> default
+    # registry -> claude.print adapter -> Output Contract -> State works end to end:
+    # the structured output the (fake) CLI emitted is validated against the schema and
+    # persisted to the node's State output.
+    schema = write_schema(
+        tmp_path / "person.schema.json",
+        {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]},
+    )
+    stdout = claude_json_result(result="made a person", structured_output={"name": "Alice"})
+    patch_which(monkeypatch)
+    patch_spawn(monkeypatch, FakeProcess(0, stdout=stdout))
+    raw = {
+        "name": "sample",
+        "version": 1,
+        "nodes": [
+            {
+                "id": "make_person",
+                "kind": "agent",
+                "inputs": {
+                    "adapter": "claude.print",
+                    "prompt": "make a person",
+                    "output_schema": str(schema),
+                },
+            }
+        ],
+    }
+    workflow = normalize_workflow(raw, source="<test>")
+
+    result = await execute_run(workflow, tmp_path / "runs", registry=AdapterRegistry())
+
+    assert result.succeeded, "the claude.print node ran and satisfied its Output Contract"
+    (run_dir,) = (tmp_path / "runs").iterdir()
+    connection = sqlite3.connect(run_dir / "state.sqlite")
+    try:
+        (row,) = connection.execute(
+            "SELECT output_json FROM attempt WHERE node_id = 'make_person'"
+        ).fetchall()
+    finally:
+        connection.close()
+    persisted = json.loads(row[0])
+    assert persisted["structured_output"] == {"name": "Alice"}, (
+        "the node's persisted State output carries the adapter's structured output"
+    )
 
 
 @pytest.mark.skipif(shutil.which("claude") is None, reason="the 'claude' CLI is not installed")

@@ -71,9 +71,13 @@ async def _communicate_or_kill(
 
     The process is spawned with ``start_new_session=True`` so the whole tree shares a
     process group that ``os.killpg`` signals; a grandchild's inherited stdout pipe
-    would otherwise keep this call blocked for its full lifetime. A process that
-    already exited (``returncode`` set) needs no kill; ``ProcessLookupError`` is
-    suppressed for the race where it exits between the check and the signal.
+    would otherwise keep this call blocked for its full lifetime. The leader's
+    ``returncode`` being set does NOT mean the process GROUP is dead: the direct
+    ``claude`` process can be reaped while a grandchild still holds the stdout/stderr
+    pipe (which is exactly what kept ``communicate`` blocked), so the group is
+    signalled REGARDLESS of the leader's returncode. ``ProcessLookupError`` is
+    suppressed for the case where no group member remains (the whole group is already
+    gone, or it exits between the cancellation and the signal).
 
     NOTE: this mirrors the executor's private ``_kill_and_reap``; it is duplicated
     rather than imported because ``caw.executor`` imports this adapter, so importing
@@ -82,9 +86,8 @@ async def _communicate_or_kill(
     try:
         return await process.communicate()
     except BaseException:
-        if process.returncode is None:
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(process.pid, signal.SIGKILL)
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
         await process.wait()
         raise
 
@@ -98,11 +101,14 @@ class ClaudePrintAdapter(Adapter):
         # allow-list — the child still receives EXACTLY invocation.env (no PATH leak).
         # A missing CLI surfaces the actionable setup error here, before any spawn.
         resolved_cli = _resolve_cli_path(_node_context(invocation))
-        # The prompt is positional; the node's `args` pass through verbatim —
-        # caw owns no policy engine, so it neither interprets nor injects
-        # sandbox/approval (or any) flags. exec (not shell): args are a list, so
-        # there is no shell interpolation of the prompt or the passthrough flags.
-        argv = [resolved_cli, "-p", invocation.prompt, *invocation.args]
+        # The prompt is the TRAILING positional, placed after a `--` end-of-options
+        # separator so a leading-dash prompt (e.g. "--help") can never be parsed by
+        # `claude` as a flag: every flag/arg goes BEFORE `--`, the prompt AFTER it.
+        # The node's `args` pass through verbatim — caw owns no policy engine, so it
+        # neither interprets nor injects sandbox/approval (or any) flags. exec (not
+        # shell): args are a list, so there is no shell interpolation of the prompt or
+        # the passthrough flags.
+        argv = [resolved_cli, "-p", *invocation.args]
         wants_structured = invocation.output_schema is not None
         if wants_structured:
             # An Output Contract is declared: ask the CLI for its single-object JSON
@@ -112,6 +118,9 @@ class ClaudePrintAdapter(Adapter):
             # invoke returns (ADR 0006) — the adapter never validates it itself.
             schema_text = self._read_schema(invocation)
             argv += ["--output-format", "json", "--json-schema", schema_text]
+        # The `--` separator and the prompt are ALWAYS appended last, so the prompt is
+        # the final token after every flag (passthrough and structured alike).
+        argv += ["--", invocation.prompt]
         # Env policy (ADR 0006, #5): pass EXACTLY the kernel's already-filtered
         # allow-list, never a merge of os.environ — that would leak the parent
         # environment. The consequence is intentional, not a bug: running real
@@ -170,20 +179,28 @@ class ClaudePrintAdapter(Adapter):
                 # The adapter asked for structured output (via --json-schema) but the
                 # wrapper carries NO `structured_output` key — the CLI produced none,
                 # so the adapter cannot produce a result (an AdapterError, consistent
-                # with the unparseable-when-required case above). Crucially we must
-                # distinguish an ABSENT key from an explicit JSON `null`: collapsing
-                # both to None via .get() would defeat the kernel's deliberate
-                # null-vs-absent distinction (the kernel's schema is the sole arbiter
-                # of whether a present null satisfies the Output Contract, ADR 0006).
+                # with the unparseable-when-required case above). An ABSENT key is
+                # distinguished from a present explicit JSON `null` here, but ONLY for
+                # the kernel's Output-Contract validation: an absent key means claude
+                # produced nothing, while a present null is a value claude produced.
+                # Note this distinction does NOT survive downstream — see the present-
+                # key branch below.
                 raise AdapterError(
                     f"{_node_context(invocation)}: 'claude -p --output-format json' "
                     "produced no 'structured_output' field but one was required by "
                     "the node's output_schema"
                 )
             else:
-                # The key is present: pass its value through AS-IS, including an
-                # explicit JSON null (-> Python None). The kernel re-validates it
-                # against the Output Contract (ADR 0006).
+                # The key is present (including an explicit JSON null -> Python None):
+                # pass its value through AS-IS. The kernel re-validates it against the
+                # Output Contract, where the schema is the sole arbiter of whether a
+                # present null satisfies the contract (ADR 0006). This null-vs-absent
+                # distinction holds for Output-Contract validation ONLY: downstream
+                # it is NOT preserved — executor.normalized_output omits
+                # structured_output when it is None, and predicate._evaluate_leaf
+                # treats an absent field as False, so in State and in `when`
+                # predicates a null is represented the same as an absent field. True
+                # end-to-end null-vs-absent round-tripping is tracked in issue #75.
                 structured_output = wrapper["structured_output"]
         return AgentResult(
             exit_status=exit_status,
