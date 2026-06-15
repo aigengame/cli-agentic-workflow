@@ -245,15 +245,33 @@ caw report <run-id> --format markdown
 Python >= 3.12, managed with [uv](https://docs.astral.sh/uv/):
 
 ```bash
-uv sync          # install
-uv run pytest    # tests
+uv sync                      # install
+uv run pytest                # full suite (includes the local-only e2e tier)
+uv run pytest -m "not e2e"   # non-e2e tier only (exactly what CI runs)
 uv run ruff check && uv run ruff format --check
 uv run mypy
 ```
 
 Tests exercise external behavior only, through three seams: the CLI itself, a
 fixture-replaying mock adapter (no tokens, no real CLIs), and the on-disk run directory.
-Real-CLI adapter tests skip automatically when `claude` or `codex` is not installed.
+
+### Two-tier test suite: non-e2e and e2e
+
+Most tests are **non-e2e** and run everywhere with no real Agent CLI. A small **e2e**
+tier (`tests/e2e/`, marked `e2e`) drives a real Agent CLI end to end — a real
+`claude -p` run flowing through `caw run` into the Output Contract and State.
+
+- **Local only, for now.** Cloud agent auth is not provisionable in GitHub Actions yet,
+  so CI runs `pytest -m "not e2e"` and the e2e tier is a local gate. It migrates into CI
+  once cloud auth is arranged ([#86](https://github.com/aigengame/cli-agentic-workflow/issues/86)).
+- **One selected agent.** `CAW_E2E_AGENT` chooses the agent (default `claude`; `codex`
+  lands with #11). Run the tier with `CAW_E2E_AGENT=claude uv run pytest -m e2e` against
+  an authenticated CLI.
+- **Fail, never skip.** When the selected agent's CLI is unavailable the e2e tests
+  **FAIL** — they never skip — so a missing or unauthenticated CLI is never silent green.
+- **Robust assertions.** e2e checks are contract/structure-based (exit status, Output
+  Contract validation, persisted State shape), never exact model text, and a transient
+  network/5xx/rate-limit failure gets a bounded retry while assertion failures never do.
 
 ## Contributing
 

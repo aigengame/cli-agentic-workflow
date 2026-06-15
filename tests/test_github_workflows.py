@@ -19,11 +19,14 @@ import caw
 REPO_ROOT = Path(__file__).resolve().parent.parent
 WORKFLOWS_DIR = REPO_ROOT / ".github" / "workflows"
 
+# CI runs the non-e2e tier only: agent e2e cannot run in GitHub Actions yet (cloud
+# agent auth is not provisionable there), so the pytest gate excludes the `e2e`
+# marker and the suite migrates into a CI gate once auth lands (#86).
 QUALITY_GATES = (
     "uv run ruff check .",
     "uv run ruff format --check .",
     "uv run mypy",
-    "uv run pytest",
+    'uv run pytest -m "not e2e"',
 )
 
 
@@ -83,6 +86,18 @@ class TestCiWorkflow:
         commands = run_commands_of(load_workflow("ci.yml"))
         for gate in QUALITY_GATES:
             assert any(gate in command for command in commands), f"missing gate: {gate}"
+
+    def test_pytest_gate_excludes_e2e_until_cloud_auth_lands(self) -> None:
+        # Agent e2e is a local gate for now (cloud agent auth is not provisionable in
+        # GitHub Actions), so CI's pytest command must exclude the `e2e` marker and
+        # never run a bare `uv run pytest` that would sweep e2e tests in (#86).
+        commands = run_commands_of(load_workflow("ci.yml"))
+        pytest_commands = [command for command in commands if "uv run pytest" in command]
+        assert pytest_commands, "CI must run pytest"
+        for command in pytest_commands:
+            assert '-m "not e2e"' in command, (
+                f"CI pytest must exclude e2e until auth lands, got: {command!r}"
+            )
 
 
 class TestReleaseWorkflowLayout:

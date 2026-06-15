@@ -13,10 +13,27 @@ uv sync --locked
 uv run ruff check .
 uv run ruff format --check .
 uv run mypy
-uv run pytest
+uv run pytest -m "not e2e"
 ```
 
 A red gate blocks the PR with a failed check.
+
+### Two-tier suite: why CI runs `-m "not e2e"`
+
+The test suite splits into two tiers (issue #86):
+
+- **non-e2e** — the default tier; needs no real Agent CLI. This is what CI runs.
+- **e2e** (`tests/e2e/`, marked `e2e`) — drives a real Agent CLI (`claude -p`, and
+  `codex exec` once #11 lands) end to end. The agent is selected by `CAW_E2E_AGENT`
+  (default `claude`), and the tests **FAIL — never skip** — when the selected CLI is
+  unavailable, so a missing/unauthenticated CLI is never silent green.
+
+CI runs only `pytest -m "not e2e"` because **cloud agent auth is not provisionable in
+GitHub Actions yet**, so agent e2e is a **local-only gate** for now: run it on a
+developer machine with an authenticated CLI via `CAW_E2E_AGENT=claude uv run pytest -m
+e2e`. Migrating the e2e tier into a CI gate is deferred until cloud auth is arranged
+(tracked in #86); when it lands, add an e2e job to `ci.yml` and update
+`tests/test_github_workflows.py` accordingly.
 
 ## Releasing
 
