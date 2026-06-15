@@ -22,8 +22,91 @@ audited.
 The product scope, architecture, and vocabulary are fully specified and frozen in
 [PRD #1](https://github.com/aigengame/cli-agentic-workflow/issues/1), with implementation
 broken into tracer-bullet issues ([#2–#17](https://github.com/aigengame/cli-agentic-workflow/issues)).
-The commands and examples below describe the specified v0.1 surface; they become runnable
-as those issues land.
+[Installation](#installation) and [Quickstart](#quickstart) cover what runs **today**; the
+[Example](#example), [CLI at a glance](#cli-at-a-glance), and [Built-in patterns](#built-in-patterns)
+sections describe the full specified v0.1 surface, which becomes runnable as those issues land.
+
+## Installation
+
+caw needs **Python ≥ 3.12** and [uv](https://docs.astral.sh/uv/). It is not on PyPI yet
+(planned — [#34](https://github.com/aigengame/cli-agentic-workflow/issues/34)), so install it
+from the repository.
+
+Install the CLI globally with uv:
+
+```bash
+uv tool install git+https://github.com/aigengame/cli-agentic-workflow
+caw --help
+```
+
+Or work from a clone (recommended if you want to develop or read the source):
+
+```bash
+git clone https://github.com/aigengame/cli-agentic-workflow.git
+cd cli-agentic-workflow
+uv sync
+uv run caw --help
+```
+
+Both give you the `caw` CLI — globally as `caw`, or as `uv run caw` inside a clone. The
+examples below use `caw`; prefix them with `uv run` when working from a clone.
+
+## Quickstart
+
+A workflow is a YAML file of nodes and the `needs` edges between them. This one runs two
+shell nodes in order — no agent CLI, no tokens, nothing to configure. Save it as
+`hello.yaml`:
+
+```yaml
+name: hello-caw
+version: 1
+nodes:
+  - id: greet
+    kind: shell
+    inputs:
+      command: echo "hello from caw"
+  - id: announce
+    kind: shell
+    needs: [greet]
+    inputs:
+      command: echo "ran after greet"
+```
+
+Validate it, inspect the plan, then run it:
+
+```bash
+caw validate hello.yaml   # workflow hello.yaml is valid (2 nodes)
+caw graph hello.yaml      # the planned DAG, printed before anything runs
+caw run hello.yaml        # node greet attempt 1 exited 0 ... run <run-id> succeeded
+```
+
+Every run is persisted under `.caw/runs/<run-id>/`: `state.sqlite` (node status, outputs,
+resume eligibility), `events.jsonl` (the append-only trace), and `workflow.normalized.json`
+(the exact graph that ran). Continue an interrupted or failed run — re-running only its
+incomplete nodes — with `caw resume <run-id>`.
+
+**Run an agent step offline.** Switch a node to `kind: agent` with the built-in `mock`
+adapter to exercise the agent path with no real CLI and no tokens: it replays a fixture file
+as the node's result (the same seam the test suite uses). Add to `nodes:`:
+
+```yaml
+  - id: summarize
+    kind: agent
+    needs: [greet]
+    inputs:
+      adapter: mock
+      prompt: "summarize the greeting"
+      fixture: summary.fixture.json
+```
+
+with `summary.fixture.json` next to the workflow file:
+
+```json
+{ "exit_status": 0, "stdout": "a one-line summary" }
+```
+
+`caw run hello.yaml` now runs the shell and agent nodes together. Swapping `adapter: mock`
+for a real adapter (e.g. `claude.print`) is the only change needed to drive a real agent CLI.
 
 ## Why caw
 
@@ -107,18 +190,22 @@ caw run review-and-fix.yaml --input task.md
 caw report <run-id> --format markdown
 ```
 
+> ℹ️ This example uses the full specified surface (`uses:`, top-level `inputs:`,
+> `caw run --input`, a `report` node) — not all of it runs yet. For a workflow that runs
+> **today**, see [Quickstart](#quickstart).
+
 ## CLI at a glance
 
-| Command | Purpose |
-| --- | --- |
-| `caw init` | Create a minimal starter workflow |
-| `caw validate <file>` | Check schema, references, adapters, and acyclicity without executing |
-| `caw graph <file>` | Render the planned DAG as text or JSON |
-| `caw run <file>` | Execute a workflow run |
-| `caw resume <run-id>` | Continue an interrupted, failed, or parked run |
-| `caw report <run-id>` | Render a report (markdown, json, jsonl, text) from persisted state |
-| `caw patterns list` | List built-in workflow patterns |
-| `caw patterns init <name>` | Scaffold a complete runnable example of a pattern |
+| Command | Purpose | Status |
+| --- | --- | --- |
+| `caw validate <file>` | Check schema, references, adapters, and acyclicity without executing | ✅ now |
+| `caw graph <file>` | Render the planned DAG as text or JSON | ✅ now |
+| `caw run <file>` | Execute a workflow run | ✅ now |
+| `caw resume <run-id>` | Continue an interrupted or failed run, re-running only incomplete nodes | ✅ now |
+| `caw init` | Create a minimal starter workflow | 🚧 planned |
+| `caw report <run-id>` | Render a report (markdown, json, jsonl, text) from persisted state | 🚧 planned |
+| `caw patterns list` | List built-in workflow patterns | 🚧 planned |
+| `caw patterns init <name>` | Scaffold a complete runnable example of a pattern | 🚧 planned |
 
 ## Built-in patterns
 
