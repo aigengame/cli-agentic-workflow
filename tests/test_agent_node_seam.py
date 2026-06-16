@@ -514,6 +514,46 @@ async def test_a_generic_adapter_exception_fails_the_node_not_the_run(tmp_path: 
 
 
 @pytest.mark.asyncio
+async def test_adapter_determined_failure_fails_the_node_even_on_a_zero_exit(
+    tmp_path: Path,
+) -> None:
+    # The adapter-determined-failure contract (#83): an Adapter that ran the agent
+    # but normalized its result as a FAILURE signals it with the first-class
+    # `AgentResult.adapter_failure` flag — NOT by manufacturing a non-zero
+    # exit_status. The kernel honors the flag ONCE: a result with adapter_failure
+    # set fails the Node even when the process's own exit_status is 0, so the
+    # scheduler skips the failed Node's dependents exactly as a non-zero exit does.
+    # The real exit_status is preserved in the trace (no fake exit code).
+    class AdapterFailureAdapter(Adapter):
+        async def invoke(self, invocation: AgentInvocation) -> AgentResult:
+            return AgentResult(
+                exit_status=0,
+                stdout="partial work",
+                stderr="claude reported an error (subtype: error_max_turns)",
+                adapter_failure=True,
+            )
+
+    registry = AdapterRegistry({"adapterfail": AdapterFailureAdapter()})
+    marker = tmp_path / "side.txt"
+    raw = agent_plus_independent_shell({"prompt": "p"}, marker)
+    raw["nodes"][0]["inputs"]["adapter"] = "adapterfail"
+    workflow = normalize_workflow(
+        raw, source="<test>", known_adapters=frozenset({"adapterfail"})
+    )
+
+    result = await execute_run(workflow, tmp_path / "runs", registry=registry)
+
+    assert not result.succeeded, "an adapter-determined failure fails the run"
+    agent_result = next(r for r in result.node_results if r.node_id == "agent")
+    assert agent_result.failure_kind is not None, "the node is failed, not succeeded"
+    assert agent_result.exit_status == 0, (
+        "the adapter's real exit_status is preserved — no manufactured non-zero code"
+    )
+    assert "error" in agent_result.stderr.lower(), "the failure cause rides on stderr"
+    assert marker.exists(), "the independent branch still completes"
+
+
+@pytest.mark.asyncio
 async def test_remote_ref_output_schema_fails_the_node_not_the_run(tmp_path: Path) -> None:
     # An output_schema with a remote `$ref` must fail the agent Node as a contract
     # error WITHOUT network resolution, never crash the Run; the independent branch

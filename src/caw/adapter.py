@@ -74,6 +74,18 @@ class AgentResult:
     (``None`` when the invocation produced none). ``artifacts`` lists durable
     files the invocation produced, for minimal indexing in State (#5); full
     artifact lifecycle is #16.
+
+    ``adapter_failure`` is the first-class, vendor-neutral signal that the Agent
+    CLI RAN but the Adapter normalized its result as a FAILURE — the canonical
+    case being Claude's ``is_error: true`` arriving with a zero process exit
+    (ADR 0006, #83). It is distinct from ``exit_status``: the Adapter keeps the
+    process's REAL exit status in ``exit_status`` (so the trace is honest) and
+    raises this flag, instead of manufacturing a fake non-zero exit through the
+    exit-code channel. The kernel honors it ONCE — a result that exited zero yet
+    carries ``adapter_failure`` is a failed Node — so every real Adapter
+    (claude #9, codex #11) signals an agent-determined failure the same way
+    rather than re-inventing the convention. A failed node carries no trustworthy
+    structured output, so the Adapter drops it and puts the cause on ``stderr``.
     """
 
     exit_status: int
@@ -81,6 +93,7 @@ class AgentResult:
     stderr: str = ""
     structured_output: object | None = None
     artifacts: tuple[Path, ...] = ()
+    adapter_failure: bool = False
 
 
 class Adapter(ABC):

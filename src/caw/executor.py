@@ -377,7 +377,18 @@ async def _execute_agent_node(node: Node, registry: AdapterRegistry) -> NodeResu
         )
     exit_status = result.exit_status
     stderr = result.stderr
-    if exit_status == 0 and inputs.output_schema is not None:
+    # The adapter-determined-failure contract (ADR 0006, #83): an Adapter that ran
+    # the agent but normalized its result as a FAILURE raises `adapter_failure`
+    # WITHOUT manufacturing a non-zero exit. The kernel honors it ONCE here — the
+    # single point that decides whether an agent result is a failed Node — so a
+    # zero-exit result carrying the flag fails exactly like a non-zero exit, while
+    # the adapter keeps the process's REAL exit_status (no fabricated exit code).
+    failed = exit_status != 0 or result.adapter_failure
+    # The Output Contract guards a SUCCESSFUL invocation's output (#63): a failed
+    # node — whether by a non-zero exit OR an adapter-determined failure — carries
+    # no trustworthy structured output, so the contract is not evaluated and cannot
+    # mask the agent's own failure cause with a contract message.
+    if not failed and inputs.output_schema is not None:
         try:
             # Run the Output Contract off the event loop: the validator's read +
             # parse + meta-schema-check + compile is synchronous blocking I/O (it
@@ -388,7 +399,13 @@ async def _execute_agent_node(node: Node, registry: AdapterRegistry) -> NodeResu
                 validate_output_contract, inputs.output_schema, result.structured_output
             )
         except OutputContractError as exc:
+            # A contract breach is a KERNEL-determined failure on a process that
+            # exited zero; there is no real non-zero process exit to preserve, so
+            # the kernel records exit_status 1 as the node's failure (the #63
+            # behavior), distinct from the adapter-determined case above where a
+            # real exit_status is kept and `adapter_failure` carries the signal.
             exit_status = 1
+            failed = True
             stderr = f"{stderr}\n{exc}".strip() if stderr else str(exc)
     return NodeResult(
         node_id=node.id,
@@ -399,7 +416,7 @@ async def _execute_agent_node(node: Node, registry: AdapterRegistry) -> NodeResu
         finished_at=_now(),
         structured_output=result.structured_output,
         artifacts=_existing_artifacts(result.artifacts),
-        failure_kind=None if exit_status == 0 else FAILED,
+        failure_kind=FAILED if failed else None,
         adapter=inputs.adapter,
     )
 
