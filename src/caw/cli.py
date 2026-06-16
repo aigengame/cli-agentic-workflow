@@ -55,7 +55,7 @@ from caw.model import Node, Predicate, Workflow, execution_order, normalize_work
 from caw.patterns import expander_names, get_expander
 from caw.report import GroupReportError, ReportFormat, render_group_report, render_report
 from caw.runlayout import run_dir, runs_root
-from caw.scaffold import PATTERN_EXAMPLES, STARTER_WORKFLOW
+from caw.scaffold import LOOP_EXAMPLE, PATTERN_EXAMPLES, STARTER_WORKFLOW, PatternExample
 
 app = typer.Typer(
     name="caw",
@@ -165,20 +165,37 @@ def patterns_init(
         known = ", ".join(sorted(PATTERN_EXAMPLES)) or "<none>"
         typer.echo(f"error: unknown pattern {name!r} (known: {known})", err=True)
         raise typer.Exit(code=2)
+    workflow_path = _write_example_bundle(example, path, label=f"the {name} bundle")
+    typer.echo(
+        f"created {name} pattern example at {workflow_path} "
+        f"(run it with `caw run {workflow_path}`)"
+    )
+
+
+def _write_example_bundle(example: PatternExample, path: Path | None, *, label: str) -> Path:
+    """Write a complete scaffold bundle all-or-nothing, returning the primary file path.
+
+    Shared by ``caw patterns init`` and ``caw loop init`` (#15): the primary file is
+    written under the chosen ``path`` (default: the example's filename) and each
+    companion beside it in the same directory. The whole bundle is guarded before a
+    single file is written, so an existing file is never clobbered and a chosen path
+    that collides with a companion is refused — never leaving a partial scaffold.
+    ``label`` names the bundle in the collision message.
+    """
     workflow_path = path if path is not None else Path(example.workflow_filename)
     directory = workflow_path.parent
-    # Map every bundle file to its destination: the workflow under the chosen path,
-    # each companion fixture beside it in the same directory.
+    # Map every bundle file to its destination: the primary under the chosen path,
+    # each companion beside it in the same directory.
     targets = {
         filename: (
             workflow_path if filename == example.workflow_filename else directory / filename
         )
         for filename in example.files
     }
-    # Guard the WHOLE bundle before writing a single file. First: a chosen workflow
-    # path whose name collides with a companion fixture maps two bundle files to ONE
-    # destination — the write loop would overwrite the workflow with fixture JSON yet
-    # still report success, leaving a non-runnable "workflow". Reject the collision.
+    # Guard the WHOLE bundle before writing a single file. First: a chosen path whose
+    # name collides with a companion maps two bundle files to ONE destination — the
+    # write loop would overwrite the primary with companion content yet still report
+    # success, leaving a non-runnable bundle. Reject the collision.
     by_destination: dict[Path, str] = {}
     for filename, target in targets.items():
         resolved = target.resolve()
@@ -186,7 +203,7 @@ def patterns_init(
         if collides_with is not None:
             typer.echo(
                 f"error: {target} is the destination of both {collides_with!r} and "
-                f"{filename!r} in the {name} bundle; choose a workflow path whose name "
+                f"{filename!r} in {label}; choose a path whose name "
                 f"does not collide with a companion file",
                 err=True,
             )
@@ -204,10 +221,7 @@ def patterns_init(
         except OSError as exc:
             typer.echo(f"error: cannot write {target}: {exc}", err=True)
             raise typer.Exit(code=2) from exc
-    typer.echo(
-        f"created {name} pattern example at {workflow_path} "
-        f"(run it with `caw run {workflow_path}`)"
-    )
+    return workflow_path
 
 
 @app.command()
@@ -541,3 +555,23 @@ def loop_report(
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=2) from exc
     typer.echo(rendered)
+
+
+@loop_app.command("init")
+def loop_init(
+    path: Annotated[
+        Path | None,
+        typer.Argument(help="Where to write the controller spec (defaults to loop.yaml)."),
+    ] = None,
+) -> None:
+    """Scaffold a complete, runnable loop-until-done example (spec + workflow + fixtures).
+
+    Writes the controller spec plus its iteration workflow and fixture companions
+    beside it, so the bundle drives a loop to done offline with the mock Adapter as
+    written — run it with ``caw loop run loop.yaml``. The whole bundle is written
+    all-or-nothing, never clobbering an existing file.
+    """
+    spec_path = _write_example_bundle(LOOP_EXAMPLE, path, label="the loop-until-done bundle")
+    typer.echo(
+        f"created loop-until-done example at {spec_path} (run it with `caw loop run {spec_path}`)"
+    )
