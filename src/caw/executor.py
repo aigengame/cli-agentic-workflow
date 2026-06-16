@@ -328,20 +328,25 @@ def _existing_artifacts(artifacts: tuple[Path, ...]) -> tuple[Path, ...]:
 async def _execute_agent_node(node: Node, registry: AdapterRegistry) -> NodeResult:
     """Run an agent Node through its Adapter and validate its Output Contract.
 
-    Adapter or Output-Contract failures are recorded as an ordinary node failure
-    (exit_status 1) with the cause on stderr, so the #4 scheduler skips the
-    failed Node's dependents exactly as it does for a non-zero shell Node. The
-    Output Contract is validated AFTER the Adapter returns and BEFORE the result
-    is reported, so a contract breach fails the Node even when the Agent CLI
-    itself exited zero.
+    A node fails when the Agent CLI exited non-zero, when the Adapter signals an
+    adapter-determined failure (``AgentResult.adapter_failure``, the first-class
+    signal a zero-exit result is a FAILURE — e.g. Claude's ``is_error``, ADR 0006,
+    #83), or when the Output Contract is breached. Each is recorded as an ordinary
+    node failure with the cause on stderr so the #4 scheduler skips the failed
+    Node's dependents exactly as it does for a non-zero shell Node. A contract
+    breach has no real non-zero process exit to preserve, so the kernel records
+    ``exit_status 1`` for it; the adapter-determined case keeps the process's REAL
+    ``exit_status`` and carries the failure on the flag. The Output Contract is
+    validated AFTER the Adapter returns and BEFORE the result is reported.
 
-    Exit-status gating (#63): the Output Contract is evaluated ONLY when the Agent
-    CLI exited zero. The contract is a guarantee about a successful invocation's
-    structured output; a non-zero exit is already a node failure, so re-checking
-    the contract would be redundant and could mask the agent's own failure cause
-    with a contract message. The structured output is validated as-is, including
-    JSON null — a schema permitting null passes, one requiring content fails — so
-    the schema is the sole arbiter and None is never special-cased.
+    Success gating (#63): the Output Contract is evaluated ONLY when the invocation
+    SUCCEEDED — the Agent CLI exited zero AND ``adapter_failure`` is not set. The
+    contract is a guarantee about a successful invocation's structured output; any
+    failure is already a node failure, so re-checking the contract would be
+    redundant and could mask the agent's own failure cause with a contract message.
+    The structured output is validated as-is, including JSON null — a schema
+    permitting null passes, one requiring content fails — so the schema is the sole
+    arbiter and None is never special-cased.
     """
     assert isinstance(node.inputs, AgentNodeInputs)
     inputs = node.inputs
