@@ -142,23 +142,30 @@ class ControllerError(Exception):
     """
 
 
-def load_controller_spec(spec_file: Path) -> ControllerSpec:
-    """Load and validate a controller spec file, folding failures into a one-liner.
+def load_spec_file[SpecT: BaseModel](spec_file: Path, spec_class: type[SpecT]) -> SpecT:
+    """Load and validate a controller spec file into ``spec_class``, folding failures.
 
-    ``workflow`` is anchored to the SPEC file's directory so the same spec resolves
-    its iteration workflow identically from any cwd (mirroring how agent-Node paths
-    anchor to the workflow file's directory, #64).
+    Shared by every Controller's ``caw <controller> run`` (#15, #17): ``workflow`` is
+    anchored to the SPEC file's directory so the same spec resolves its iteration
+    workflow identically from any cwd (mirroring how agent-Node paths anchor to the
+    workflow file's directory, #64), and any validation failure is folded into a
+    single ``error:``-line ``WorkflowConfigError`` for the CLI's one-line contract.
     """
     raw = load_workflow_file(spec_file)
     workflow_value = raw.get("workflow")
     if isinstance(workflow_value, str) and not Path(workflow_value).is_absolute():
         raw = {**raw, "workflow": str(spec_file.resolve().parent / workflow_value)}
     try:
-        return ControllerSpec.model_validate(raw)
+        return spec_class.model_validate(raw)
     except Exception as exc:  # noqa: BLE001 — fold any validation failure to one line
         raise WorkflowConfigError(
             f"invalid controller spec in {spec_file}: {_first_line(exc)}"
         ) from exc
+
+
+def load_controller_spec(spec_file: Path) -> ControllerSpec:
+    """Load and validate a ``loop_until_done`` controller spec file (#15)."""
+    return load_spec_file(spec_file, ControllerSpec)
 
 
 def _first_line(exc: Exception) -> str:
@@ -227,8 +234,8 @@ def _materialize_iteration_raw(
     found: set[str] = set()
     for node in nodes:
         node_id = node.get("id") if isinstance(node, dict) else None
-        applicable = by_node.get(node_id) if node_id is not None else None
-        if isinstance(node, dict) and applicable:
+        applicable = by_node.get(node_id) if isinstance(node_id, str) else None
+        if isinstance(node, dict) and isinstance(node_id, str) and applicable:
             found.add(node_id)
             inputs = dict(node.get("inputs", {}))
             for substitution in applicable:
@@ -628,9 +635,7 @@ async def _drive_adversarial(
             round_raw, source=f"{spec.workflow} (round {index})", base_dir=base_dir
         )
         if not any(node.id == spec.verify_node for node in workflow.nodes):
-            raise ControllerError(
-                f"verify_node {spec.verify_node!r} is not in the round workflow"
-            )
+            raise ControllerError(f"verify_node {spec.verify_node!r} is not in the round workflow")
         result = await execute_run(workflow, iterations_root, resolved_registry)
         run_dir = iterations_root / result.run_id
         _record_membership(run_dir, result.run_id, group_id, index)
@@ -656,9 +661,7 @@ async def _drive_adversarial(
     return GroupResult(group_id=group_id, status=GROUP_REJECTED, iterations=tuple(completed))
 
 
-def _verification_verdict(
-    spec: AdversarialSpec, run_dir: Path, result: RunResult
-) -> str | None:
+def _verification_verdict(spec: AdversarialSpec, run_dir: Path, result: RunResult) -> str | None:
     """The terminal status if the verification should stop after this round, else None.
 
     Stops on a failed Run, or on the accept Predicate holding over the verify-node's
@@ -743,9 +746,7 @@ async def resume_adversarial_verification(
             verdict = _verification_verdict(spec, last_run_dir, resumed)
             if verdict is not None:
                 _persist_adversarial_state(spec, base, group_id, tuple(completed), verdict)
-                return GroupResult(
-                    group_id=group_id, status=verdict, iterations=tuple(completed)
-                )
+                return GroupResult(group_id=group_id, status=verdict, iterations=tuple(completed))
 
     feedback_value: object | None = None
     if completed:
@@ -884,7 +885,9 @@ async def _drive_tournament(
         if not result.succeeded:
             # A failed round has no winner to promote forward: stop the tournament.
             winners.append(None)
-            _persist_tournament_state(spec, base, group_id, tuple(completed), tuple(winners), GROUP_FAILED)
+            _persist_tournament_state(
+                spec, base, group_id, tuple(completed), tuple(winners), GROUP_FAILED
+            )
             return GroupResult(group_id=group_id, status=GROUP_FAILED, iterations=tuple(completed))
 
         last_winner = _round_winner(spec, run_dir, result.run_id)
@@ -913,7 +916,9 @@ def _round_substitutions(
     substitutions: list[_Substitution] = []
     if spec.promote is not None and winner is not None:
         substitutions.append(
-            _Substitution(to_node=spec.promote.to_node, to_field=spec.promote.to_field, value=winner)
+            _Substitution(
+                to_node=spec.promote.to_node, to_field=spec.promote.to_field, value=winner
+            )
         )
     substitutions.extend(_feedback_substitution(spec.feedback, feedback_value))
     return tuple(substitutions)
@@ -963,9 +968,7 @@ def _persist_tournament_state(
         for position, it in enumerate(iterations)
         if position < len(winners)
     }
-    final_winner = next(
-        (winner for winner in reversed(winners) if winner is not None), None
-    )
+    final_winner = next((winner for winner in reversed(winners) if winner is not None), None)
     _write_group_state(
         base,
         group_id,

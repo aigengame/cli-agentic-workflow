@@ -25,8 +25,8 @@ from caw.controller import (
     TournamentSpec,
     run_tournament,
 )
-from caw.runlayout import group_iterations_root, group_state_path
 from caw.report import ReportFormat, render_group_report
+from caw.runlayout import group_iterations_root, group_state_path
 from caw.state import StateStore
 
 # ----------------------------------------------------------------------------------

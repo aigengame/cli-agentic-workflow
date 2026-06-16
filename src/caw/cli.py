@@ -27,6 +27,7 @@ id, State, and Events trace.
 import asyncio
 import json
 import sqlite3
+from collections.abc import Coroutine
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Any
@@ -35,11 +36,18 @@ import typer
 
 from caw.config import WorkflowConfigError, load_workflow_file
 from caw.controller import (
+    AdversarialSpec,
     ControllerError,
     GroupResult,
+    TournamentSpec,
     load_controller_spec,
+    load_spec_file,
+    resume_adversarial_verification,
     resume_loop_until_done,
+    resume_tournament,
+    run_adversarial_verification,
     run_loop_until_done,
+    run_tournament,
 )
 from caw.executor import (
     SKIP_ALL_BRANCHES_SKIPPED,
@@ -56,9 +64,11 @@ from caw.patterns import expander_names, get_expander
 from caw.report import GroupReportError, ReportFormat, render_group_report, render_report
 from caw.runlayout import run_dir, runs_root
 from caw.scaffold import (
+    ADVERSARIAL_EXAMPLE,
     LOOP_EXAMPLE,
     PATTERN_EXAMPLES,
     STARTER_WORKFLOW,
+    TOURNAMENT_EXAMPLE,
     PatternExample,
 )
 
@@ -475,10 +485,13 @@ app.add_typer(loop_app)
 def _report_group_and_exit(result: GroupResult) -> None:
     """Print a Run Group's outcome and exit on its stop reason (ADR 0009).
 
-    Mirrors the single-run exit contract: the loop reaching ``done`` or stopping at
-    ``exhausted`` (max iterations) is a successful drive (exit 0); a constituent Run
-    that ``failed`` exits 1, matching ``caw run``'s failed-Run contract. Each
-    iteration's run id is named so a user can drill into one with ``caw report``.
+    Shared by every Pattern Controller surface (``caw loop`` / ``caw verify`` /
+    ``caw tournament``). Mirrors the single-run exit contract: any non-``failed``
+    terminal status (``done`` / ``exhausted`` / ``accepted`` / ``rejected`` /
+    ``complete``) is a successful drive (exit 0); a constituent Run that ``failed``
+    exits 1, matching ``caw run``'s failed-Run contract. Each iteration's run id is
+    named so a user can drill into one with ``caw report``; the tournament's final
+    winner is named when present.
     """
     typer.echo(
         f"Run Group {result.group_id}: {result.status} ({len(result.iterations)} iterations)"
@@ -486,6 +499,8 @@ def _report_group_and_exit(result: GroupResult) -> None:
     for iteration in result.iterations:
         outcome = "succeeded" if iteration.succeeded else "failed"
         typer.echo(f"  iteration {iteration.iteration_index} ({iteration.run_id}): {outcome}")
+    if result.winner is not None:
+        typer.echo(f"winner: {result.winner}")
     if result.status == "failed":
         raise typer.Exit(code=1)
 
@@ -554,6 +569,17 @@ def loop_report(
     Aggregates every iteration into one result (AC6), never re-executing. An unknown
     group id is refused as a config-class error (exit 2) with one ``error:`` line.
     """
+    _report_group(group_id, format)
+
+
+def _report_group(group_id: str, format: ReportFormat) -> None:
+    """Render a Run Group's aggregate report, shared by every Controller surface (#15, #17).
+
+    A Run Group is reported with the SAME aggregate renderer regardless of which
+    Controller produced it (loop / verify / tournament), since every Controller
+    persists the same ``group.json`` + per-iteration run layout. An unknown group id
+    is a config-class refusal (exit 2) with one ``error:`` line.
+    """
     try:
         rendered = render_group_report(group_id, Path.cwd(), format)
     except GroupReportError as exc:
@@ -579,4 +605,172 @@ def loop_init(
     spec_path = _write_example_bundle(LOOP_EXAMPLE, path, label="the loop-until-done bundle")
     typer.echo(
         f"created loop-until-done example at {spec_path} (run it with `caw loop run {spec_path}`)"
+    )
+
+
+def _drive_group_and_exit(coro: "Coroutine[Any, Any, GroupResult]") -> None:
+    """Run a Controller coroutine to a GroupResult, mapping failures to the exit contract.
+
+    Shared by every Controller's ``run``/``resume`` (#15, #17): a ControllerError or a
+    config-class WorkflowConfigError (a bad spec / an iteration workflow that fails to
+    normalize / an unknown-or-finished group) is exit 2 with one ``error:`` line; an
+    infrastructure failure is exit 3; otherwise the group's outcome is reported and the
+    success/failure exit contract applied by :func:`_report_group_and_exit`.
+    """
+    try:
+        result = asyncio.run(coro)
+    except (ControllerError, WorkflowConfigError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    except (OSError, sqlite3.Error) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=3) from exc
+    _report_group_and_exit(result)
+
+
+verify_app = typer.Typer(
+    name="verify",
+    help="Run, resume, and report an adversarial-verification Run Group (a Pattern Controller).",
+    no_args_is_help=True,
+)
+app.add_typer(verify_app)
+
+
+@verify_app.command("run")
+def verify_run(spec_file: Path) -> None:
+    """Run an adversarial-verification Run Group from a controller spec file (#17).
+
+    Materializes each verification round as a separate immutable Run, feeding the
+    verifier's feedback forward, until the accept Predicate holds (``accepted``), a
+    round fails, or ``max_rounds`` is reached (``rejected``). Exit codes mirror
+    ``caw run``: 0 (accepted / rejected), 1 (a constituent Run failed), 2 (an invalid
+    spec), 3 (infra).
+    """
+    try:
+        spec = load_spec_file(spec_file, AdversarialSpec)
+    except WorkflowConfigError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    _drive_group_and_exit(run_adversarial_verification(spec, base=Path.cwd()))
+
+
+@verify_app.command("resume")
+def verify_resume(group_id: str) -> None:
+    """Resume an interrupted adversarial-verification Run Group (#17).
+
+    The Run Group is the resumption unit (ADR 0002): a succeeded round is never
+    re-run. An unknown or already-finished group is refused as a config-class error
+    (exit 2). Otherwise the exit contract mirrors ``caw verify run``.
+    """
+    _drive_group_and_exit(resume_adversarial_verification(group_id, base=Path.cwd()))
+
+
+@verify_app.command("report")
+def verify_report(
+    group_id: str,
+    format: Annotated[
+        ReportFormat,
+        typer.Option(help="Render the aggregate report as JSON, JSONL, text, or markdown."),
+    ] = ReportFormat.json,
+) -> None:
+    """Render an aggregate report of an adversarial-verification Run Group (#17).
+
+    Aggregates every round into one result, never re-executing. An unknown group id is
+    refused as a config-class error (exit 2) with one ``error:`` line.
+    """
+    _report_group(group_id, format)
+
+
+@verify_app.command("init")
+def verify_init(
+    path: Annotated[
+        Path | None,
+        typer.Argument(help="Where to write the controller spec (defaults to verify.yaml)."),
+    ] = None,
+) -> None:
+    """Scaffold a complete, runnable adversarial-verification example (#17).
+
+    Writes the controller spec plus its round workflow and fixture companions beside
+    it, so the bundle drives a verification to accepted offline with the mock Adapter —
+    run it with ``caw verify run verify.yaml``. Written all-or-nothing.
+    """
+    spec_path = _write_example_bundle(
+        ADVERSARIAL_EXAMPLE, path, label="the adversarial-verification bundle"
+    )
+    typer.echo(
+        f"created adversarial-verification example at {spec_path} "
+        f"(run it with `caw verify run {spec_path}`)"
+    )
+
+
+tournament_app = typer.Typer(
+    name="tournament",
+    help="Run, resume, and report a tournament Run Group (a Pattern Controller).",
+    no_args_is_help=True,
+)
+app.add_typer(tournament_app)
+
+
+@tournament_app.command("run")
+def tournament_run(spec_file: Path) -> None:
+    """Run a tournament Run Group from a controller spec file (#17).
+
+    Materializes each round as a separate immutable Run, promoting the round's winner
+    into the next round, until every round has run (``complete``) or a round fails
+    (``failed``). The final winner is named. Exit codes mirror ``caw run``: 0
+    (complete), 1 (a constituent Run failed), 2 (an invalid spec), 3 (infra).
+    """
+    try:
+        spec = load_spec_file(spec_file, TournamentSpec)
+    except WorkflowConfigError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    _drive_group_and_exit(run_tournament(spec, base=Path.cwd()))
+
+
+@tournament_app.command("resume")
+def tournament_resume(group_id: str) -> None:
+    """Resume an interrupted tournament Run Group (#17).
+
+    The Run Group is the resumption unit (ADR 0002): a succeeded round is never re-run.
+    An unknown or already-finished group is refused as a config-class error (exit 2).
+    Otherwise the exit contract mirrors ``caw tournament run``.
+    """
+    _drive_group_and_exit(resume_tournament(group_id, base=Path.cwd()))
+
+
+@tournament_app.command("report")
+def tournament_report(
+    group_id: str,
+    format: Annotated[
+        ReportFormat,
+        typer.Option(help="Render the aggregate report as JSON, JSONL, text, or markdown."),
+    ] = ReportFormat.json,
+) -> None:
+    """Render an aggregate report of a tournament Run Group, with comparison evidence (#17).
+
+    Aggregates every round into one result — each round's compare-node output (the
+    winner and the comparison scores) is the comparison evidence — never re-executing.
+    An unknown group id is refused as a config-class error (exit 2) with one
+    ``error:`` line.
+    """
+    _report_group(group_id, format)
+
+
+@tournament_app.command("init")
+def tournament_init(
+    path: Annotated[
+        Path | None,
+        typer.Argument(help="Where to write the controller spec (defaults to tournament.yaml)."),
+    ] = None,
+) -> None:
+    """Scaffold a complete, runnable tournament example (#17).
+
+    Writes the controller spec plus its round workflow and fixture companions beside
+    it, so the bundle runs a tournament to completion offline with the mock Adapter —
+    run it with ``caw tournament run tournament.yaml``. Written all-or-nothing.
+    """
+    spec_path = _write_example_bundle(TOURNAMENT_EXAMPLE, path, label="the tournament bundle")
+    typer.echo(
+        f"created tournament example at {spec_path} (run it with `caw tournament run {spec_path}`)"
     )

@@ -122,7 +122,9 @@ async def test_verification_stops_when_a_round_accepts(tmp_path: Path) -> None:
     # AC1: round 1 rejects and points to round2.fixture.json; the Controller feeds
     # that forward; round 2 reads it and accepts, so the loop stops `accepted` —
     # each round a separate immutable Run in the same Run Group.
-    _write_fixture(tmp_path / "round1.fixture.json", accept=False, next_fixture="round2.fixture.json")
+    _write_fixture(
+        tmp_path / "round1.fixture.json", accept=False, next_fixture="round2.fixture.json"
+    )
     _write_fixture(tmp_path / "round2.fixture.json", accept=True)
     workflow = _write_workflow(tmp_path, "round1.fixture.json")
     spec = _spec(workflow, max_rounds=5)
@@ -170,7 +172,9 @@ async def test_verification_stops_on_a_failed_round(tmp_path: Path) -> None:
 async def test_each_round_records_its_group_membership(tmp_path: Path) -> None:
     # AC3-parity: each round's Run records the run group id and round index in its
     # own State; the controller state is persisted in group.json.
-    _write_fixture(tmp_path / "round1.fixture.json", accept=False, next_fixture="round2.fixture.json")
+    _write_fixture(
+        tmp_path / "round1.fixture.json", accept=False, next_fixture="round2.fixture.json"
+    )
     _write_fixture(tmp_path / "round2.fixture.json", accept=True)
     workflow = _write_workflow(tmp_path, "round1.fixture.json")
     spec = _spec(workflow, max_rounds=5)
@@ -196,7 +200,9 @@ async def test_verifier_feedback_is_substituted_into_the_next_round(tmp_path: Pa
     # AC1: the verifier's feedback from round N reaches round N+1's generator. The
     # second round's FROZEN snapshot must show the substituted fixture path —
     # proving the rejection's feedback reached the materialized regeneration Run.
-    _write_fixture(tmp_path / "round1.fixture.json", accept=False, next_fixture="round2.fixture.json")
+    _write_fixture(
+        tmp_path / "round1.fixture.json", accept=False, next_fixture="round2.fixture.json"
+    )
     _write_fixture(tmp_path / "round2.fixture.json", accept=True)
     workflow = _write_workflow(tmp_path, "round1.fixture.json")
     spec = _spec(workflow, max_rounds=5)
