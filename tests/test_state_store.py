@@ -94,9 +94,7 @@ def test_run_group_membership_is_recorded_and_read_back(tmp_path: Path) -> None:
             definition_checksum="sha256:abc",
             created_at="2026-06-16T00:00:00+00:00",
         )
-        state.record_run_group_membership(
-            run_id="run-1", run_group_id="grp-1", iteration_index=2
-        )
+        state.record_run_group_membership(run_id="run-1", run_group_id="grp-1", iteration_index=2)
 
     with StateStore(db_path) as reopened:
         assert reopened.run_group_membership("run-1") == ("grp-1", 2)
