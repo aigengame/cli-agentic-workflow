@@ -55,7 +55,13 @@ from caw.model import Node, Predicate, Workflow, execution_order, normalize_work
 from caw.patterns import expander_names, get_expander
 from caw.report import GroupReportError, ReportFormat, render_group_report, render_report
 from caw.runlayout import run_dir, runs_root
-from caw.scaffold import LOOP_EXAMPLE, PATTERN_EXAMPLES, STARTER_WORKFLOW, PatternExample
+from caw.scaffold import (
+    FANOUT_EXAMPLE,
+    LOOP_EXAMPLE,
+    PATTERN_EXAMPLES,
+    STARTER_WORKFLOW,
+    PatternExample,
+)
 
 app = typer.Typer(
     name="caw",
@@ -574,4 +580,38 @@ def loop_init(
     spec_path = _write_example_bundle(LOOP_EXAMPLE, path, label="the loop-until-done bundle")
     typer.echo(
         f"created loop-until-done example at {spec_path} (run it with `caw loop run {spec_path}`)"
+    )
+
+
+fanout_app = typer.Typer(
+    name="fanout",
+    help="Scaffold the fan-out-synthesis end-to-end sample.",
+    no_args_is_help=True,
+)
+app.add_typer(fanout_app)
+
+
+@fanout_app.command("init")
+def fanout_init(
+    path: Annotated[
+        Path | None,
+        typer.Argument(help="Where to write the sample workflow (defaults to fanout.yaml)."),
+    ] = None,
+) -> None:
+    """Scaffold the fan-out-synthesis sample (a `parallel` workflow + branch fixtures).
+
+    Writes the workflow plus its two branch fixtures and the synthesis fixture beside
+    it, so the bundle fans the same task out to two agent branches and joins them in a
+    synthesis node — running to success offline with the mock Adapter as written. Run
+    it with ``caw run fanout.yaml``; the reference sample fans the same task to
+    ``claude.print`` and ``codex.exec`` (swap each branch's ``adapter`` and ``fixture``
+    for a real adapter). The whole bundle is written all-or-nothing, never clobbering
+    an existing file.
+    """
+    workflow_path = _write_example_bundle(
+        FANOUT_EXAMPLE, path, label="the fan-out-synthesis bundle"
+    )
+    typer.echo(
+        f"created fan-out-synthesis sample at {workflow_path} "
+        f"(run it with `caw run {workflow_path}`)"
     )
