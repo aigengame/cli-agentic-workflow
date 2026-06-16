@@ -152,7 +152,16 @@ class ClaudePrintAdapter(Adapter):
         # shell-node decode.
         stdout = stdout_bytes.decode("utf-8", errors="backslashreplace")
         stderr = stderr_bytes.decode("utf-8", errors="backslashreplace")
-        exit_status = process.returncode if process.returncode is not None else -1
+        # `communicate()` (in `_communicate_or_kill`) always settles the returncode,
+        # so it is a concrete int here — never None. We pass it through AS-IS,
+        # including a NEGATIVE returncode from a signal-kill (e.g. -9 for SIGKILL):
+        # the old `else -1` fallback was both dead (returncode is never None after
+        # communicate) AND a sentinel collision — `-1` is the executor's TIMED_OUT
+        # sentinel, so coercing to it would make a signal-kill indistinguishable
+        # from a timeout in the trace (#84). The timeout path is the executor's, with
+        # its own TIMED_OUT classification; the adapter never manufactures that here.
+        assert process.returncode is not None, "communicate() settles the returncode"
+        exit_status = process.returncode
         # Parse the result wrapper only on a successful, structured-requested run:
         # a non-zero exit is already a node failure (ADR 0006), so unparseable
         # stdout from a failed process is moot and must NOT mask the real exit.

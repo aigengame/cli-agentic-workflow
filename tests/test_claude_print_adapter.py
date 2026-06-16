@@ -157,6 +157,28 @@ async def test_non_zero_exit_is_an_ordinary_result_not_an_error(
 
 
 @pytest.mark.asyncio
+async def test_signal_killed_process_reports_its_real_negative_returncode_not_the_timeout_sentinel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #84 sentinel collision: a `claude` killed by a signal exits with a NEGATIVE
+    # returncode (e.g. -9 for SIGKILL). The adapter must report that REAL returncode,
+    # never collapse it to -1 — which is the executor's TIMED_OUT sentinel — so a
+    # signal-kill stays distinguishable from a timeout in the trace (the timeout path
+    # is the executor's, with failure_kind TIMED_OUT). `communicate()` always settles
+    # returncode, so a `None` fallback is unreachable and removed.
+    patch_which(monkeypatch)
+    patch_spawn(monkeypatch, FakeProcess(-9, stdout=b"", stderr=b"Killed"))
+    adapter = ClaudePrintAdapter()
+
+    result = await adapter.invoke(
+        AgentInvocation(node_id="n", adapter="claude.print", prompt="do it")
+    )
+
+    assert result.exit_status == -9, "the real signal-kill returncode is preserved"
+    assert result.exit_status != -1, "it never collides with the TIMED_OUT sentinel"
+
+
+@pytest.mark.asyncio
 async def test_invalid_utf8_bytes_decode_recoverably_not_with_replacement_chars(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
