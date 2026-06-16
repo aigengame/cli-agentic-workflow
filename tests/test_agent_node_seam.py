@@ -552,6 +552,51 @@ async def test_adapter_determined_failure_fails_the_node_even_on_a_zero_exit(
 
 
 @pytest.mark.asyncio
+async def test_mock_fixture_adapter_failure_fails_the_node_preserving_zero_exit(
+    tmp_path: Path,
+) -> None:
+    # The OFFLINE mock Adapter honors the first-class `adapter_failure` fixture field
+    # (#83): a zero-exit fixture that sets `adapter_failure: true` models Claude's
+    # is_error / zero-exit path offline, so the node FAILS while its real exit_status
+    # (0) is preserved. Without this, a fixture-driven Workflow or Pattern example
+    # would replay an adapter-determined failure as a spurious SUCCESS — the gap this
+    # closes. (The sibling test above proves the kernel honors the flag; this proves
+    # the built-in mock Adapter actually emits it from a fixture.)
+    fixture = write_fixture(
+        tmp_path / "fixture.json",
+        exit_status=0,
+        stdout="partial work",
+        stderr="claude reported an error (subtype: error_max_turns)",
+        adapter_failure=True,
+    )
+    workflow = agent_workflow(fixture)
+
+    result = await execute_run(workflow, tmp_path / "runs")
+
+    assert not result.succeeded, "a fixture's adapter_failure fails the run"
+    (agent_result,) = result.node_results
+    assert agent_result.failure_kind is not None, "the node is failed, not succeeded"
+    assert agent_result.exit_status == 0, "the fixture's real zero exit_status is preserved"
+
+
+@pytest.mark.asyncio
+async def test_mock_fixture_non_boolean_adapter_failure_is_a_config_error(
+    tmp_path: Path,
+) -> None:
+    # A non-boolean `adapter_failure` in a fixture is a fixture-authoring error,
+    # surfaced as an AdapterError that fails the node (like a malformed exit_status),
+    # never a silent truthy coercion of a string into a failure.
+    fixture = write_fixture(tmp_path / "fixture.json", exit_status=0, adapter_failure="yes")
+    workflow = agent_workflow(fixture)
+
+    result = await execute_run(workflow, tmp_path / "runs")
+
+    assert not result.succeeded
+    (agent_result,) = result.node_results
+    assert "adapter_failure" in agent_result.stderr and "boolean" in agent_result.stderr
+
+
+@pytest.mark.asyncio
 async def test_remote_ref_output_schema_fails_the_node_not_the_run(tmp_path: Path) -> None:
     # An output_schema with a remote `$ref` must fail the agent Node as a contract
     # error WITHOUT network resolution, never crash the Run; the independent branch

@@ -109,9 +109,12 @@ class MockAdapter(Adapter):
 
     The fixture is the canned normalized result for an agent Node, located by the
     node's ``fixture`` path. It is a JSON object with an ``exit_status`` and
-    optional ``stdout``, ``stderr``, ``structured_output``, and ``artifacts``
-    (a list of file paths). This lets whole Workflows and Patterns run with no
-    real Agent CLI installed (#5 acceptance criteria 1 and 4).
+    optional ``stdout``, ``stderr``, ``structured_output``, ``artifacts`` (a list
+    of file paths), and ``adapter_failure`` (a boolean: the agent ran but the
+    Adapter normalizes its result as a FAILURE — the offline analogue of Claude's
+    ``is_error: true`` arriving with a zero exit, ADR 0006 / #83). This lets whole
+    Workflows and Patterns run with no real Agent CLI installed (#5 acceptance
+    criteria 1 and 4).
 
     The shipped adapter never writes the resolved env to a path: env-observation
     for the env-policy test lives in a test-only adapter seam, so a secret value
@@ -142,12 +145,23 @@ class MockAdapter(Adapter):
                 f"fixture {fixture} for node {node_id!r} must declare an integer exit_status"
             )
         artifacts = MockAdapter._parse_artifacts(raw.get("artifacts", ()), fixture, node_id)
+        # The first-class adapter-determined-failure signal (ADR 0006, #83): an
+        # optional boolean that lets an offline fixture model the canonical "the
+        # agent ran but its result is a FAILURE" case (Claude's is_error with a zero
+        # exit). A non-boolean is a fixture-authoring error, surfaced like the
+        # exit_status one; absent, it defaults False (an ordinary result).
+        adapter_failure = raw.get("adapter_failure", False)
+        if not isinstance(adapter_failure, bool):
+            raise AdapterError(
+                f"fixture {fixture} for node {node_id!r} 'adapter_failure' must be a boolean"
+            )
         return AgentResult(
             exit_status=exit_status,
             stdout=str(raw.get("stdout", "")),
             stderr=str(raw.get("stderr", "")),
             structured_output=raw.get("structured_output"),
             artifacts=artifacts,
+            adapter_failure=adapter_failure,
         )
 
     @staticmethod
