@@ -202,13 +202,18 @@ async def _kill_and_reap(process: "asyncio.subprocess.Process") -> None:
     process group; killing only the shell would orphan such a grandchild, and its
     inherited stdout pipe would keep ``communicate()`` blocked for the grandchild's
     full lifetime (the timeout would classify correctly but the call would still
-    hang). A process that already exited (returncode set) needs no kill;
-    ProcessLookupError is suppressed for the race where it exits between the check
-    and the signal. ``wait()`` then reaps the shell.
+    hang). The group is signalled UNCONDITIONALLY — even when the leader's
+    ``returncode`` is already set: asyncio's child watcher can reap the leader the
+    moment it exits while a grandchild still holds the inherited stdout/stderr pipe,
+    so a non-None returncode does NOT mean the process GROUP is dead. Killing only
+    when ``returncode is None`` would leak that surviving group — the same fix the
+    shared ``SubprocessAdapter._communicate_or_kill`` carries (#83). The whole tree
+    shares one process group (``start_new_session``), so ``os.killpg`` tears it down;
+    ``ProcessLookupError`` is suppressed for the race where the group is already
+    gone. ``wait()`` then reaps the shell.
     """
-    if process.returncode is None:
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(process.pid, signal.SIGKILL)
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(process.pid, signal.SIGKILL)
     await process.wait()
 
 

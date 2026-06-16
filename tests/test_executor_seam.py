@@ -9,7 +9,7 @@ import subprocess
 import sys
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from conftest import read_events, single_run_dir, state_rows
@@ -85,6 +85,66 @@ async def test_a_node_exceeding_its_timeout_is_terminated_and_recorded_timed_out
     run_dir = single_run_dir(tmp_path / "runs")
     (node,) = state_rows(run_dir, "SELECT * FROM node")
     assert node["status"] == "timed_out", "the node is recorded timed_out, not failed"
+
+
+@pytest.mark.asyncio
+async def test_kill_and_reap_signals_the_group_even_when_the_leader_already_exited(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Regression (#83 review): the shell-node teardown kills the process GROUP
+    # UNCONDITIONALLY. asyncio's child watcher can reap the leader (setting
+    # `returncode`) while a grandchild still holds the inherited stdout/stderr pipe,
+    # so gating killpg behind `returncode is None` would leak the surviving group —
+    # the same fix the shared SubprocessAdapter carries. A fake leader whose
+    # `returncode` is ALREADY set must still be killpg'd.
+    from caw.executor import _kill_and_reap
+
+    killed: list[tuple[int, int]] = []
+
+    def _record_killpg(pgid: int, sig: int) -> None:
+        killed.append((pgid, sig))
+
+    monkeypatch.setattr("caw.executor.os.killpg", _record_killpg)
+
+    class _ReapedLeader:
+        pid = 4242
+        returncode = 0  # already exited / reaped by the child watcher
+
+        async def wait(self) -> int:
+            return 0
+
+    await _kill_and_reap(cast("asyncio.subprocess.Process", _ReapedLeader()))
+
+    assert killed == [(4242, signal.SIGKILL)], (
+        "the group is signalled even when the leader's returncode is already set"
+    )
+
+
+@pytest.mark.asyncio
+async def test_kill_and_reap_suppresses_a_process_lookup_error_for_an_already_gone_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # If the whole group is already gone, os.killpg raises ProcessLookupError; the
+    # teardown suppresses it and still reaps the leader rather than crashing the Run.
+    from caw.executor import _kill_and_reap
+
+    def _raise_lookup(pgid: int, sig: int) -> None:
+        raise ProcessLookupError
+
+    monkeypatch.setattr("caw.executor.os.killpg", _raise_lookup)
+    reaped: list[bool] = []
+
+    class _LiveLeader:
+        pid = 4242
+        returncode = None
+
+        async def wait(self) -> int:
+            reaped.append(True)
+            return -9
+
+    await _kill_and_reap(cast("asyncio.subprocess.Process", _LiveLeader()))  # must not raise
+
+    assert reaped == [True], "wait() still reaps the leader after a suppressed killpg"
 
 
 @pytest.mark.asyncio
