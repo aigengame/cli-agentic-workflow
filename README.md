@@ -269,17 +269,19 @@ real CLI). The mock complements the e2e tier; it does not replace it.
 ### Two-tier test suite: non-e2e and e2e
 
 The **non-e2e** tier runs everywhere with no real Agent CLI. The **e2e** tier
-(`tests/e2e/`, marked `e2e`) drives a real Agent CLI end to end — a real `claude -p` run
-flowing through `caw run` into the Output Contract and State. Because most real usage runs
-agent CLIs as nodes, e2e is mandatory coverage that grows as features land (new adapters,
-multi-node graphs, patterns) — not an afterthought.
+(`tests/e2e/`, marked `e2e`) drives a real Agent CLI end to end — a real `claude -p` or
+`codex exec` run flowing through `caw run` into the Output Contract and State. The suite
+is agent-neutral: the same workflow shape runs under either agent, exercising the
+capability symmetry of the two adapters. Because most real usage runs agent CLIs as nodes,
+e2e is mandatory coverage that grows as features land (new adapters, multi-node graphs,
+patterns) — not an afterthought.
 
 - **Local only, for now.** Cloud agent auth is not provisionable in GitHub Actions yet,
   so CI runs `pytest -m "not e2e"` and the e2e tier is a local gate. It migrates into CI
   once cloud auth is arranged ([#86](https://github.com/aigengame/cli-agentic-workflow/issues/86)).
 - **One selected agent.** `CAW_E2E_AGENT` chooses the agent (default `claude`; `codex`
-  lands with #11). Run the tier with `CAW_E2E_AGENT=claude uv run pytest -m e2e` against
-  an authenticated CLI.
+  also wired). Run the tier against an authenticated CLI with
+  `CAW_E2E_AGENT=claude uv run pytest -m e2e` or `CAW_E2E_AGENT=codex uv run pytest -m e2e`.
 - **Fail, never skip.** When the selected agent's CLI is unavailable the e2e tests
   **FAIL** — they never skip — so a missing or unauthenticated CLI is never silent green.
 - **Robust assertions.** e2e checks are contract/structure-based (exit status, Output
