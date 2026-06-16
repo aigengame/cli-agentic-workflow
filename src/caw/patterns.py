@@ -55,6 +55,59 @@ def _reject_declared_needs_each(nodes: list[NodeDict], role: str, reason: str) -
     return nodes
 
 
+def _require_when(node: NodeDict, role: str, reason: str) -> NodeDict:
+    """Require ``node`` to declare a ``when`` Predicate — the gate that makes it a branch.
+
+    classify-and-act branches route on the classifier's output via their ``when``
+    Predicate (the sole conditional mechanism, ADR 0007); a branch entry with no
+    ``when`` would always run and defeat the routing, so it is rejected. The message
+    always contains "must declare a `when`", which the seam tests assert.
+    """
+    if isinstance(node, dict) and "when" not in node:
+        raise ValueError(f"a {role} must declare a `when`; {reason}")
+    return node
+
+
+def _require_when_each(nodes: list[NodeDict], role: str, reason: str) -> list[NodeDict]:
+    """Apply :func:`_require_when` to each node in a list, returning it."""
+    for node in nodes:
+        _require_when(node, role, reason)
+    return nodes
+
+
+def _require_join_policy(node: NodeDict | None, role: str, reason: str) -> NodeDict | None:
+    """Require ``node`` (if present) to declare an explicit ``join`` policy.
+
+    A join that tolerates skipped branches must state its policy rather than silently
+    defaulting to ``all`` (which would skip the join whenever any branch skipped);
+    classify-and-act's join typically carries ``join: any`` (ADR 0007). The message
+    always contains "must declare an explicit `join` policy", which the seam tests
+    assert.
+    """
+    if isinstance(node, dict) and "join" not in node:
+        raise ValueError(f"a {role} must declare an explicit `join` policy; {reason}")
+    return node
+
+
+def _require_agent_kind(node: NodeDict, role: str, reason: str) -> NodeDict:
+    """Require ``node`` to be ``kind: agent`` — the parallel-agent fan-out shape.
+
+    fan-out-synthesis fans out parallel AGENT nodes and synthesizes them; a worker or
+    synthesize node of any other kind is not that shape, so it is rejected. The message
+    always contains "must be `kind: agent`", which the seam tests assert.
+    """
+    if isinstance(node, dict) and node.get("kind") != "agent":
+        raise ValueError(f"a {role} must be `kind: agent`; {reason}")
+    return node
+
+
+def _require_agent_kind_each(nodes: list[NodeDict], role: str, reason: str) -> list[NodeDict]:
+    """Apply :func:`_require_agent_kind` to each node in a list, returning it."""
+    for node in nodes:
+        _require_agent_kind(node, role, reason)
+    return nodes
+
+
 class PatternExpander:
     """One registered expander: its params model, expand function, and one-line shape.
 
@@ -196,12 +249,14 @@ class _ClassifyAndActParams(BaseModel):
     A ``classifier`` agent Node runs first and emits a label in its normalized
     output; each ``branches`` entry is a branch the run acts on, gated by its own
     ``when`` Predicate reading the classifier's output (``path`` addresses into
-    ``structured_output`` — the sole conditional mechanism, ADR 0007). The optional
-    ``join`` fans the branches in; because only the matching branch runs and the
-    rest skip, the join typically carries ``join: any`` (ADR 0007) so it runs on the
-    one taken branch. The expander injects each branch's ``needs`` (the classifier)
-    and the join's ``needs`` (every branch); the classifier, branch, and join entries
-    must not declare their own ``needs`` — only the ``when`` gating is the author's.
+    ``structured_output`` — the sole conditional mechanism, ADR 0007), so every
+    branch entry MUST declare a ``when``. The optional ``join`` fans the branches in;
+    because only the matching branch runs and the rest skip, the join MUST declare an
+    explicit ``join`` policy (typically ``join: any``, ADR 0007) rather than silently
+    defaulting to ``all`` and skipping itself. The expander injects each branch's
+    ``needs`` (the classifier) and the join's ``needs`` (every branch); the
+    classifier, branch, and join entries must not declare their own ``needs`` — the
+    ``when`` gating and the join policy are the author's.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -226,11 +281,29 @@ class _ClassifyAndActParams(BaseModel):
             "the expander needs each branch on the classifier",
         )
 
+    @field_validator("branches")
+    @classmethod
+    def _branches_must_declare_when(cls, branches: list[NodeDict]) -> list[NodeDict]:
+        return _require_when_each(
+            branches,
+            "classify-and-act branch",
+            "each branch routes on the classifier's output via its `when` Predicate",
+        )
+
     @field_validator("join")
     @classmethod
     def _join_must_not_declare_needs(cls, join: NodeDict | None) -> NodeDict | None:
         return _reject_declared_needs(
             join, "classify-and-act join", "the join fans in every branch"
+        )
+
+    @field_validator("join")
+    @classmethod
+    def _join_must_declare_join_policy(cls, join: NodeDict | None) -> NodeDict | None:
+        return _require_join_policy(
+            join,
+            "classify-and-act join",
+            "only the matching branch runs, so the join must state its policy (e.g. `any`)",
         )
 
 
@@ -291,11 +364,14 @@ def _expand_generate_and_filter(params: _GenerateAndFilterParams) -> list[NodeDi
 class _FanOutSynthesisParams(BaseModel):
     """Params of the ``fan-out-synthesis`` expander: fan out, then synthesize.
 
-    Each ``workers`` entry is an independent agent Node (no ``needs``, so they run
-    concurrently); the ``synthesize`` Node fans every worker in and synthesizes their
-    results into one output. The expander injects the synthesize node's ``needs``
-    (every worker); a worker or the synthesize node declaring its own ``needs`` is
-    rejected. The synthesize node may carry its own ``join`` policy (ADR 0007).
+    Each ``workers`` entry is an independent agent Node (``kind: agent``, no
+    ``needs``, so they run concurrently); the ``synthesize`` Node — itself an agent —
+    fans every worker in and synthesizes their results into one output. The AC names
+    "parallel agent nodes" and a "synthesize join", so a worker or synthesize node of
+    any non-agent kind is rejected. The expander injects the synthesize node's
+    ``needs`` (every worker); a worker or the synthesize node declaring its own
+    ``needs`` is rejected. The synthesize node may carry its own ``join`` policy
+    (ADR 0007).
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -312,12 +388,30 @@ class _FanOutSynthesisParams(BaseModel):
             "workers are independent and run concurrently",
         )
 
+    @field_validator("workers")
+    @classmethod
+    def _workers_must_be_agents(cls, workers: list[NodeDict]) -> list[NodeDict]:
+        return _require_agent_kind_each(
+            workers,
+            "fan-out-synthesis worker",
+            "the pattern fans out parallel agent nodes",
+        )
+
     @field_validator("synthesize")
     @classmethod
     def _synthesize_must_not_declare_needs(cls, synthesize: NodeDict) -> NodeDict:
         return _reject_declared_needs(
             synthesize, "fan-out-synthesis synthesize", "the synthesize node fans in every worker"
         )  # type: ignore[return-value]
+
+    @field_validator("synthesize")
+    @classmethod
+    def _synthesize_must_be_an_agent(cls, synthesize: NodeDict) -> NodeDict:
+        return _require_agent_kind(
+            synthesize,
+            "fan-out-synthesis synthesize",
+            "the synthesize join is an agent that synthesizes the workers' results",
+        )
 
 
 def _expand_fan_out_synthesis(params: _FanOutSynthesisParams) -> list[NodeDict]:
