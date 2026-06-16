@@ -108,6 +108,27 @@ with `summary.fixture.json` next to the workflow file:
 `caw run hello.yaml` now runs the shell and agent nodes together. Swapping `adapter: mock`
 for a real adapter (e.g. `claude.print`) is the only change needed to drive a real agent CLI.
 
+### Fan-out synthesis: the reference end-to-end sample
+
+The first complete end-to-end sample fans the **same task** out to two agent branches in
+parallel and joins their answers in a synthesis node — the fan-out-synthesis shape. Scaffold
+the whole bundle (the workflow plus its branch and synthesis fixtures) and run it offline,
+clone-to-completed in well under ten minutes:
+
+```bash
+caw fanout init                # writes fanout.yaml + the three companion fixtures
+caw graph fanout.yaml          # two branches fan into one synthesis node
+caw run fanout.yaml            # runs offline with the mock adapter — no tokens
+caw report <run-id> --format markdown   # the conclusion, separated from the trace
+```
+
+The scaffolded sample runs against the `mock` adapter so it completes with no real Agent CLI
+and no tokens. The reference sample fans the same task to `claude.print` and `codex.exec` side
+by side: swap each branch's `adapter: mock` (and its `fixture` for an `output_schema`) for a
+real adapter to drive two real agent CLIs and synthesize their answers. The Markdown report
+keeps the final conclusion (each node's outcome, including the synthesis node's) in its own
+sections, distinct from the `## Trace` of events.
+
 ## Why caw
 
 - **Validate before you spend tokens.** `caw validate` catches schema errors, broken
@@ -210,6 +231,7 @@ caw report <run-id> --format markdown
 | `caw loop resume <group-id>` | Resume an interrupted run group at the group level | ✅ now |
 | `caw loop report <group-id>` | Aggregate every iteration of a run group into one report | ✅ now |
 | `caw loop init [path]` | Scaffold a complete runnable loop-until-done example | ✅ now |
+| `caw fanout init [path]` | Scaffold the complete runnable fan-out-synthesis sample | ✅ now |
 
 ## Built-in patterns
 
@@ -225,7 +247,7 @@ example of any shipped pattern with `caw patterns init <name>`.
 | Parallel | Independent branches joined downstream | ✅ now |
 | Classify and act | Classifier routes to one of several `when`-gated branches | 🚧 planned |
 | Generate and filter | N candidate generators, then a scoring/validation filter | 🚧 planned |
-| Fan-out synthesis | Parallel agents, then a synthesis node (the reference sample runs `claude.print` and `codex.exec` side by side) | 🚧 planned |
+| Fan-out synthesis | Parallel agents, then a synthesis node (the reference sample runs `claude.print` and `codex.exec` side by side) — scaffold it with `caw fanout init` | ✅ now |
 | Adversarial verification | Generator + verifiers, with accept / reject / regenerate | 🚧 planned |
 | Tournament | Rounds or brackets with winner promotion and comparison evidence | 🚧 planned |
 | Loop until done | Iterates immutable runs in a Run Group until the done Predicate holds | ✅ now |
