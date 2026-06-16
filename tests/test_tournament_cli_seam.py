@@ -97,6 +97,7 @@ def test_tournament_report_carries_comparison_evidence(
     assert report_result.exit_code == 0, report_result.output
     report = json.loads(report_result.output)
     assert report["status"] == "complete"
+    assert report["winner"] == "candidate-c", "the group report carries the final winner"
     assert len(report["iterations"]) == 2
     for iteration in report["iterations"]:
         compare = next(node for node in iteration["nodes"] if node["id"] == "compare")

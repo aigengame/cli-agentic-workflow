@@ -240,16 +240,23 @@ def _gather_group(group_id: str, base: Path) -> dict[str, Any]:
     return {
         "group_id": persisted["group_id"],
         "status": persisted["status"],
+        # A controller may record a top-level result on group.json (the tournament's
+        # final promoted winner); carry it so the aggregate report is as informative as
+        # the controller's own run output. Absent (e.g. loop/verify) it stays None.
+        "winner": persisted.get("winner"),
         "iteration_count": len(iterations),
         "iterations": iterations,
     }
 
 
 def _render_group_json(report: dict[str, Any]) -> str:
-    """Machine-readable aggregate: group status + each iteration's conclusion + trace."""
+    """Machine-readable aggregate: group status + final winner + per-iteration conclusion."""
     contract = {
         "group_id": report["group_id"],
         "status": report["status"],
+        # The controller's top-level result (the tournament's final winner), carried so
+        # the aggregate report carries it; always present (``null`` for loop/verify).
+        "winner": report["winner"],
         "iteration_count": report["iteration_count"],
         "iterations": [
             {
@@ -270,6 +277,7 @@ def _render_group_jsonl(report: dict[str, Any]) -> str:
                 "record": "group",
                 "group_id": report["group_id"],
                 "status": report["status"],
+                "winner": report["winner"],
                 "iteration_count": report["iteration_count"],
             }
         )
@@ -296,10 +304,12 @@ def _render_group_jsonl(report: dict[str, Any]) -> str:
 
 
 def _render_group_text(report: dict[str, Any]) -> str:
-    """Plain text: the group status, then each iteration's conclusion."""
+    """Plain text: the group status, the final winner (when any), then each conclusion."""
     lines = [
         f"group {report['group_id']}: {report['status']} ({report['iteration_count']} iterations)"
     ]
+    if report["winner"] is not None:
+        lines.append(f"winner: {report['winner']}")
     for iteration in report["iterations"]:
         lines.append(
             f"  iteration {iteration['iteration_index']} ({iteration['run_id']}): "
@@ -316,6 +326,10 @@ def _render_group_markdown(report: dict[str, Any]) -> str:
         f"# Run Group {report['group_id']}",
         "",
         f"**Status:** {report['status']}",
+    ]
+    if report["winner"] is not None:
+        out.append(f"**Winner:** {report['winner']}")
+    out += [
         f"**Iterations:** {report['iteration_count']}",
         "",
     ]
