@@ -5,8 +5,8 @@ unit-tested OFFLINE (see ``tests/test_e2e_harness.py``, which runs in CI) while 
 real-CLI tests under ``tests/e2e/`` exercise it against a live agent:
 
 * **Agent selection** — exactly ONE agent runs per e2e session, chosen by
-  ``CAW_E2E_AGENT`` (default ``claude``). Only ``claude`` is wired today; ``codex``
-  lands with #11 by adding one entry to :data:`_AGENTS`.
+  ``CAW_E2E_AGENT`` (default ``claude``). Both ``claude`` and ``codex`` are wired,
+  each one entry in :data:`_AGENTS`.
 * **skip = fail** — :func:`require_agent_cli` FAILS (never skips) when the selected
   agent's CLI is absent, so a missing CLI is loud, not silent green.
 * **Transient-only bounded retry** — :func:`run_with_transient_retry` re-runs ONLY
@@ -36,17 +36,38 @@ class E2EConfigError(Exception):
 
 @dataclass(frozen=True)
 class AgentSpec:
-    """How a selected agent maps onto the kernel: its Adapter name and its CLI binary."""
+    """How a selected agent maps onto the kernel: Adapter name, CLI binary, run args.
+
+    ``run_args`` are the agent's own headless-run CLI flags that an e2e agent Node
+    passes through as node ``args`` (ADR 0006 / #11: caw owns no policy engine, so
+    sandbox/approval/repo flags are ordinary passthrough args). They are NOT a caw
+    concept — they are the flags THAT agent's CLI needs to run non-interactively and
+    unattended from an arbitrary working directory: codex needs ``--skip-git-repo-check``
+    (an e2e run dir is a non-git tmp dir) and a non-interactive ``--sandbox`` so it never
+    blocks on an approval prompt; claude needs none. Switching the selected agent still
+    changes only the adapter NAME on the node — these args are supplied by the harness
+    per agent, preserving the #11 symmetry of the node SHAPE.
+    """
 
     adapter: str
     cli: str
+    run_args: tuple[str, ...] = ()
 
 
 # The single source of truth for which agents the e2e suite can drive. Keyed by the
-# value of CAW_E2E_AGENT. Adding `codex` (#11) is a one-line entry here — the agent
-# selector, CLI presence check, and adapter resolution all read from this map.
+# value of CAW_E2E_AGENT. Adding an agent is a one-line entry here — the agent
+# selector, CLI presence check, adapter resolution, and headless run args all read
+# from this map.
 _AGENTS: dict[str, AgentSpec] = {
     "claude": AgentSpec(adapter="claude.print", cli="claude"),
+    "codex": AgentSpec(
+        adapter="codex.exec",
+        cli="codex",
+        # Non-interactive, directory-agnostic headless run: skip the git-repo gate (an
+        # e2e run dir is a non-git tmp dir) and pin a read-only sandbox so codex never
+        # parks on an approval prompt.
+        run_args=("--skip-git-repo-check", "--sandbox", "read-only"),
+    ),
 }
 
 # The agent exercised when CAW_E2E_AGENT is unset (decision #3).
@@ -105,8 +126,7 @@ def _spec(agent: str) -> AgentSpec:
     except KeyError as exc:
         supported = ", ".join(sorted(_AGENTS))
         raise E2EConfigError(
-            f"unsupported CAW_E2E_AGENT={agent!r}; supported agents: {supported} "
-            "(codex lands with #11)"
+            f"unsupported CAW_E2E_AGENT={agent!r}; supported agents: {supported}"
         ) from exc
 
 
@@ -118,6 +138,18 @@ def adapter_for_agent(agent: str) -> str:
 def agent_cli_name(agent: str) -> str:
     """The CLI binary name ``agent`` resolves on PATH (e.g. ``claude`` -> ``claude``)."""
     return _spec(agent).cli
+
+
+def agent_run_args(agent: str) -> tuple[str, ...]:
+    """The headless-run passthrough CLI flags an e2e agent Node declares for ``agent``.
+
+    These are the SELECTED agent's own CLI flags (not a caw concept) needed to run it
+    non-interactively from an arbitrary working directory: empty for claude, the
+    git-repo-check skip + a non-interactive sandbox for codex. An e2e agent Node passes
+    them through as node ``args`` (#11 acceptance 3: sandbox/approval flags are ordinary
+    passthrough args), so the node SHAPE stays symmetric across agents.
+    """
+    return _spec(agent).run_args
 
 
 def require_agent_cli(agent: str) -> str:

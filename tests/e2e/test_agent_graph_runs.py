@@ -1,13 +1,15 @@
-"""Real ``claude.print`` graph-run e2e tests (#86).
+"""Real agent-CLI graph-run e2e tests (#86, #11).
 
 These cover the cases whose correctness depends on the REAL Agent CLI: a real
-``claude -p`` invocation, its result-wrapper shape, and a real agent Node flowing through
-``execute_run`` into the Output Contract and State. This is a LIVING suite, not a fixed
-set: today it bootstraps three runs (structured-output, freeform, real non-zero failure)
-because ``claude.print`` is the only real node surface so far, and it grows as features
-land (codex #11, multi-node graphs, patterns, resume). Behaviors a fixture can verify
-completely and offline are covered by the mock suite instead — the two are co-weighted,
-neither privileged.
+``claude -p`` / ``codex exec`` invocation, its output shape, and a real agent Node
+flowing through ``execute_run`` into the Output Contract and State. This is a LIVING,
+agent-NEUTRAL suite: every test drives whichever agent ``CAW_E2E_AGENT`` selects
+through the SAME workflow shape — the headline #11 symmetry, where a node switches
+between ``claude.print`` and ``codex.exec`` by changing only its adapter name. It
+bootstraps three graph runs (structured-output, freeform, real non-zero failure) and
+grows as features land (multi-node graphs, patterns, resume). Behaviors a fixture can
+verify completely and offline are covered by the mock suite instead — the two are
+co-weighted, neither privileged.
 
 Assertions are contract/structure-based, never free-text (decision #4): a structured
 run is judged by exit 0 + the kernel validating the Output Contract + the typed shape
@@ -24,8 +26,9 @@ from typing import Any
 
 import pytest
 
-from caw.adapter import AdapterRegistry
+from caw.adapter import Adapter, AdapterRegistry
 from caw.claude_print import ClaudePrintAdapter
+from caw.codex_exec import CodexExecAdapter
 from caw.executor import FAILED, RunResult, execute_run
 from caw.model import Workflow, normalize_workflow
 from caw.state import StateStore
@@ -56,8 +59,12 @@ def _agent_workflow(
     }
     if output_schema is not None:
         inputs["output_schema"] = str(output_schema)
-    if args:
-        inputs["args"] = list(args)
+    # The selected agent's headless-run flags (sandbox/repo-check for codex; none for
+    # claude) precede any test-supplied args, so e.g. the invalid-flag failure test
+    # still trips the real CLI's argument parser on its bad flag.
+    combined_args = (*harness.agent_run_args(agent), *args)
+    if combined_args:
+        inputs["args"] = list(combined_args)
     raw = {
         "name": "e2e",
         "version": 1,
@@ -91,12 +98,16 @@ async def test_structured_output_graph_run(agent: str, tmp_path: Path) -> None:
     # structured_output is persisted to State with the contracted shape.
     harness.require_agent_cli(agent)  # FAIL (not skip) when the selected CLI is absent
     schema = tmp_path / "answer.schema.json"
+    # `additionalProperties: false` and a fully-listed `required` keep the schema valid
+    # under codex's strict (OpenAI structured-output) mode, and are harmless for claude;
+    # the schema is identical for both agents, preserving the #11 symmetry.
     schema.write_text(
         json.dumps(
             {
                 "type": "object",
                 "properties": {"answer": {"type": "integer"}},
                 "required": ["answer"],
+                "additionalProperties": False,
             }
         ),
         encoding="utf-8",
@@ -168,17 +179,31 @@ async def test_real_failure_non_zero_path(agent: str, tmp_path: Path) -> None:
     assert statuses[_NODE_ID] == "failed", "the non-zero exit is recorded as FAILED in State"
 
 
+def _capability_adapter(agent: str) -> Adapter:
+    """The selected agent's real Adapter, for the capability probe.
+
+    ``capability_check`` is a per-Adapter method (not on the base :class:`Adapter`
+    ABC), so the e2e probe dispatches on the selected agent. Both real Adapters expose
+    it with the SAME signature, capability-symmetric (#11).
+    """
+    adapters: dict[str, Adapter] = {
+        "claude": ClaudePrintAdapter(),
+        "codex": CodexExecAdapter(),
+    }
+    return adapters[agent]
+
+
 @pytest.mark.asyncio
 async def test_capability_check_reports_a_version(agent: str) -> None:
-    # The real-CLI capability probe (`claude --version`): adapter infrastructure that
-    # is free and tokenless, but still real-CLI-dependent — so it belongs in the e2e
-    # tier (fail, never skip), not the mock suite. NOTE: capability_check lives on the
-    # shared SubprocessAdapter base (#83), inherited by claude and codex (#11); this
-    # drives ClaudePrintAdapter directly since `claude` is the only wired agent today,
-    # so a non-claude CAW_E2E_AGENT already fails earlier at the require_agent_cli /
-    # adapter-resolution guard.
+    # The real-CLI capability probe (`claude --version` / `codex --version`): adapter
+    # infrastructure that is free and tokenless, but still real-CLI-dependent — so it
+    # belongs in the e2e tier (fail, never skip), not the mock suite. capability_check
+    # lives on the shared SubprocessAdapter base (#83), inherited by both real Adapters
+    # (claude #9, codex #11); this dispatches on the selected agent via
+    # _capability_adapter, both exposing it symmetrically (#11).
     harness.require_agent_cli(agent)
+    adapter = _capability_adapter(agent)
 
-    version = await ClaudePrintAdapter().capability_check()
+    version = await adapter.capability_check()  # type: ignore[attr-defined]
 
     assert version.strip(), "a real capability check reports a non-empty version string"
