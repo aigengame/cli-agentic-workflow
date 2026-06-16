@@ -189,9 +189,119 @@ def test_report_surfaces_skip_causes_distinctly(
     assert by_id["gate"]["status"] == "skipped" and by_id["gate"]["cause"] == "when_false"
     assert by_id["downstream"]["status"] == "skipped" and by_id["downstream"]["cause"] == "blocked"
 
+    # #94: a `blocked` node names the immediate skipped dependency that withheld it
+    # (downstream's `gate`), at parity with the live run; a `when_false` gate is the
+    # skip ORIGIN, not blocked, so it carries no blocker.
+    assert by_id["downstream"]["blocked_by"] == "gate"
+    assert by_id["gate"]["blocked_by"] is None
+
     markdown = runner.invoke(app, ["report", run_id, "--format", "markdown"]).output
     assert "gate — skipped (when_false)" in markdown
-    assert "downstream — skipped (blocked)" in markdown
+    assert "downstream — skipped (blocked by gate)" in markdown
+
+
+def test_report_names_the_root_failed_blocker_for_a_failure_blocked_node(
+    write_workflow_data: Callable[[dict[str, Any]], Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #94: a `blocked`-skipped node's report names WHICH upstream node withheld it,
+    # inferred from the snapshot (`needs`) + persisted node statuses alone — at parity
+    # with the live `caw run` message, which names the blocker from the in-memory
+    # RunResult. boom fails; mid and downstream are skipped in its failure cone. The
+    # live executor attributes the WHOLE failure cone to the ROOT failed node (boom),
+    # so the report must too — not merely to each node's immediate skipped parent.
+    workflow_file = write_workflow_data(
+        {
+            "name": "sample",
+            "version": 1,
+            "nodes": [
+                {"id": "boom", "kind": "shell", "inputs": {"command": "exit 3"}},
+                {
+                    "id": "mid",
+                    "kind": "shell",
+                    "needs": ["boom"],
+                    "inputs": {"command": "echo mid"},
+                },
+                {
+                    "id": "downstream",
+                    "kind": "shell",
+                    "needs": ["mid"],
+                    "inputs": {"command": "echo downstream"},
+                },
+            ],
+        }
+    )
+    monkeypatch.chdir(tmp_path)
+    run = runner.invoke(app, ["run", str(workflow_file)])
+    assert run.exit_code == 1, run.output
+    # The live run attributes the whole failure cone to the root failed node.
+    assert "node mid skipped (blocked by boom)" in run.output
+    assert "node downstream skipped (blocked by boom)" in run.output
+    run_id = _run_dir_name(tmp_path)
+
+    # Structured formats carry the blocker as a field; a failed node is not blocked.
+    report = json.loads(runner.invoke(app, ["report", run_id, "--format", "json"]).output)
+    by_id = {node["id"]: node for node in report["nodes"]}
+    assert by_id["mid"]["status"] == "skipped" and by_id["mid"]["cause"] == "blocked"
+    assert by_id["mid"]["blocked_by"] == "boom"
+    assert by_id["downstream"]["blocked_by"] == "boom"
+    assert by_id["boom"]["blocked_by"] is None
+
+    # Markdown / text name the blocker in the node-detail parenthetical, at parity.
+    markdown = runner.invoke(app, ["report", run_id, "--format", "markdown"]).output
+    assert "mid — skipped (blocked by boom)" in markdown
+    assert "downstream — skipped (blocked by boom)" in markdown
+    text = runner.invoke(app, ["report", run_id, "--format", "text"]).output
+    assert "mid: skipped (blocked by boom)" in text
+    assert "downstream: skipped (blocked by boom)" in text
+
+
+def test_report_degrades_to_plain_blocked_when_the_blocker_is_indeterminable(
+    write_workflow_data: Callable[[dict[str, Any]], Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #94 AC5: when a `blocked` node's blocker cannot be inferred from persisted data
+    # (no failed/skipped upstream survives in State), the report degrades to plain
+    # `(blocked)` rather than erroring. Simulated by forcing a `blocked` status onto a
+    # node whose only dependency SUCCEEDED — an inconsistency the report tolerates.
+    workflow_file = write_workflow_data(
+        {
+            "name": "sample",
+            "version": 1,
+            "nodes": [
+                {"id": "build", "kind": "shell", "inputs": {"command": "echo build"}},
+                {
+                    "id": "ship",
+                    "kind": "shell",
+                    "needs": ["build"],
+                    "inputs": {"command": "echo ship"},
+                },
+            ],
+        }
+    )
+    monkeypatch.chdir(tmp_path)
+    assert runner.invoke(app, ["run", str(workflow_file)]).exit_code == 0
+    run_id = _run_dir_name(tmp_path)
+    database = tmp_path / ".caw" / "runs" / run_id / "state.sqlite"
+    connection = sqlite3.connect(database)
+    # A real skipped node is never attempted, so drop the attempt too — otherwise its
+    # persisted exit status would render instead of the skip cause.
+    connection.execute(
+        "UPDATE node SET status = 'skipped', cause = 'blocked' WHERE node_id = 'ship'"
+    )
+    connection.execute("DELETE FROM attempt WHERE node_id = 'ship'")
+    connection.commit()
+    connection.close()
+
+    markdown = runner.invoke(app, ["report", run_id, "--format", "markdown"])
+    assert markdown.exit_code == 0, markdown.output
+    assert "ship — skipped (blocked)" in markdown.output
+    assert "blocked by" not in markdown.output
+    report = json.loads(runner.invoke(app, ["report", run_id, "--format", "json"]).output)
+    ship = next(node for node in report["nodes"] if node["id"] == "ship")
+    assert ship["blocked_by"] is None
 
 
 def test_report_refuses_a_run_dir_without_state_and_creates_no_database(

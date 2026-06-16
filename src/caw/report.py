@@ -84,13 +84,83 @@ def _conclusion_nodes(run_dir: Path) -> tuple[str | None, list[dict[str, Any]]]:
 def _gather(run_dir: Path) -> dict[str, Any]:
     """Assemble the full report model from the Run's persisted State and Events."""
     status, nodes = _conclusion_nodes(run_dir)
+    graph = _read_graph(run_dir)
+    needs_by_id = {node["id"]: node["needs"] for node in graph}
+    statuses = {node["id"]: node["status"] for node in nodes}
+    causes = {node["id"]: node["cause"] for node in nodes}
+    for node in nodes:
+        # State persists a skip's cause but not its blocker (#94); a `blocked` node
+        # infers WHICH upstream withheld it from the graph + persisted statuses.
+        node["blocked_by"] = (
+            _infer_blocker(node["id"], needs_by_id, statuses, causes)
+            if node["status"] == "skipped" and node["cause"] == "blocked"
+            else None
+        )
     return {
         "run_id": run_dir.name,
         "status": status,
         "nodes": nodes,
-        "graph": _read_graph(run_dir),
+        "graph": graph,
         "trace": _read_trace(run_dir),
     }
+
+
+def _root_failed_blocker(
+    node_id: str,
+    needs_by_id: dict[str, list[str]],
+    statuses: dict[str, str],
+    causes: dict[str, str | None],
+    seen: set[str],
+) -> str | None:
+    """The root FAILED ancestor reachable from ``node_id`` through ``blocked`` skips.
+
+    Mirrors the executor's failure cone (``_skip_failed_dependents``), which
+    attributes every transitively skipped Node to the ORIGINAL failed Node — so a
+    direct failed dependency is the blocker, and a dependency that was itself
+    ``blocked`` is followed upstream to its own failed root. Declaration order
+    breaks ties; the IR is acyclic (ADR 0002), but ``seen`` guards regardless.
+    Returns ``None`` when no failed ancestor is reachable (a pure skip cone).
+    """
+    if node_id in seen:
+        return None
+    seen.add(node_id)
+    blocked_needs: list[str] = []
+    for need in needs_by_id.get(node_id, []):
+        status = statuses.get(need)
+        if status is not None and status not in {"succeeded", "skipped"}:
+            return need  # a failed / errored / timed_out dependency is the blocker
+        if status == "skipped" and causes.get(need) == "blocked":
+            blocked_needs.append(need)
+    for need in blocked_needs:
+        root = _root_failed_blocker(need, needs_by_id, statuses, causes, seen)
+        if root is not None:
+            return root
+    return None
+
+
+def _infer_blocker(
+    node_id: str,
+    needs_by_id: dict[str, list[str]],
+    statuses: dict[str, str],
+    causes: dict[str, str | None],
+) -> str | None:
+    """Name the upstream Node that withheld a ``blocked`` skip, from persisted data.
+
+    State persists a skip's cause but not its blocker (#94), so a report infers it
+    from the snapshot's ``needs`` plus the persisted statuses, at parity with the
+    live ``caw run`` message. A failure cone points at the ROOT failed Node
+    (``_skip_failed_dependents``); a ``when_false`` / ``all_branches_skipped`` skip
+    cone points at the IMMEDIATE skipped parent (``_propagate_skip_to_dependents``).
+    Returns ``None`` when no blocker is determinable, so the report degrades to a
+    plain ``(blocked)`` rather than erroring.
+    """
+    root = _root_failed_blocker(node_id, needs_by_id, statuses, causes, set())
+    if root is not None:
+        return root
+    for need in needs_by_id.get(node_id, []):
+        if statuses.get(need) == "skipped":
+            return need
+    return None
 
 
 def _render_json(report: dict[str, Any]) -> str:
@@ -150,10 +220,14 @@ def _node_detail(node: dict[str, Any]) -> str:
 
     A node that ran shows ``(exit N)``; a skipped node shows its cause
     (``(when_false)`` / ``(blocked)`` / ``(all_branches_skipped)``, #7) so the three
-    skip reasons read distinctly; a node with neither shows nothing.
+    skip reasons read distinctly. A ``blocked`` node also names the upstream that
+    withheld it (``(blocked by gate)``, #94) when inferable, at parity with the live
+    ``caw run`` message; a node with neither shows nothing.
     """
     if node["exit_status"] is not None:
         return f" (exit {node['exit_status']})"
+    if node["cause"] == "blocked" and node.get("blocked_by"):
+        return f" (blocked by {node['blocked_by']})"
     if node["cause"]:
         return f" ({node['cause']})"
     return ""
