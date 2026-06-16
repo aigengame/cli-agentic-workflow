@@ -476,7 +476,7 @@ def _report_group_and_exit(result: GroupResult) -> None:
     iteration's run id is named so a user can drill into one with ``caw report``.
     """
     typer.echo(
-        f"run group {result.group_id}: {result.status} ({len(result.iterations)} iterations)"
+        f"Run Group {result.group_id}: {result.status} ({len(result.iterations)} iterations)"
     )
     for iteration in result.iterations:
         outcome = "succeeded" if iteration.succeeded else "failed"
@@ -490,7 +490,7 @@ def loop_run(spec_file: Path) -> None:
     """Run a loop-until-done Run Group from a controller spec file.
 
     Materializes each iteration as a separate immutable Run, feeding the prior
-    iteration's output forward, until the done-predicate holds, an iteration fails,
+    iteration's output forward, until the done Predicate holds, an iteration fails,
     or ``max_iterations`` is reached. Exit codes mirror ``caw run``: 0 (group done
     or exhausted), 1 (a constituent Run failed), 2 (an invalid spec), 3 (infra).
     """

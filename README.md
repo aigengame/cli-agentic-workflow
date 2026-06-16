@@ -228,17 +228,17 @@ example of any shipped pattern with `caw patterns init <name>`.
 | Fan-out synthesis | Parallel agents, then a synthesis node (the reference sample runs `claude.print` and `codex.exec` side by side) | 🚧 planned |
 | Adversarial verification | Generator + verifiers, with accept / reject / regenerate | 🚧 planned |
 | Tournament | Rounds or brackets with winner promotion and comparison evidence | 🚧 planned |
-| Loop until done | Iterates immutable runs in a run group until a stop condition | ✅ now |
+| Loop until done | Iterates immutable runs in a Run Group until the done Predicate holds | ✅ now |
 
-### Run groups and the loop-until-done controller
+### Run Groups and the loop-until-done controller
 
 Iterative patterns are realized by a **pattern controller**, a distinct axis from pattern
 expanders ([ADR 0009](docs/adr/0009-pattern-controller-infrastructure.md)): an expander
 shapes one run's graph, a controller sequences multiple runs. Per
 [ADR 0002](docs/adr/0002-pattern-iteration-as-run-groups.md) the kernel only ever executes
 acyclic runs — `loop until done` lives above the executor, in Python, re-running an
-ordinary single-iteration workflow until a stop condition holds. Each iteration is a
-*separate immutable run*; successive runs link into a **run group** that reports and
+ordinary single-iteration workflow until the done Predicate holds. Each iteration is a
+*separate immutable run*; successive runs link into a **Run Group** that reports and
 resumes as one unit (under `.caw/groups/<group-id>/`).
 
 A controller spec file declares the loop:
@@ -246,8 +246,8 @@ A controller spec file declares the loop:
 ```yaml
 workflow: loop-iteration.yaml   # an ordinary single-iteration workflow
 max_iterations: 5
-evaluate_node: verdict          # the node whose output the stop condition reads
-done:                           # the stop condition — the same `when` predicate algebra
+evaluate_node: verdict          # the node whose output the done Predicate reads
+done:                           # the done Predicate — the same `when` predicate algebra
   ref: { node: verdict, field: stdout }
   op: contains
   value: FINISHED
@@ -257,14 +257,14 @@ feedback:                       # iteration N's output fed into iteration N+1 (o
   from_field: next_fixture
 ```
 
-The loop stops on the done predicate holding, an iteration failing, or `max_iterations`.
+The loop stops on the done Predicate holding, an iteration failing, or `max_iterations`.
 Feedback flows by **structural substitution** of the prior run's output into a named node
-input (not string templating). Drive and inspect a run group with:
+input (not string templating). Drive and inspect a Run Group with:
 
 - `caw loop init` — scaffold a complete, runnable loop-until-done example (offline).
 - `caw loop run <spec>` — run the loop; exit 0 (done/exhausted), 1 (an iteration failed).
 - `caw loop resume <group-id>` — resume an interrupted group without re-running completed
-  iterations (the run group is the resumption unit; a succeeded iteration is never re-run).
+  iterations (the Run Group is the resumption unit; a succeeded iteration is never re-run).
 - `caw loop report <group-id>` — aggregate every iteration into one report.
 
 ## Positioning

@@ -4,7 +4,7 @@ The Controller drives the EXISTING ``execute_run``/``resume_run`` as black boxes
 materializing each iteration as a separate immutable Run under a Run Group. These
 tests run the whole loop OFFLINE with the mock Adapter (fixtures), so a deterministic
 multi-iteration loop is proven with no tokens: a faithful feedback loop where
-iteration N's structured output selects iteration N+1's fixture, the done-predicate
+iteration N's structured output selects iteration N+1's fixture, the done Predicate
 reads the iteration's verdict, and the loop stops on done / failure / max-iterations.
 """
 
@@ -20,7 +20,7 @@ from caw.state import StateStore
 # ----------------------------------------------------------------------------------
 # A loop iteration is a single mock-Adapter agent Node named ``verdict``. Its fixture
 # is a canned normalized result whose ``stdout`` carries the stop verdict (the
-# done-predicate reads it with ``contains``, the op valid on the textual ``stdout``
+# done Predicate reads it with ``contains``, the op valid on the textual ``stdout``
 # field) and whose ``structured_output`` carries ``next_fixture`` (the fixture
 # iteration N+1 should read). The Controller's feedback substitutes
 # ``verdict.structured_output.next_fixture`` into the ``verdict`` node's ``fixture``
@@ -62,7 +62,7 @@ def _write_workflow(directory: Path, first_fixture: str) -> Path:
 
 
 def _spec(workflow: Path, *, max_iterations: int) -> ControllerSpec:
-    # The done-predicate reuses the existing `when` algebra: the iteration is done
+    # The done Predicate reuses the existing `when` algebra: the iteration is done
     # when the `verdict` node's textual `stdout` contains the FINISHED verdict
     # (`contains` is the op valid on the string `stdout` field, #7).
     return ControllerSpec.model_validate(
@@ -84,6 +84,29 @@ def _spec(workflow: Path, *, max_iterations: int) -> ControllerSpec:
     )
 
 
+def test_spec_rejects_a_done_ref_that_misses_evaluate_node() -> None:
+    # The done Predicate may only reference `evaluate_node`: at evaluation time only
+    # that node's output is supplied to the Predicate, so a ref to a typo or a
+    # different node would silently evaluate false and the loop would wrongly EXHAUST.
+    # `ControllerSpec.model_validate` must reject it (fail fast over fail silent),
+    # mirroring model.py's `when`-refs-must-be-in-`needs` invariant.
+    with pytest.raises(ValueError, match="done predicate references node 'verdcit'"):
+        ControllerSpec.model_validate(
+            {
+                "workflow": "iteration.yaml",
+                "max_iterations": 5,
+                "evaluate_node": "verdict",
+                # `verdcit` is a typo — not the evaluate_node — so the done Predicate
+                # would never see this node's output.
+                "done": {
+                    "ref": {"node": "verdcit", "field": "stdout"},
+                    "op": "contains",
+                    "value": "FINISHED",
+                },
+            }
+        )
+
+
 @pytest.mark.asyncio
 async def test_loop_stops_at_the_iteration_that_reports_done(tmp_path: Path) -> None:
     # AC1/AC2/AC4: iteration 1 reports not-done and points to iter2.fixture.json;
@@ -97,7 +120,7 @@ async def test_loop_stops_at_the_iteration_that_reports_done(tmp_path: Path) -> 
     result = await run_loop_until_done(spec, base=tmp_path)
 
     assert isinstance(result, GroupResult)
-    assert result.status == "done", "the loop stopped because the done-predicate held"
+    assert result.status == "done", "the loop stopped because the done Predicate held"
     assert len(result.iterations) == 2, "exactly two iterations materialized"
     # Each iteration is a separate Run directory under the group's iterations root.
     iterations_root = group_iterations_root(result.group_id, tmp_path)
@@ -110,7 +133,7 @@ async def test_loop_stops_at_the_iteration_that_reports_done(tmp_path: Path) -> 
 async def test_loop_stops_at_max_iterations_when_never_done(tmp_path: Path) -> None:
     # AC4: a loop that never reports done stops at max_iterations and reports it,
     # rather than looping forever. Every iteration points forward to a not-done
-    # fixture, so the done-predicate is never satisfied.
+    # fixture, so the done Predicate is never satisfied.
     _write_fixture(tmp_path / "loop.fixture.json", done=False, next_fixture="loop.fixture.json")
     workflow = _write_workflow(tmp_path, "loop.fixture.json")
     spec = _spec(workflow, max_iterations=3)

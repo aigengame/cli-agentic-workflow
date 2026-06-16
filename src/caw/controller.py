@@ -9,7 +9,7 @@ failure / max-iterations.
 
 The Controller is NOT in the IR and is NOT an Expander (ADR 0008): it lives above the
 executor, in Python. The loop is described by a :class:`ControllerSpec` (a separate
-authored surface from the iteration ``Workflow``), the stop condition reuses the
+authored surface from the iteration ``Workflow``), the done Predicate reuses the
 existing ``when`` Predicate algebra (the sole conditional mechanism, ADR 0007), and
 feedback from iteration N reaches iteration N+1 by STRUCTURAL substitution of the
 prior Run's terminal ``structured_output`` into a named node input — not string
@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from caw.adapter import AdapterRegistry
 from caw.config import WorkflowConfigError, load_workflow_file
@@ -37,13 +37,19 @@ from caw.runlayout import (
 )
 from caw.state import StateStore
 
-# The Run Group's terminal status: why the loop stopped (ADR 0009).
-#   "done"      — the done-predicate held over the finished iteration's output
-#   "exhausted" — the iteration index reached max_iterations without done
-#   "failed"    — an iteration's Run failed (a failed result is not fed forward)
+# The Run Group's status (ADR 0009).
+#   TERMINAL (resume refused — nothing to do):
+#     "done"      — the done Predicate held over the finished iteration's output
+#     "exhausted" — the iteration index reached max_iterations without done
+#   RESUMABLE (resume continues the loop):
+#     "running"   — an in-progress marker persisted BETWEEN iterations; an
+#                   interrupted group is found in this state and the loop continues
+#     "failed"    — an iteration's Run failed (resumable per Resume Eligibility:
+#                   resume re-runs it in place, then the loop continues)
 GROUP_DONE = "done"
 GROUP_EXHAUSTED = "exhausted"
 GROUP_FAILED = "failed"
+GROUP_RUNNING = "running"
 
 
 class FeedbackSpec(BaseModel):
@@ -67,7 +73,7 @@ class ControllerSpec(BaseModel):
     """The authored definition of a loop-until-done Run Group (ADR 0009).
 
     ``workflow`` is the iteration ``Workflow`` file (an ordinary single-iteration
-    graph); ``max_iterations`` is the hard cap; ``done`` is the structured stop
+    graph); ``max_iterations`` is the hard cap; ``done`` is the structured done
     Predicate (the ``when`` algebra) evaluated against ``evaluate_node``'s output;
     ``feedback`` (optional) carries the prior iteration's output into the next.
     """
@@ -76,12 +82,28 @@ class ControllerSpec(BaseModel):
 
     workflow: Path
     max_iterations: int = Field(ge=1)
-    # The id of the Run's node whose normalized output the done-predicate and the
+    # The id of the Run's node whose normalized output the done Predicate and the
     # feedback source read. A Run can have several leaf nodes, so the spec names the
     # one carrying the iteration's verdict explicitly, mirroring a `when` ref's node.
     evaluate_node: str
     done: Predicate
     feedback: FeedbackSpec | None = None
+
+    @model_validator(mode="after")
+    def _done_refs_must_target_evaluate_node(self) -> "ControllerSpec":
+        # Every leaf ``ref`` in the done Predicate must address ``evaluate_node``:
+        # at evaluation time only that node's output is supplied to the Predicate
+        # (``_iteration_verdict`` returns ``None`` for any other node), so a ref to a
+        # typo or a different node would silently evaluate false and the loop would
+        # wrongly EXHAUST. Reject it at validation, mirroring ``model.py``'s
+        # ``when``-refs-must-be-in-``needs`` invariant — fail fast over fail silent.
+        for ref in self.done.leaf_refs():
+            if ref.node != self.evaluate_node:
+                raise ValueError(
+                    f"done predicate references node {ref.node!r}, but only "
+                    f"evaluate_node {self.evaluate_node!r}'s output is available to it"
+                )
+        return self
 
 
 @dataclass(frozen=True)
@@ -232,7 +254,7 @@ async def _drive_loop(
 
     ``iterations`` seeds the already-completed iterations (empty for a fresh group);
     ``feedback_value`` seeds the value to feed into the next iteration. The loop
-    materializes iterations until the done-predicate holds, an iteration fails, or
+    materializes iterations until the done Predicate holds, an iteration fails, or
     the iteration index reaches ``max_iterations``.
     """
     resolved_registry = registry or AdapterRegistry()
@@ -267,10 +289,12 @@ async def _drive_loop(
             return GroupResult(group_id=group_id, status=status, iterations=tuple(completed))
 
         # Not yet done and not the last iteration: feed this iteration's output
-        # forward and persist the in-progress group state before the next run.
+        # forward and persist the in-progress (RUNNING) group state before the next
+        # run, so an interruption here is distinguishable from a terminal EXHAUSTED.
         feedback_value = _next_feedback(spec, run_dir, result.run_id)
-        _persist_group_state(spec, base, group_id, tuple(completed), GROUP_EXHAUSTED)
+        _persist_group_state(spec, base, group_id, tuple(completed), GROUP_RUNNING)
 
+    # The cap was reached without done: this EXHAUSTED is terminal.
     _persist_group_state(spec, base, group_id, tuple(completed), GROUP_EXHAUSTED)
     return GroupResult(group_id=group_id, status=GROUP_EXHAUSTED, iterations=tuple(completed))
 
@@ -280,7 +304,7 @@ def _iteration_verdict(
 ) -> str | None:
     """The terminal group status if the loop should stop after this iteration, else None.
 
-    Stops on a failed Run, or on the done-predicate holding over the evaluate-node's
+    Stops on a failed Run, or on the done Predicate holding over the evaluate-node's
     output. Returns ``None`` to continue (the caller also stops at max_iterations).
     """
     if not result.succeeded:
@@ -367,21 +391,25 @@ async def resume_loop_until_done(
 ) -> GroupResult:
     """Resume an interrupted Run Group at the GROUP level (AC5, ADR 0002 / 0009).
 
-    Re-reads ``group.json``; a SUCCEEDED iteration Run is never re-run (Resume
-    Eligibility, CONTEXT.md). If the last recorded iteration's Run is incomplete it
-    is ``resume_run``'d in place, then the loop continues from the persisted
-    iteration index with feedback fed forward from the last completed iteration. A
-    group that already finished (done/failed/exhausted with nothing left) is refused.
+    Re-reads ``group.json`` and resumes only a non-terminal Run Group. A TERMINAL
+    group is refused: ``done`` (the done Predicate held) and ``exhausted`` (the cap
+    was reached) both have nothing left to do. A RESUMABLE group continues: a
+    ``running`` group was interrupted between iterations, so the loop continues from
+    the persisted iteration index; a ``failed`` group's last iteration Run is
+    resumable (Resume Eligibility, CONTEXT.md), so ``resume_run`` re-runs it in place
+    and the loop continues. A SUCCEEDED iteration Run is never re-run; if the last
+    recorded iteration's Run is incomplete it is ``resume_run``'d in place, then the
+    loop continues with feedback fed forward from the last completed iteration.
     """
     persisted = load_group_state(group_id, base)
     spec = ControllerSpec.model_validate(persisted["spec"])
     resolved_registry = registry or AdapterRegistry()
     iterations_root = group_iterations_root(group_id, base)
 
-    if persisted["status"] == GROUP_DONE:
+    status = persisted["status"]
+    if status in {GROUP_DONE, GROUP_EXHAUSTED}:
         raise ControllerError(
-            f"run group {group_id!r} already finished (status: {persisted['status']}); "
-            f"nothing to resume"
+            f"run group {group_id!r} already finished (status: {status}); nothing to resume"
         )
 
     completed = [

@@ -9,7 +9,7 @@ ADR 0002 decided that every pattern iteration is a separate immutable Run and th
 Pattern Controller evaluates the finished Run N and materializes Run N+1, linking them
 into a Run Group. ADR 0008 then realized the OTHER pattern axis — Pattern Expanders that
 compile to one Run's plain IR — and explicitly left the Controller axis (run groups,
-iteration index, stop conditions) as "a heavier, distinct axis." This ADR records HOW the
+iteration index, done Predicate) as "a heavier, distinct axis." This ADR records HOW the
 Controller axis is built, proven by `loop_until_done`, and why each mechanism is shaped as
 it is. The kernel stays ignorant of controllers: `execute_run`/`resume_run` are unchanged
 and a Controller drives them as black boxes from Python, never from the IR.
@@ -35,7 +35,7 @@ workflow it drives:
 - `done`: a structured `Predicate` (the existing `when` algebra, ADR 0007) evaluated
   against the finished Run's named node output. CONTEXT.md makes the Predicate the SOLE
   conditional mechanism and "a composable structured algebra, not an expression string";
-  the stop condition reuses it verbatim rather than inventing a stop-condition DSL.
+  the done Predicate reuses it verbatim rather than inventing a done-Predicate DSL.
 - `evaluate_node`: the id of the Run's node whose normalized output the `done` predicate
   and the feedback source read. A Run can have several leaf nodes, so the spec names the
   one that carries the iteration's verdict explicitly, mirroring how a `when` ref names a
@@ -98,10 +98,16 @@ status records which: `failed`, `done`, or `exhausted`.
 
 ### Group-level resume (the Run Group is the resumption unit)
 
-A Run Group resumes (AC5) by re-reading `group.json`: a SUCCEEDED iteration Run is never
-re-run (Resume Eligibility, CONTEXT.md), an incomplete last iteration is `resume_run`'d in
-place, and the loop then continues from the persisted iteration index. The kernel's
-`is_resumable` rule is honored per iteration. Resuming a single iteration by raw run id
+A Run Group resumes (AC5) by re-reading `group.json`, and only a NON-TERMINAL group
+resumes. The group status disambiguates: `running` (an in-progress marker persisted
+between iterations) and `failed` (the last iteration's Run failed and is itself resumable
+per Resume Eligibility) are RESUMABLE; `done` (the done Predicate held) and `exhausted`
+(the cap was reached) are TERMINAL and refused with a clear error — nothing is left to do.
+On a resumable group a SUCCEEDED iteration Run is never re-run (Resume Eligibility,
+CONTEXT.md), an incomplete last iteration is `resume_run`'d in place, and the loop then
+continues from the persisted iteration index. The kernel's `is_resumable` rule is honored
+per iteration — a `failed` group's last Run is resumed in place before the loop continues.
+Resuming a single iteration by raw run id
 through `caw resume` is intentionally NOT supported: iterations live under the group dir,
 not `.caw/runs/`, so `caw resume <iteration_run_id>` finds no run dir — the Run Group, not
 a lone iteration, is the resumption unit (ADR 0002).

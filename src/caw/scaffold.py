@@ -135,9 +135,9 @@ _LOOP_SPEC = """\
 # Group with `caw loop report <group-id>`.
 workflow: loop-iteration.yaml
 max_iterations: 5
-# The node whose normalized output the done-predicate and feedback source read.
+# The node whose normalized output the done Predicate and feedback source read.
 evaluate_node: verdict
-# The stop condition reuses the `when` Predicate algebra (the sole conditional
+# The done Predicate reuses the `when` Predicate algebra (the sole conditional
 # mechanism): done when the `verdict` node's stdout contains FINISHED.
 done:
   ref:

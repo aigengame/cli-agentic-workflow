@@ -210,10 +210,13 @@ def test_loop_resume_continues_a_group(tmp_path: Path, monkeypatch: pytest.Monke
     assert "exhausted" in first.output
     group_id = _group_id(first.output)
 
-    # Interruption shape: reopen the cap so the resume continues past iteration 1.
+    # Interruption shape: a real interruption between iterations persists the
+    # in-progress `running` marker (not the terminal `exhausted`). Mark it `running`
+    # and reopen the cap so the resume continues past iteration 1.
     state_path = tmp_path / ".caw" / "groups" / group_id / "group.json"
     persisted = json.loads(state_path.read_text())
     persisted["spec"]["max_iterations"] = 5
+    persisted["status"] = "running"
     state_path.write_text(json.dumps(persisted, indent=2) + "\n")
 
     resumed = runner.invoke(app, ["loop", "resume", group_id])

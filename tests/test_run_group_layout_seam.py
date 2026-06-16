@@ -36,7 +36,7 @@ def test_group_iterations_root_holds_the_per_iteration_runs(tmp_path: Path) -> N
 
 
 def test_group_state_path_is_the_controller_state_file(tmp_path: Path) -> None:
-    # Controller state (iteration index, stop-condition inputs, per-iteration run
+    # Controller state (iteration index, done Predicate inputs, per-iteration run
     # ids) is persisted in one JSON file the group dir owns (#15 / ADR 0002).
     state_path = runlayout.group_state_path("grp-1", tmp_path)
     assert state_path == tmp_path / ".caw" / "groups" / "grp-1" / "group.json"

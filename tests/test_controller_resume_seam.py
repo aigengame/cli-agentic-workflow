@@ -75,18 +75,20 @@ def _spec(workflow: Path, *, max_iterations: int) -> ControllerSpec:
     )
 
 
-def _bump_max_iterations(group_id: str, base: Path, new_max: int) -> None:
+def _interrupt_after_iteration(group_id: str, base: Path, new_max: int) -> None:
     """Simulate an interruption: iteration 1 completed (not done) then the loop died.
 
-    The persisted ``group.json`` after a non-final iteration records that iteration
-    with the in-progress (``exhausted``) marker. Raising ``max_iterations`` re-opens
-    the loop so a resume continues past the completed iteration — exactly the
-    "interrupted before the next iteration ran" shape, without killing a process
-    mid-run in a unit test.
+    A real interruption between iterations persists ``group.json`` with the in-progress
+    ``running`` marker (the loop hadn't reached the cap or done). This rewrites the
+    capped-pass ``exhausted`` status to ``running`` AND raises ``max_iterations`` so a
+    resume treats the group as interrupted and continues past the completed iteration —
+    exactly the "interrupted before the next iteration ran" shape, without killing a
+    process mid-run in a unit test.
     """
     state_path = group_state_path(group_id, base)
     persisted = json.loads(state_path.read_text(encoding="utf-8"))
     persisted["spec"]["max_iterations"] = new_max
+    persisted["status"] = "running"
     state_path.write_text(json.dumps(persisted, indent=2) + "\n", encoding="utf-8")
 
 
@@ -112,8 +114,9 @@ async def test_group_resume_does_not_rerun_a_completed_iteration(tmp_path: Path)
         attempts_before = state.max_attempt_per_node(iteration1_run_id)
     snapshot_before = (iteration1_dir / "workflow.normalized.json").read_text()
 
-    # Interruption: the loop died after iteration 1; reopen the cap and resume.
-    _bump_max_iterations(first.group_id, tmp_path, new_max=5)
+    # Interruption: the loop died after iteration 1; mark it RUNNING, reopen the cap,
+    # and resume.
+    _interrupt_after_iteration(first.group_id, tmp_path, new_max=5)
     resumed = await resume_loop_until_done(first.group_id, base=tmp_path)
 
     assert resumed.status == "done", "the resumed loop ran iteration 2 and stopped on done"
@@ -148,6 +151,58 @@ async def test_resuming_a_finished_done_group_is_refused(tmp_path: Path) -> None
 
     with pytest.raises(ControllerError, match="already finished"):
         await resume_loop_until_done(result.group_id, base=tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_resuming_an_exhausted_group_is_refused(tmp_path: Path) -> None:
+    # A group that hit its cap (exhausted) is TERMINAL: there is nothing left to do,
+    # so resume refuses it with a clear error, exactly like a done group — both are
+    # terminal stop reasons, distinct from the in-progress `running` marker.
+    from caw.controller import ControllerError
+
+    _write_fixture(tmp_path / "loop.fixture.json", done=False, next_fixture="loop.fixture.json")
+    workflow = _write_workflow(tmp_path, "loop.fixture.json")
+
+    result = await run_loop_until_done(_spec(workflow, max_iterations=2), base=tmp_path)
+    assert result.status == "exhausted", "the loop hit the cap without reaching done"
+
+    with pytest.raises(ControllerError, match="already finished"):
+        await resume_loop_until_done(result.group_id, base=tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_resuming_a_failed_group_reruns_the_failed_iteration_and_continues(
+    tmp_path: Path,
+) -> None:
+    # A group whose last iteration FAILED is RESUMABLE (Resume Eligibility): the failed
+    # last Run is `resume_run`'d in place, and once it succeeds the loop continues. Here
+    # the iteration's fixture fails first (non-zero exit), then is rewritten to a
+    # succeeding done fixture before resume — so the in-place re-run reaches done and the
+    # group stops, reusing the same iteration run id (not a fresh iteration).
+    fixture = tmp_path / "iter.fixture.json"
+    fixture.write_text(json.dumps({"exit_status": 1, "stderr": "boom"}), encoding="utf-8")
+    workflow = _write_workflow(tmp_path, "iter.fixture.json")
+
+    first = await run_loop_until_done(_spec(workflow, max_iterations=3), base=tmp_path)
+    assert first.status == "failed", "the first pass stopped on the failed iteration"
+    assert len(first.iterations) == 1
+    failed_run_id = first.iterations[0].run_id
+    assert not first.iterations[0].succeeded
+
+    # The failure was transient: rewrite the fixture to succeed-and-report-done, then
+    # resume. `resume_run` re-runs the failed node in place under the SAME run id.
+    _write_fixture(fixture, done=True)
+    resumed = await resume_loop_until_done(first.group_id, base=tmp_path)
+
+    assert resumed.status == "done", "the re-run iteration now succeeds and reports done"
+    assert resumed.iterations[0].run_id == failed_run_id, (
+        "the failed iteration is resumed in place — same run id, not a fresh iteration"
+    )
+    assert resumed.iterations[0].succeeded, "the resumed iteration's Run now succeeded"
+
+    # group.json records the terminal done status after the resume.
+    persisted = load_group_state(first.group_id, tmp_path)
+    assert persisted["status"] == "done"
 
 
 @pytest.mark.asyncio

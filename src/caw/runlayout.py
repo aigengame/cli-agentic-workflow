@@ -60,7 +60,7 @@ def group_iterations_root(group_id: str, base: Path | None = None) -> Path:
 def group_state_path(group_id: str, base: Path | None = None) -> Path:
     """The controller-state file of a Run Group: ``<group_dir>/group.json`` (#15).
 
-    Persists the controller's iteration index, stop-condition inputs, and the
+    Persists the controller's iteration index, done Predicate inputs, and the
     ordered per-iteration run ids — the Run Group's resumable state (ADR 0002).
     """
     return group_dir(group_id, base) / _GROUP_STATE_FILENAME

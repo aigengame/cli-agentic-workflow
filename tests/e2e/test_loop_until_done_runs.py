@@ -4,10 +4,10 @@ A Pattern Controller must drive a REAL Agent CLI iteration through ``execute_run
 into a Run Group, exactly as the offline mock suite proves the control flow. The
 mock seam tests prove the loop's mechanics (stop-on-done / feedback / membership /
 group resume); this proves a controller iteration actually reaches the real CLI,
-records its Run Group membership, and the done-predicate stops the loop.
+records its Run Group membership, and the done Predicate stops the loop.
 
 Token-frugal by construction: ONE real agent call. The iteration asks for a single
-structured answer; the done-predicate holds on iteration 1 (``exit_status equals 0``
+structured answer; the done Predicate holds on iteration 1 (``exit_status equals 0``
 over the successful agent Node), so the loop stops after exactly one real iteration —
 proving the full controller path (materialize -> execute_run -> evaluate -> stop)
 against the live CLI, not a degenerate offline stand-in. Assertions are
@@ -40,7 +40,7 @@ async def test_loop_until_done_iteration_reaches_the_real_agent_cli(
     # A loop-until-done controller whose iteration is a real agent Node: the
     # controller materializes the iteration, runs it through execute_run against the
     # real `claude -p`, validates the structured output, records the iteration's Run
-    # Group membership, and the done-predicate (exit_status == 0) stops the loop at
+    # Group membership, and the done Predicate (exit_status == 0) stops the loop at
     # iteration 1.
     harness.require_agent_cli(agent)  # FAIL (not skip) when the selected CLI is absent
     schema = tmp_path / "answer.schema.json"
@@ -107,9 +107,9 @@ async def test_loop_until_done_iteration_reaches_the_real_agent_cli(
     async def do_loop() -> GroupResult:
         return await run_loop_until_done(spec, base=tmp_path, registry=AdapterRegistry())
 
-    result = await _retry_group(do_loop)
+    result = await _retry_group(do_loop, base=tmp_path)
 
-    assert result.status == "done", "the done-predicate stopped the loop at iteration 1"
+    assert result.status == "done", "the done Predicate stopped the loop at iteration 1"
     assert len(result.iterations) == 1, "exactly one real iteration ran"
     iteration_result = result.iterations[0]
     assert iteration_result.succeeded, "the real agent iteration succeeded"
@@ -128,7 +128,7 @@ async def test_loop_until_done_iteration_reaches_the_real_agent_cli(
     assert isinstance(structured.get("answer"), int)
 
 
-async def _retry_group(do_loop: Callable[[], Awaitable[GroupResult]]) -> GroupResult:
+async def _retry_group(do_loop: Callable[[], Awaitable[GroupResult]], base: Path) -> GroupResult:
     """Retry the loop on a TRANSIENT failure of its single iteration (decision #6).
 
     A Run Group whose only iteration failed for a transient reason (network / 5xx /
@@ -137,14 +137,26 @@ async def _retry_group(do_loop: Callable[[], Awaitable[GroupResult]]) -> GroupRe
     """
     result = await do_loop()
     attempts = 1
-    while attempts < harness.DEFAULT_MAX_ATTEMPTS and _group_is_transient(result):
+    while attempts < harness.DEFAULT_MAX_ATTEMPTS and _group_is_transient(result, base):
         result = await do_loop()
         attempts += 1
     return result
 
 
-def _group_is_transient(result: GroupResult) -> bool:
-    """Whether a finished Run Group failed for a transient reason on its last iteration."""
+def _group_is_transient(result: GroupResult, base: Path) -> bool:
+    """Whether a finished Run Group failed for a TRANSIENT reason on its last iteration.
+
+    Only a ``failed`` group is retryable, and only when the failed iteration's persisted
+    stderr carries a transient marker. The classification reuses the harness's
+    State-reading classifier (:func:`harness.cli_run_is_transient`) over the failed
+    iteration's run dir — exactly how the CLI-seam e2e tests classify a transient Run —
+    so a DETERMINISTIC failure (bad flag, schema/auth/contract breach) is NOT retried and
+    cannot multiply real agent calls.
+    """
     if result.status != "failed" or not result.iterations:
         return False
-    return any(not iteration.succeeded for iteration in result.iterations)
+    last = result.iterations[-1]
+    if last.succeeded:
+        return False
+    run_dir = group_iterations_root(result.group_id, base) / last.run_id
+    return harness.cli_run_is_transient(run_dir)
