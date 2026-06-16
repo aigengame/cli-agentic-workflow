@@ -731,12 +731,12 @@ class _Scheduler:
         Mirrors ``_on_success`` so a skip unblocks dependents the same way a
         success does: a ``join: any`` Node's indegree can still reach 0 after one
         branch skips, leaving it ready to run on its surviving branch. The join
-        tolerance is enforced not by an extra readiness gate but by skip
-        propagation (``_propagate_skip_to_dependents``): a ``join: any`` Node is
-        skipped — cause ``all_branches_skipped`` — only once EVERY dependency has
-        skipped, and the ``done``-set exclusion in ``_ready_nodes`` then keeps it
-        from being launched. A ``join: all`` Node is instead skipped as soon as
-        any one dependency skips.
+        tolerance is enforced not by an extra readiness gate but by the skip walk
+        (``_propagate_skips``): a ``join: any`` Node is skipped — cause
+        ``all_branches_skipped`` — only once EVERY dependency has skipped, and the
+        ``done``-set exclusion in ``_ready_nodes`` then keeps it from being
+        launched. A ``join: all`` Node is instead skipped as soon as any one
+        dependency skips.
         """
         for dependent in self._dependents[node_id]:
             self._indegree[dependent] -= 1
