@@ -149,8 +149,9 @@ def patterns_init(
     Writes the workflow file plus any companion fixture files beside it, so the
     scaffolded bundle runs to success offline with the mock Adapter. The chosen
     path names the workflow file; companions are written in its directory. The
-    whole bundle is written only if NO target file exists, so an existing file is
-    never clobbered.
+    whole bundle is written only if NO target file exists and no two bundle files
+    collide on one destination, so an existing file is never clobbered and the
+    workflow is never overwritten by one of its own companions.
     """
     example = PATTERN_EXAMPLES.get(name)
     if example is None:
@@ -167,8 +168,25 @@ def patterns_init(
         )
         for filename in example.files
     }
-    # Refuse the WHOLE bundle if any target exists, so a partial scaffold never
-    # clobbers one file and leaves the rest unwritten.
+    # Guard the WHOLE bundle before writing a single file. First: a chosen workflow
+    # path whose name collides with a companion fixture maps two bundle files to ONE
+    # destination — the write loop would overwrite the workflow with fixture JSON yet
+    # still report success, leaving a non-runnable "workflow". Reject the collision.
+    by_destination: dict[Path, str] = {}
+    for filename, target in targets.items():
+        resolved = target.resolve()
+        collides_with = by_destination.get(resolved)
+        if collides_with is not None:
+            typer.echo(
+                f"error: {target} is the destination of both {collides_with!r} and "
+                f"{filename!r} in the {name} bundle; choose a workflow path whose name "
+                f"does not collide with a companion file",
+                err=True,
+            )
+            raise typer.Exit(code=2)
+        by_destination[resolved] = filename
+    # Second: refuse the whole bundle if any target exists, so a partial scaffold
+    # never clobbers one file and leaves the rest unwritten.
     for target in targets.values():
         if target.exists():
             typer.echo(f"error: {target} already exists; refusing to overwrite it", err=True)

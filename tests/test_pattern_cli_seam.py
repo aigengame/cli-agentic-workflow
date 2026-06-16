@@ -34,12 +34,12 @@ def _pipeline_pattern_file(directory: Path) -> Path:
     return workflow_file
 
 
-def test_graph_shows_the_expanded_dag_of_a_pipeline_pattern(
+def test_graph_shows_the_expanded_plan_of_a_pipeline_pattern(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # AC: a `pattern:` file's expanded DAG is visible in `caw graph` — the JSON
+    # AC: a `pattern:` file's expanded plan is visible in `caw graph` — the JSON
     # plan shows the plain nodes and the chained edges the expander produced, so a
-    # user inspects the materialized graph before running it.
+    # user inspects the materialized Workflow before running it.
     workflow_file = _pipeline_pattern_file(tmp_path)
     monkeypatch.chdir(tmp_path)
 
@@ -190,3 +190,25 @@ def test_patterns_init_refuses_to_overwrite_an_existing_file(
 
     assert result.exit_code == 2
     assert existing.read_text(encoding="utf-8") == "name: mine\n", "the file is untouched"
+
+
+def test_patterns_init_refuses_a_workflow_path_colliding_with_a_companion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Regression: a chosen workflow path whose basename equals a companion fixture
+    # maps two bundle files to ONE destination. The write loop would write the
+    # workflow there and then overwrite it with fixture JSON while still reporting
+    # success, leaving a non-runnable "workflow". The collision is refused (exit 2,
+    # one `error:` line) before anything is written, so no partial bundle is left.
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["patterns", "init", "pipeline", "draft.fixture.json"])
+
+    assert result.exit_code == 2, result.output
+    lines = [line for line in result.output.splitlines() if line.strip()]
+    assert len(lines) == 1
+    assert lines[0].startswith("error:")
+    assert "draft.fixture.json" in lines[0], "the error names the colliding destination"
+    # Nothing was written: not the colliding target, not the other companions.
+    assert not (tmp_path / "draft.fixture.json").exists(), "no file is written on collision"
+    assert not (tmp_path / "review.fixture.json").exists(), "the bundle is all-or-nothing"

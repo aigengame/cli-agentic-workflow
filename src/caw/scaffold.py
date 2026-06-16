@@ -55,7 +55,7 @@ def _fixture(structured_output: str) -> str:
 # path end to end with no real Agent CLI installed.
 _PIPELINE_WORKFLOW = """\
 # A runnable `pipeline` pattern example: three mock-Adapter agent steps chained
-# draft -> review -> publish. Inspect the expanded DAG with
+# draft -> review -> publish. Inspect the expanded workflow with
 # `caw graph pipeline.yaml` and run it with `caw run pipeline.yaml` — the `mock`
 # adapter replays each step's fixture, so no real Agent CLI is required.
 name: pipeline-example
@@ -90,7 +90,7 @@ pattern:
 _PARALLEL_WORKFLOW = """\
 # A runnable `parallel` pattern example: two independent mock-Adapter agent
 # branches run concurrently, then a `merge` agent fans them in. Inspect the
-# expanded DAG with `caw graph parallel.yaml` and run it with
+# expanded workflow with `caw graph parallel.yaml` and run it with
 # `caw run parallel.yaml` — the `mock` adapter replays each fixture, so no real
 # Agent CLI is required.
 name: parallel-example
