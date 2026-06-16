@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.12.0](https://github.com/aigengame/cli-agentic-workflow/compare/v0.11.0...v0.12.0) (2026-06-16)
+
+
+### Features
+
+* codex.exec adapter, capability-symmetric with claude.print ([#11](https://github.com/aigengame/cli-agentic-workflow/issues/11)) ([#101](https://github.com/aigengame/cli-agentic-workflow/issues/101)) ([477f15e](https://github.com/aigengame/cli-agentic-workflow/commit/477f15e5b3a3aaa15179d1b7311c0f925eb4586c))
+* pattern controller infrastructure + run groups + loop-until-done ([#15](https://github.com/aigengame/cli-agentic-workflow/issues/15)) ([#104](https://github.com/aigengame/cli-agentic-workflow/issues/104)) ([3227b3e](https://github.com/aigengame/cli-agentic-workflow/commit/3227b3eae3c2a6cdccf5cd7778d8b9074f8a5fc0))
+
 ## [0.11.0](https://github.com/aigengame/cli-agentic-workflow/compare/v0.10.0...v0.11.0) (2026-06-16)
 
 
