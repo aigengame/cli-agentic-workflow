@@ -48,9 +48,7 @@ def _reject_declared_needs(node: NodeDict | None, role: str, reason: str) -> Nod
     return node
 
 
-def _reject_declared_needs_each(
-    nodes: list[NodeDict], role: str, reason: str
-) -> list[NodeDict]:
+def _reject_declared_needs_each(nodes: list[NodeDict], role: str, reason: str) -> list[NodeDict]:
     """Apply :func:`_reject_declared_needs` to each node in a list, returning it."""
     for node in nodes:
         _reject_declared_needs(node, role, reason)

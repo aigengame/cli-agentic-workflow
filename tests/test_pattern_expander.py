@@ -312,7 +312,11 @@ def _classify_and_act_raw() -> dict[str, Any]:
                     "id": "handle-bug",
                     "kind": "shell",
                     "when": {
-                        "ref": {"node": "classify", "field": "structured_output", "path": ["category"]},
+                        "ref": {
+                            "node": "classify",
+                            "field": "structured_output",
+                            "path": ["category"],
+                        },
                         "op": "equals",
                         "value": "bug",
                     },
@@ -322,7 +326,11 @@ def _classify_and_act_raw() -> dict[str, Any]:
                     "id": "handle-feature",
                     "kind": "shell",
                     "when": {
-                        "ref": {"node": "classify", "field": "structured_output", "path": ["category"]},
+                        "ref": {
+                            "node": "classify",
+                            "field": "structured_output",
+                            "path": ["category"],
+                        },
                         "op": "equals",
                         "value": "feature",
                     },
@@ -380,7 +388,11 @@ def test_expanded_classify_and_act_is_identical_to_the_handwritten_equivalent() 
                     "kind": "shell",
                     "needs": ["classify"],
                     "when": {
-                        "ref": {"node": "classify", "field": "structured_output", "path": ["category"]},
+                        "ref": {
+                            "node": "classify",
+                            "field": "structured_output",
+                            "path": ["category"],
+                        },
                         "op": "equals",
                         "value": "bug",
                     },
@@ -391,7 +403,11 @@ def test_expanded_classify_and_act_is_identical_to_the_handwritten_equivalent() 
                     "kind": "shell",
                     "needs": ["classify"],
                     "when": {
-                        "ref": {"node": "classify", "field": "structured_output", "path": ["category"]},
+                        "ref": {
+                            "node": "classify",
+                            "field": "structured_output",
+                            "path": ["category"],
+                        },
                         "op": "equals",
                         "value": "feature",
                     },
@@ -478,7 +494,11 @@ def _generate_and_filter_raw() -> dict[str, Any]:
             "filter": {
                 "id": "accept",
                 "kind": "agent",
-                "inputs": {"adapter": "mock", "prompt": "Keep the strong ideas", "fixture": "f.json"},
+                "inputs": {
+                    "adapter": "mock",
+                    "prompt": "Keep the strong ideas",
+                    "fixture": "f.json",
+                },
             },
         },
     }
@@ -518,7 +538,11 @@ def test_expanded_generate_and_filter_is_identical_to_the_handwritten_equivalent
                     "id": "accept",
                     "kind": "agent",
                     "needs": ["candidate-1", "candidate-2"],
-                    "inputs": {"adapter": "mock", "prompt": "Keep the strong ideas", "fixture": "f.json"},
+                    "inputs": {
+                        "adapter": "mock",
+                        "prompt": "Keep the strong ideas",
+                        "fixture": "f.json",
+                    },
                 },
             ],
         },
@@ -575,7 +599,11 @@ def _fan_out_synthesis_raw() -> dict[str, Any]:
             "synthesize": {
                 "id": "synthesize",
                 "kind": "agent",
-                "inputs": {"adapter": "mock", "prompt": "Synthesize the angles", "fixture": "s.json"},
+                "inputs": {
+                    "adapter": "mock",
+                    "prompt": "Synthesize the angles",
+                    "fixture": "s.json",
+                },
             },
         },
     }
@@ -615,7 +643,11 @@ def test_expanded_fan_out_synthesis_is_identical_to_the_handwritten_equivalent()
                     "id": "synthesize",
                     "kind": "agent",
                     "needs": ["angle-a", "angle-b"],
-                    "inputs": {"adapter": "mock", "prompt": "Synthesize the angles", "fixture": "s.json"},
+                    "inputs": {
+                        "adapter": "mock",
+                        "prompt": "Synthesize the angles",
+                        "fixture": "s.json",
+                    },
                 },
             ],
         },
