@@ -13,6 +13,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
+from caw.runlayout import group_iterations_root, group_state_path
 from caw.state import StateStore
 
 
@@ -169,3 +170,142 @@ _RENDERERS: dict[ReportFormat, Callable[[dict[str, Any]], str]] = {
 def render_report(run_dir: Path, format: ReportFormat) -> str:
     """Render a report of the Run at ``run_dir`` in the requested format."""
     return _RENDERERS[format](_gather(run_dir))
+
+
+class GroupReportError(Exception):
+    """Raised when a Run Group cannot be reported (absent or with a missing iteration)."""
+
+
+def _gather_group(group_id: str, base: Path) -> dict[str, Any]:
+    """Aggregate a Run Group's per-iteration reports into one result (#15, AC6).
+
+    Reads the authoritative ``group.json`` for the group's status and ordered
+    iterations, then renders each iteration's per-run report with the SAME
+    single-run gatherer (``_gather``) — so each iteration carries its own
+    conclusion (run id, node statuses, artifacts, errors) distinct from its trace
+    evidence (events), exactly as a standalone run report does. The Run Group is
+    the unit of aggregate reporting (ADR 0002).
+    """
+    state_path = group_state_path(group_id, base)
+    if not state_path.is_file():
+        groups_root = state_path.parent.parent
+        raise GroupReportError(f"no run group for group id {group_id!r} under {groups_root}")
+    persisted = json.loads(state_path.read_text(encoding="utf-8"))
+    iterations_root = group_iterations_root(group_id, base)
+    iterations = []
+    for entry in persisted["iterations"]:
+        run_dir = iterations_root / entry["run_id"]
+        per_run = _gather(run_dir)
+        iterations.append(
+            {
+                "iteration_index": entry["iteration_index"],
+                "run_id": per_run["run_id"],
+                "status": per_run["status"],
+                "nodes": per_run["nodes"],
+                "graph": per_run["graph"],
+                "trace": per_run["trace"],
+            }
+        )
+    return {
+        "group_id": persisted["group_id"],
+        "status": persisted["status"],
+        "iteration_count": len(iterations),
+        "iterations": iterations,
+    }
+
+
+def _render_group_json(report: dict[str, Any]) -> str:
+    """Machine-readable aggregate: group status + each iteration's conclusion + trace."""
+    contract = {
+        "group_id": report["group_id"],
+        "status": report["status"],
+        "iteration_count": report["iteration_count"],
+        "iterations": [
+            {
+                key: iteration[key]
+                for key in ("iteration_index", "run_id", "status", "nodes", "trace")
+            }
+            for iteration in report["iterations"]
+        ],
+    }
+    return json.dumps(contract, indent=2)
+
+
+def _render_group_jsonl(report: dict[str, Any]) -> str:
+    """Line-delimited aggregate: a group record, then per-iteration conclusion + events."""
+    lines = [
+        json.dumps(
+            {
+                "record": "group",
+                "group_id": report["group_id"],
+                "status": report["status"],
+                "iteration_count": report["iteration_count"],
+            }
+        )
+    ]
+    for iteration in report["iterations"]:
+        lines.append(
+            json.dumps(
+                {
+                    "record": "iteration",
+                    "iteration_index": iteration["iteration_index"],
+                    "run_id": iteration["run_id"],
+                    "status": iteration["status"],
+                    "nodes": iteration["nodes"],
+                }
+            )
+        )
+        lines += [
+            json.dumps(
+                {"record": "event", "iteration_index": iteration["iteration_index"], **event}
+            )
+            for event in iteration["trace"]
+        ]
+    return "\n".join(lines)
+
+
+def _render_group_text(report: dict[str, Any]) -> str:
+    """Plain text: the group status, then each iteration's conclusion."""
+    lines = [
+        f"group {report['group_id']}: {report['status']} ({report['iteration_count']} iterations)"
+    ]
+    for iteration in report["iterations"]:
+        lines.append(
+            f"  iteration {iteration['iteration_index']} ({iteration['run_id']}): "
+            f"{iteration['status']}"
+        )
+        for node in iteration["nodes"]:
+            lines.append(f"    {node['id']}: {node['status']}{_node_detail(node)}")
+    return "\n".join(lines)
+
+
+def _render_group_markdown(report: dict[str, Any]) -> str:
+    """Markdown: the group heading and status, then a section per iteration."""
+    out = [
+        f"# Run Group {report['group_id']}",
+        "",
+        f"**Status:** {report['status']}",
+        f"**Iterations:** {report['iteration_count']}",
+        "",
+    ]
+    for iteration in report["iterations"]:
+        out += [f"## Iteration {iteration['iteration_index']}", ""]
+        out.append(f"**Run:** {iteration['run_id']} — {iteration['status']}")
+        out += ["", "### Nodes", ""]
+        for node in iteration["nodes"]:
+            out.append(f"- {node['id']} — {node['status']}{_node_detail(node)}")
+        out.append("")
+    return "\n".join(out)
+
+
+_GROUP_RENDERERS: dict[ReportFormat, Callable[[dict[str, Any]], str]] = {
+    ReportFormat.json: _render_group_json,
+    ReportFormat.jsonl: _render_group_jsonl,
+    ReportFormat.text: _render_group_text,
+    ReportFormat.markdown: _render_group_markdown,
+}
+
+
+def render_group_report(group_id: str, base: Path, format: ReportFormat) -> str:
+    """Render an aggregate report of a Run Group in the requested format (#15, AC6)."""
+    return _GROUP_RENDERERS[format](_gather_group(group_id, base))

@@ -81,6 +81,60 @@ def test_recording_an_attempt_for_a_nonexistent_node_is_rejected(tmp_path: Path)
         )
 
 
+def test_run_group_membership_is_recorded_and_read_back(tmp_path: Path) -> None:
+    # AC3 (#15): a Run records its run group id and iteration index. A Pattern
+    # Controller writes the membership row into each iteration's run State after
+    # execute_run mints the run, so the run itself carries which group and which
+    # iteration it is — queryable from the run, not only from group.json.
+    db_path = tmp_path / "state.sqlite"
+    with StateStore(db_path) as state:
+        state.record_run_started(
+            run_id="run-1",
+            workflow_name="loop",
+            definition_checksum="sha256:abc",
+            created_at="2026-06-16T00:00:00+00:00",
+        )
+        state.record_run_group_membership(run_id="run-1", run_group_id="grp-1", iteration_index=2)
+
+    with StateStore(db_path) as reopened:
+        assert reopened.run_group_membership("run-1") == ("grp-1", 2)
+
+
+def test_run_group_membership_of_an_unmembered_run_is_none(tmp_path: Path) -> None:
+    # A standalone run (not in a group) has no membership row, so the read returns
+    # None — an ordinary single-Run directory is undisturbed by the additive table.
+    with StateStore(tmp_path / "state.sqlite") as state:
+        state.record_run_started(
+            run_id="solo",
+            workflow_name="sample",
+            definition_checksum="sha256:abc",
+            created_at="2026-06-16T00:00:00+00:00",
+        )
+        assert state.run_group_membership("solo") is None
+
+
+def test_run_group_membership_table_is_additive_over_a_pre_existing_db(tmp_path: Path) -> None:
+    # The membership table is added via CREATE TABLE IF NOT EXISTS (the established
+    # convention, #76 lesson): reopening a State db created WITHOUT it must add the
+    # table with no destructive migration and no error, so an older run directory is
+    # forward-compatible. Simulate a pre-#15 db by creating the run/node/attempt
+    # tables only, then reopening through StateStore.
+    db_path = tmp_path / "state.sqlite"
+    legacy = sqlite3.connect(db_path)
+    legacy.executescript(
+        "CREATE TABLE run (run_id TEXT PRIMARY KEY, workflow_name TEXT, "
+        "definition_checksum TEXT, status TEXT, created_at TEXT, finished_at TEXT, error TEXT);"
+    )
+    legacy.commit()
+    legacy.close()
+
+    with StateStore(db_path) as reopened:
+        reopened.record_run_group_membership(
+            run_id="run-1", run_group_id="grp-1", iteration_index=0
+        )
+        assert reopened.run_group_membership("run-1") == ("grp-1", 0)
+
+
 def test_a_failure_during_construction_closes_the_connection(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

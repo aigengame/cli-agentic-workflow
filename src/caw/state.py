@@ -1,4 +1,17 @@
-"""Durable Run State persisted as SQLite inside the run directory."""
+"""Durable Run State persisted as SQLite inside the run directory.
+
+Schema changes are ADDITIVE: every table is created with ``CREATE TABLE IF NOT
+EXISTS`` and existing tables are never ``ALTER``ed, so reopening a State database
+written by an older caw version adds any new table without a destructive migration
+(the #76 lesson — a column added to an existing table is a silent no-op that
+crashes the first write, which a new TABLE never does). The Run Group membership
+table (#15) follows this rule: it is a NEW table, so an older single-run directory
+simply gains it on reopen. It carries NO foreign key to ``run`` because it is a
+denormalized, queryable MIRROR of the controller state authoritatively held in the
+group's ``group.json`` (a Pattern Controller writes the membership row by
+re-opening the iteration's already-finalized State); ``group.json`` — not this
+table — is the source of truth for the Run Group's control flow.
+"""
 
 import json
 import sqlite3
@@ -33,6 +46,11 @@ CREATE TABLE IF NOT EXISTS attempt (
     output_json TEXT,
     PRIMARY KEY (run_id, node_id, attempt),
     FOREIGN KEY (run_id, node_id) REFERENCES node (run_id, node_id)
+);
+CREATE TABLE IF NOT EXISTS run_group_membership (
+    run_id TEXT PRIMARY KEY,
+    run_group_id TEXT NOT NULL,
+    iteration_index INTEGER NOT NULL
 );
 """
 
@@ -169,6 +187,36 @@ class StateStore:
             " VALUES (?, ?, ?, ?, ?, ?, ?)",
             (run_id, node_id, attempt, started_at, finished_at, exit_status, json.dumps(output)),
         )
+
+    def record_run_group_membership(
+        self, run_id: str, run_group_id: str, iteration_index: int
+    ) -> None:
+        """Record that a Run belongs to a Run Group at a given iteration index (#15).
+
+        A Pattern Controller writes this after ``execute_run`` finalized the
+        iteration's Run, so the Run itself carries which group and which iteration
+        it is — queryable from the Run, satisfying AC3. The row is a denormalized
+        mirror of the authoritative ``group.json``; ``INSERT OR REPLACE`` keeps a
+        re-materialized membership write idempotent.
+        """
+        self._execute(
+            "INSERT OR REPLACE INTO run_group_membership"
+            " (run_id, run_group_id, iteration_index) VALUES (?, ?, ?)",
+            (run_id, run_group_id, iteration_index),
+        )
+
+    def run_group_membership(self, run_id: str) -> tuple[str, int] | None:
+        """The ``(run_group_id, iteration_index)`` of a Run, or ``None`` if standalone.
+
+        A Run not materialized by a Pattern Controller has no membership row, so a
+        standalone single-Run directory reads ``None`` and is undisturbed by the
+        additive table.
+        """
+        row = self._connection.execute(
+            "SELECT run_group_id, iteration_index FROM run_group_membership WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+        return None if row is None else (str(row[0]), int(row[1]))
 
     def node_table_has_cause(self) -> bool:
         """Whether the `node` table carries the `cause` column (#76).

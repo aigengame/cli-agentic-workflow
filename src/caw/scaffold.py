@@ -120,6 +120,76 @@ pattern:
 """
 
 
+# A runnable `loop-until-done` Pattern Controller example (#15, ADR 0009): a
+# controller spec drives an iteration workflow until a done-predicate holds. The
+# iteration is a single mock-Adapter agent Node whose fixture reports a verdict in
+# `stdout` (CONTINUE / FINISHED) and points the next iteration at its fixture via
+# `structured_output.next_fixture`; the controller's structural feedback substitutes
+# that into the node's `fixture` field. iteration 1 reports CONTINUE -> iteration 2
+# reports FINISHED, so the loop stops at iteration 2 — all offline, no Agent CLI.
+_LOOP_SPEC = """\
+# A runnable `loop-until-done` Pattern Controller example. Run it with
+# `caw loop run loop.yaml` — the iteration is re-run with feedback until the
+# `done` predicate holds (here: the `verdict` node's stdout contains FINISHED),
+# the iteration's Run fails, or `max_iterations` is reached. Report the whole Run
+# Group with `caw loop report <group-id>`.
+workflow: loop-iteration.yaml
+max_iterations: 5
+# The node whose normalized output the done Predicate and feedback source read.
+evaluate_node: verdict
+# The done Predicate reuses the `when` Predicate algebra (the sole conditional
+# mechanism): done when the `verdict` node's stdout contains FINISHED.
+done:
+  ref:
+    node: verdict
+    field: stdout
+  op: contains
+  value: FINISHED
+# Feedback from iteration N -> iteration N+1: the prior verdict's
+# `structured_output.next_fixture` is substituted into the `verdict` node's
+# `fixture` field for the next iteration (structural substitution, not templating).
+feedback:
+  to_node: verdict
+  to_field: fixture
+  from_field: next_fixture
+"""
+
+_LOOP_ITERATION_WORKFLOW = """\
+# One loop iteration: a single mock-Adapter agent Node that emits a verdict. The
+# controller re-runs this workflow with feedback until the done-predicate holds.
+name: loop-until-done-iteration
+version: 1
+nodes:
+  - id: verdict
+    kind: agent
+    inputs:
+      adapter: mock
+      prompt: Decide whether the task is done; if not, point to the next iteration.
+      fixture: verdict-1.fixture.json
+"""
+
+
+def _loop_fixture(*, done: bool, next_fixture: str | None = None) -> str:
+    """A loop-iteration fixture: a verdict in stdout + an optional next-fixture pointer."""
+    structured = f'{{"next_fixture": "{next_fixture}"}}' if next_fixture else "{}"
+    stdout = "FINISHED" if done else "CONTINUE"
+    return f'{{"exit_status": 0, "stdout": "{stdout}", "structured_output": {structured}}}\n'
+
+
+# The loop-until-done controller bundle: the spec, the iteration workflow, and the
+# two iteration fixtures (CONTINUE -> FINISHED). Reuses the PatternExample bundle
+# shape (a workflow file + companion files); `caw loop init` writes the whole bundle.
+LOOP_EXAMPLE = PatternExample(
+    workflow_filename="loop.yaml",
+    files={
+        "loop.yaml": _LOOP_SPEC,
+        "loop-iteration.yaml": _LOOP_ITERATION_WORKFLOW,
+        "verdict-1.fixture.json": _loop_fixture(done=False, next_fixture="verdict-2.fixture.json"),
+        "verdict-2.fixture.json": _loop_fixture(done=True),
+    },
+)
+
+
 # Pattern name -> its runnable scaffold bundle. Keyed by the registry's expander
 # names; #13 extends this map beside its registration.
 PATTERN_EXAMPLES: dict[str, PatternExample] = {
