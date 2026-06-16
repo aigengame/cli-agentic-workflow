@@ -1160,6 +1160,143 @@ async def test_a_dependent_of_a_when_skipped_node_is_skipped_blocked_along_the_w
 
 
 @pytest.mark.asyncio
+async def test_blocked_cause_and_blocker_membership_are_consistent_across_skip_causes(
+    tmp_path: Path,
+) -> None:
+    # #77 invariant: `cause == "blocked"` iff `node_id in skipped_blockers`, kept
+    # consistent in ONE place (`_record_skip`). A workflow mixing all three skip
+    # causes proves it: `classify` emits "billing"; `gate` gates on "shipping" so
+    # it skips `when_false` (no blocker); `blocked_dependent` needs `gate` so it
+    # skips `blocked` (blocker `gate`); `tolerant` is a `join: any` over `gate` and
+    # an independently-skipped `other_gate`, so once BOTH branches skip it is
+    # `all_branches_skipped` (no blocker). Across the whole result, the two maps
+    # agree exactly — a `blocked` node always has a blocker and a non-`blocked`
+    # node never does.
+    workflow = conditional_workflow(
+        shell("classify", "echo billing"),
+        shell(
+            "gate",
+            "echo gate",
+            needs=["classify"],
+            when={
+                "ref": {"node": "classify", "field": "stdout"},
+                "op": "equals",
+                "value": "shipping",
+            },
+        ),
+        shell(
+            "other_gate",
+            "echo other",
+            needs=["classify"],
+            when={
+                "ref": {"node": "classify", "field": "stdout"},
+                "op": "equals",
+                "value": "refund",
+            },
+        ),
+        shell("blocked_dependent", "echo blocked", needs=["gate"]),
+        shell("tolerant", "echo tolerant", needs=["gate", "other_gate"], join="any"),
+    )
+
+    result = await execute_run(workflow, tmp_path / "runs")
+
+    assert result.succeeded, "benign skips do not fail the run"
+    # The discriminating invariant: blocked-ness is derivable from blocker membership.
+    for node_id, cause in result.skipped_causes.items():
+        has_blocker = node_id in result.skipped_blockers
+        assert (cause == "blocked") == has_blocker, (
+            f"node {node_id!r} cause {cause!r} disagrees with blocker membership "
+            f"{has_blocker}: the two maps must stay consistent"
+        )
+    assert result.skipped_causes["gate"] == "when_false"
+    assert result.skipped_causes["blocked_dependent"] == "blocked"
+    assert result.skipped_blockers["blocked_dependent"] == "gate"
+    assert result.skipped_causes["tolerant"] == "all_branches_skipped"
+    assert "tolerant" not in result.skipped_blockers, "a tolerant-join skip carries no blocker"
+
+
+@pytest.mark.asyncio
+async def test_a_long_when_skip_chain_does_not_blow_the_stack(tmp_path: Path) -> None:
+    # #77 depth-safety: the skip-origin walk must be BFS (no recursion), so a long
+    # pipeline whose HEAD gate closes — reachable at Pattern-Expander scale — skips
+    # its whole transitive cone without a RecursionError. A 4,000-node linear chain
+    # `gate -> n1 -> ... -> n3999` far exceeds Python's ~1000 default recursion
+    # limit, so the previously mutually-recursive skip-origin walk would overflow
+    # the stack here; the unified BFS walk handles it.
+    depth = 4000
+    nodes: list[dict[str, Any]] = [
+        shell(
+            "gate",
+            "echo gate",
+            needs=["classify"],
+            when={
+                "ref": {"node": "classify", "field": "stdout"},
+                "op": "equals",
+                "value": "shipping",
+            },
+        )
+    ]
+    previous = "gate"
+    for index in range(depth):
+        node_id = f"n{index}"
+        nodes.append(shell(node_id, "echo x", needs=[previous]))
+        previous = node_id
+    workflow = conditional_workflow(shell("classify", "echo billing"), *nodes)
+
+    result = await execute_run(workflow, tmp_path / "runs")
+
+    assert result.succeeded, "a closed head gate and its skipped cone do not fail the run"
+    attempted = {node_result.node_id for node_result in result.node_results}
+    assert attempted == {"classify"}, "only the classifier ran; the whole chain skipped"
+    assert len(result.skipped_node_ids) == depth + 1, (
+        "the gate and every one of its transitive dependents were skipped, BFS-safely"
+    )
+    assert result.skipped_causes["gate"] == "when_false"
+    assert result.skipped_causes[f"n{depth - 1}"] == "blocked", (
+        "the deep tail is blocked, not lost"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_wide_when_skip_cone_stays_within_a_generous_time_bound(tmp_path: Path) -> None:
+    # #77 O(1) membership: the skip cascade must not be O(N^2). A `join: all` fan-out
+    # where one closed gate orphans a WIDE set of dependents stresses the per-skip
+    # terminal/`_skipped` membership tests the walk performs; with an incrementally
+    # maintained terminal set and a `_skipped` set, a wide cone stays near-linear. A
+    # quadratic cascade over this width blows well past the generous bound.
+    import time
+
+    width = 1500
+    nodes = [
+        shell(
+            "gate",
+            "echo gate",
+            needs=["classify"],
+            when={
+                "ref": {"node": "classify", "field": "stdout"},
+                "op": "equals",
+                "value": "shipping",
+            },
+        )
+    ]
+    # A wide fan-out off the skipped gate: every `leafN` is a default-join dependent
+    # of the gate, so each is skipped `blocked` when the gate closes.
+    nodes.extend(shell(f"leaf{index}", "echo x", needs=["gate"]) for index in range(width))
+    workflow = conditional_workflow(shell("classify", "echo billing"), *nodes)
+
+    start = time.perf_counter()
+    result = await execute_run(workflow, tmp_path / "runs")
+    elapsed = time.perf_counter() - start
+
+    assert result.succeeded
+    assert len(result.skipped_node_ids) == width + 1, "the gate and every fan-out leaf skipped"
+    assert elapsed < 10.0, (
+        f"a {width}-wide skip cone took {elapsed:.2f}s (expected < 10s); "
+        f"a quadratic cascade would regress here"
+    )
+
+
+@pytest.mark.asyncio
 async def test_a_join_any_node_runs_when_one_branch_skipped_and_one_succeeded(
     tmp_path: Path,
 ) -> None:

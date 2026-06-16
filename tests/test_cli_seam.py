@@ -288,6 +288,97 @@ def test_graph_json_plan_surfaces_each_nodes_when_predicate_and_join_policy(
     }, "the predicate is surfaced as the serialized algebra"
 
 
+def test_graph_json_plan_preserves_a_falsy_when_value(
+    write_workflow_data: Callable[[dict[str, Any]], Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #77: the predicate serializer must preserve a leaf's MEANINGFUL falsy value —
+    # `exit_status equals 0` — not strip it as an inactive-shape None. `value: null`
+    # is moot here (it is rejected at validation per #75's decision), so the concrete
+    # hazard the JSON plan must survive is the falsy-but-valid `0`, which the old
+    # `exclude_none` happened to keep but `to_plan_dict` keeps by design.
+    plan_input: dict[str, Any] = {
+        "name": "sample",
+        "version": 1,
+        "nodes": [
+            {"id": "probe", "kind": "shell", "inputs": {"command": "true"}},
+            {
+                "id": "act",
+                "kind": "shell",
+                "needs": ["probe"],
+                "when": {
+                    "ref": {"node": "probe", "field": "exit_status"},
+                    "op": "equals",
+                    "value": 0,
+                },
+                "inputs": {"command": "echo act"},
+            },
+        ],
+    }
+    workflow_file = write_workflow_data(plan_input)
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["graph", str(workflow_file), "--format", "json"])
+
+    assert result.exit_code == 0, result.output
+    nodes = {node["id"]: node for node in json.loads(result.output)["nodes"]}
+    assert nodes["act"]["when"] == {
+        "ref": {"node": "probe", "field": "exit_status"},
+        "op": "equals",
+        "value": 0,
+    }, "a meaningful falsy `value: 0` survives serialization, not stripped"
+
+
+def test_graph_json_plan_serializes_a_structured_output_sub_path(
+    write_workflow_data: Callable[[dict[str, Any]], Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #75/#77: a structured_output sub-`path` leaf serializes its `path` in the plan
+    # so a consumer sees the routing target; a leaf with NO sub-path carries no
+    # spurious empty `path` key (proven by the other plan tests). The classifier is
+    # an agent Node (only kind that emits structured_output).
+    plan_input: dict[str, Any] = {
+        "name": "sample",
+        "version": 1,
+        "nodes": [
+            {
+                "id": "classify",
+                "kind": "agent",
+                "inputs": {"adapter": "mock", "prompt": "classify"},
+            },
+            {
+                "id": "act",
+                "kind": "shell",
+                "needs": ["classify"],
+                "when": {
+                    "ref": {
+                        "node": "classify",
+                        "field": "structured_output",
+                        "path": ["category"],
+                    },
+                    "op": "equals",
+                    "value": "bug",
+                },
+                "inputs": {"command": "echo act"},
+            },
+        ],
+    }
+    workflow_file = write_workflow_data(plan_input)
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["graph", str(workflow_file), "--format", "json"])
+
+    assert result.exit_code == 0, result.output
+    nodes = {node["id"]: node for node in json.loads(result.output)["nodes"]}
+    assert nodes["act"]["when"]["ref"] == {
+        "node": "classify",
+        "field": "structured_output",
+        "path": ["category"],
+    }, "the structured_output sub-path is serialized so a consumer sees the routing target"
+
+
 def test_graph_text_plan_annotates_a_nodes_when_and_non_default_join(
     write_workflow_data: Callable[[dict[str, Any]], Path],
     tmp_path: Path,
