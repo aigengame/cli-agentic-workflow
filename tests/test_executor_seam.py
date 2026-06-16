@@ -1004,6 +1004,115 @@ async def test_a_not_when_predicate_drives_a_skip_in_the_scheduler(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+async def test_a_structured_output_sub_path_leaf_routes_classify_and_act(
+    tmp_path: Path,
+) -> None:
+    # #75 / #13: a `when` leaf addresses a sub-path INTO an agent Node's
+    # structured_output and routes on it. `classify` is an agent Node whose
+    # structured_output is {"category": "bug"}; `act` gates on
+    # structured_output.category == "bug" via `ref.path: ["category"]`, so the
+    # addressed sub-value (a scalar) is compared — not the whole dict — and the
+    # gate opens. This is the reusable addressing mechanism #13's classify-and-act
+    # routes on, proven end-to-end through the scheduler.
+    from conftest import write_fixture
+
+    fixture = write_fixture(
+        tmp_path / "classify.json",
+        exit_status=0,
+        stdout="classified",
+        structured_output={"category": "bug", "confidence": 9},
+    )
+    marker = tmp_path / "acted.txt"
+    raw: dict[str, Any] = {
+        "name": "sample",
+        "version": 1,
+        "nodes": [
+            {
+                "id": "classify",
+                "kind": "agent",
+                "inputs": {"adapter": "mock", "prompt": "classify", "fixture": str(fixture)},
+            },
+            {
+                "id": "act",
+                "kind": "shell",
+                "needs": ["classify"],
+                "when": {
+                    "ref": {
+                        "node": "classify",
+                        "field": "structured_output",
+                        "path": ["category"],
+                    },
+                    "op": "equals",
+                    "value": "bug",
+                },
+                "inputs": {"command": f"touch {marker}"},
+            },
+        ],
+    }
+    workflow = normalize_workflow(raw, source="<test>")
+
+    result = await execute_run(workflow, tmp_path / "runs")
+
+    assert result.succeeded
+    assert marker.exists(), "the addressed structured_output.category == 'bug' opened the gate"
+    assert result.skipped_node_ids == (), "an open structured_output gate skips nothing"
+
+
+@pytest.mark.asyncio
+async def test_a_structured_output_sub_path_leaf_skips_when_the_sub_value_differs(
+    tmp_path: Path,
+) -> None:
+    # The complement (#75 / #13): the addressed structured_output sub-value is
+    # compared, so a leaf that does not match the addressed sub-field closes the
+    # gate. `classify` emits {"category": "feature"}; `act` gates on
+    # structured_output.category == "bug", which is false, so `act` is skipped
+    # when_false — distinguishing routing-on-a-sub-value from the old whole-dict
+    # comparison (which a scalar could never match at all).
+    from conftest import write_fixture
+
+    fixture = write_fixture(
+        tmp_path / "classify.json",
+        exit_status=0,
+        stdout="classified",
+        structured_output={"category": "feature"},
+    )
+    marker = tmp_path / "acted.txt"
+    raw: dict[str, Any] = {
+        "name": "sample",
+        "version": 1,
+        "nodes": [
+            {
+                "id": "classify",
+                "kind": "agent",
+                "inputs": {"adapter": "mock", "prompt": "classify", "fixture": str(fixture)},
+            },
+            {
+                "id": "act",
+                "kind": "shell",
+                "needs": ["classify"],
+                "when": {
+                    "ref": {
+                        "node": "classify",
+                        "field": "structured_output",
+                        "path": ["category"],
+                    },
+                    "op": "equals",
+                    "value": "bug",
+                },
+                "inputs": {"command": f"touch {marker}"},
+            },
+        ],
+    }
+    workflow = normalize_workflow(raw, source="<test>")
+
+    result = await execute_run(workflow, tmp_path / "runs")
+
+    assert result.succeeded, "a closed structured_output gate does not fail the run"
+    assert not marker.exists(), "structured_output.category != 'bug', so the gate is closed"
+    assert result.skipped_causes.get("act") == "when_false"
+
+
+@pytest.mark.asyncio
 async def test_a_dependent_of_a_when_skipped_node_is_skipped_blocked_along_the_whole_chain(
     tmp_path: Path,
 ) -> None:

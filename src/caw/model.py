@@ -5,9 +5,9 @@ import hashlib
 import heapq
 import json
 import re
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, TypeVar
 
 from pydantic import (
     BaseModel,
@@ -22,6 +22,10 @@ from pydantic import (
 from caw.adapter import BUILTIN_ADAPTER_NAMES
 from caw.config import WorkflowConfigError
 from caw.patterns import expand_pattern
+
+# The result type a `Predicate.fold` reduces a predicate tree to: a bool for the
+# evaluator, a string for the CLI summary, a dict for the plan serializer (#77).
+_T = TypeVar("_T")
 
 
 def _require_non_blank(value: str) -> str:
@@ -242,6 +246,17 @@ PredicateOp = Literal["equals", "contains"]
 _STRING_PREDICATE_FIELDS = frozenset({"stdout"})
 
 
+# The normalized-output fields each Node KIND can produce, so a `when` ref to a
+# field a dependency's kind never emits is a config error (#75). Every Node emits
+# `stdout` and `exit_status`; only an agent Node emits `structured_output` (a
+# shell Node has no parsed structured output). The kind-aware Workflow validator
+# checks each leaf ref against the referenced node's kind.
+_PRODUCIBLE_FIELDS_FOR_KIND: dict[str, frozenset[str]] = {
+    "shell": frozenset({"stdout", "exit_status"}),
+    "agent": frozenset({"stdout", "exit_status", "structured_output"}),
+}
+
+
 # The Python types a leaf `value` may take per referenced field, so a `value`
 # whose type can NEVER match the field is rejected at config time rather than
 # silently evaluating false on every run (#75). `exit_status` is an integer, so
@@ -267,14 +282,40 @@ def _value_type_admissible_for_field(field: str, value: object) -> bool:
 
 
 class PredicateRef(BaseModel):
-    """An atomic reference to one field of an upstream Node's normalized output (#7)."""
+    """An atomic reference to one field of an upstream Node's normalized output (#7).
+
+    ``path`` is an optional sub-path ADDRESSING into the ``structured_output``
+    field (#75): an ordered sequence of dict keys (``str``) and/or list indices
+    (``int``) that descends into the parsed JSON to the scalar a leaf compares
+    against, e.g. ``path: ["category"]`` addresses ``structured_output["category"]``
+    and ``path: ["items", 0]`` addresses the first element of an ``items`` list.
+    Without a ``path`` a ``structured_output`` ref reads the whole parsed object
+    (a scalar ``equals`` can then never match a dict, so addressing is how a
+    classify-and-act routes on a classifier's label — #13). A ``path`` on any
+    other field (``stdout`` / ``exit_status``, scalars with no interior) is a
+    config error: there is nothing to descend into. This is the single, reusable
+    addressing mechanism #13 builds classify-and-act routing on.
+    """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     node: str
     field: PredicateField
+    path: tuple[str | int, ...] = ()
 
     _node_non_blank = field_validator("node")(_require_non_blank)
+
+    @model_validator(mode="after")
+    def _path_only_addresses_structured_output(self) -> "PredicateRef":
+        # A sub-`path` descends into the structured_output object; `stdout` and
+        # `exit_status` are scalars with no interior to address, so a `path` on
+        # either is a config error rather than a silently-ignored attribute (#75).
+        if self.path and self.field != "structured_output":
+            raise ValueError(
+                f"`path` addresses into `structured_output` only, not the scalar "
+                f"{self.field!r} field"
+            )
+        return self
 
 
 class Predicate(BaseModel):
@@ -315,24 +356,99 @@ class Predicate(BaseModel):
     any_of: tuple["Predicate", ...] | None = None
     not_: "Predicate | None" = Field(default=None, alias="not")
 
-    @model_validator(mode="after")
-    def _exactly_one_shape(self) -> "Predicate":
-        # A predicate is EXACTLY one shape — a leaf XOR one combinator (#7). A
-        # leaf is identified by `ref` and must be complete (`ref` AND `op`); each
-        # combinator is identified by its own field. Mixing shapes, declaring two
-        # combinators, or an empty/incomplete predicate is a config error, so a
-        # `when` always denotes one unambiguous boolean expression.
-        is_leaf = self.ref is not None
-        combinators = [
+    def _present_shapes(self) -> list[str]:
+        """The shape kinds this predicate declares, by field presence.
+
+        The SINGLE place that maps a Predicate's fields to its shape (#77): the
+        shape validator counts these to enforce "exactly one shape", and ``fold``
+        dispatches on the single present shape. Adding a combinator extends this
+        one list, so every shape-dispatching consumer follows automatically rather
+        than each re-deriving the mapping.
+        """
+        return [
             name
             for name, present in (
+                ("leaf", self.ref is not None),
                 ("all_of", self.all_of is not None),
                 ("any_of", self.any_of is not None),
                 ("not", self.not_ is not None),
             )
             if present
         ]
-        shapes = int(is_leaf) + len(combinators)
+
+    def fold(
+        self,
+        *,
+        leaf: "Callable[[Predicate], _T]",
+        all_of: "Callable[[list[_T]], _T]",
+        any_of: "Callable[[list[_T]], _T]",
+        not_: "Callable[[_T], _T]",
+    ) -> "_T":
+        """Recursively reduce this predicate to a ``_T`` via per-shape callbacks (#77).
+
+        The single shape-dispatch site every consumer drives: the evaluator, the
+        leaf-ref walk, the CLI summary, and the plan serializer all express their
+        recursion as a fold rather than re-implementing the ``leaf`` / ``all_of``
+        / ``any_of`` / ``not`` dispatch. ``leaf`` receives the leaf Predicate (to
+        read its ``ref`` / ``op`` / ``value``); each combinator callback receives
+        its children ALREADY folded, so a consumer only describes how to combine
+        results, never how to walk the tree. Adding a combinator adds one shape to
+        ``_present_shapes`` and one branch here — and every consumer follows.
+
+        Assumes a validated single-shape predicate (the model validator guarantees
+        it); the final ``not`` branch is the residual shape.
+        """
+
+        def recurse(child: "Predicate") -> "_T":
+            return child.fold(leaf=leaf, all_of=all_of, any_of=any_of, not_=not_)
+
+        if self.ref is not None:
+            return leaf(self)
+        if self.all_of is not None:
+            return all_of([recurse(child) for child in self.all_of])
+        if self.any_of is not None:
+            return any_of([recurse(child) for child in self.any_of])
+        assert self.not_ is not None, "a validated non-leaf predicate is exactly one combinator"
+        return not_(recurse(self.not_))
+
+    def to_plan_dict(self) -> dict[str, Any]:
+        """Serialize this predicate to its plan/JSON form: the ACTIVE shape only (#77).
+
+        Unlike ``model_dump(exclude_none=True)`` — which strips an intentional
+        falsy/None leaf field as if it were an inactive-shape key — this folds the
+        validated shape and emits exactly the keys that shape carries: a leaf emits
+        ``ref`` (its ``path`` only when non-empty), ``op``, and ``value`` (a value
+        is always present and meaningful — `value: null` is rejected at validation,
+        so a serialized ``value`` is never a stripped key); a combinator emits its
+        single combinator key with its children serialized. So the plan round-trips
+        the shape with no inactive None keys and no spurious empty ``path``.
+        """
+
+        def _leaf(node: "Predicate") -> dict[str, Any]:
+            assert node.ref is not None
+            ref: dict[str, Any] = {"node": node.ref.node, "field": node.ref.field}
+            if node.ref.path:
+                ref["path"] = list(node.ref.path)
+            return {"ref": ref, "op": node.op, "value": node.value}
+
+        return self.fold(
+            leaf=_leaf,
+            all_of=lambda children: {"all_of": children},
+            any_of=lambda children: {"any_of": children},
+            not_=lambda child: {"not": child},
+        )
+
+    @model_validator(mode="after")
+    def _exactly_one_shape(self) -> "Predicate":
+        # A predicate is EXACTLY one shape — a leaf XOR one combinator (#7). A
+        # leaf is identified by `ref` and must be complete (`ref` AND `op`); each
+        # combinator is identified by its own field. Mixing shapes, declaring two
+        # combinators, or an empty/incomplete predicate is a config error, so a
+        # `when` always denotes one unambiguous boolean expression. The shape
+        # mapping lives once in `_present_shapes` (#77); this counts it.
+        present = self._present_shapes()
+        is_leaf = "leaf" in present
+        shapes = len(present)
         if shapes != 1:
             raise ValueError(
                 "must be exactly one of a leaf (ref/op/value), all_of, any_of, or not"
@@ -391,16 +507,20 @@ class Predicate(BaseModel):
 
         The single source the dependency and field invariants walk: a leaf
         contributes its own ``ref``; a combinator contributes the refs of its
-        children recursively. So a ref buried in any combinator is checked.
+        children recursively. So a ref buried in any combinator is checked. The
+        depth-first walk is expressed as a ``fold`` (#77), so the shape dispatch
+        lives once in ``fold`` rather than re-implemented here.
         """
-        if self.ref is not None:
-            return (self.ref,)
-        refs: list[PredicateRef] = []
-        for child in (*(self.all_of or ()), *(self.any_of or ())):
-            refs.extend(child.leaf_refs())
-        if self.not_ is not None:
-            refs.extend(self.not_.leaf_refs())
-        return tuple(refs)
+
+        def _concat(children: list[tuple[PredicateRef, ...]]) -> tuple[PredicateRef, ...]:
+            return tuple(ref for child in children for ref in child)
+
+        return self.fold(
+            leaf=lambda node: (node.ref,) if node.ref is not None else (),
+            all_of=_concat,
+            any_of=_concat,
+            not_=lambda child: child,
+        )
 
 
 class Node(BaseModel):
@@ -536,6 +656,33 @@ class Workflow(BaseModel):
             for reference in node.needs:
                 if reference not in known:
                     raise ValueError(f"node {node.id!r} needs unknown node {reference!r}")
+        return nodes
+
+    @field_validator("nodes")
+    @classmethod
+    def _when_refs_must_match_dependency_kind(cls, nodes: tuple[Node, ...]) -> tuple[Node, ...]:
+        # Kind-aware `when` reference validation (#75): a leaf reads a field off a
+        # dependency's normalized output, but only an agent Node ever emits
+        # `structured_output` — a shell Node never does. The per-Node
+        # `_when_refs_must_be_dependencies` validator only knows the dependency's
+        # id, not its kind; here the whole node set is in scope, so an impossible
+        # reference (e.g. `structured_output` of a shell dependency) is a config
+        # error rather than a leaf that silently evaluates false on every run. This
+        # runs after the known-reference validator, so every referenced node is
+        # present in `kind_of`.
+        kind_of = {node.id: node.kind for node in nodes}
+        for node in nodes:
+            if node.when is None:
+                continue
+            for ref in node.when.leaf_refs():
+                producible = _PRODUCIBLE_FIELDS_FOR_KIND.get(
+                    kind_of.get(ref.node, ""), frozenset()
+                )
+                if ref.field not in producible:
+                    raise ValueError(
+                        f"node {node.id!r} `when` references {ref.field!r} of {ref.node!r}, "
+                        f"a {kind_of.get(ref.node)!r} node that does not produce it"
+                    )
         return nodes
 
     @field_validator("nodes")
