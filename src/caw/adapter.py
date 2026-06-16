@@ -5,8 +5,9 @@ normalizes its result into the workflow runtime. The kernel only ever speaks to
 the abstract :class:`Adapter` and the vendor-neutral :class:`AgentInvocation` /
 :class:`AgentResult` data classes, so no Agent-CLI specifics (`claude -p`,
 `codex exec`, flag names, output formats) leak into the executor, State, or
-Events. Real Adapters land in later issues (#9 claude, #11 codex); v0.1 ships
-the interface plus one :class:`MockAdapter` that replays a fixture file offline.
+Events. Two real Adapters ship behind the interface — :class:`~caw.claude_print.ClaudePrintAdapter`
+(#9) and :class:`~caw.codex_exec.CodexExecAdapter` (#11) — alongside the
+:class:`MockAdapter` that replays a fixture file offline.
 """
 
 from abc import ABC, abstractmethod
@@ -19,8 +20,8 @@ from pathlib import Path
 # so a typo fails `caw validate` fast (#64), before any run directory. Adapters
 # injected at run time (a populated AdapterRegistry passed to execute_run) are not
 # known at validate time; their unknown-name check stays the run-time registry
-# resolve. Real CLIs (#9 claude, #11 codex) add their names here as they land.
-BUILTIN_ADAPTER_NAMES: frozenset[str] = frozenset({"mock", "claude.print"})
+# resolve. A new real CLI adds its name here as it lands (#9 claude, #11 codex).
+BUILTIN_ADAPTER_NAMES: frozenset[str] = frozenset({"mock", "claude.print", "codex.exec"})
 
 
 class AdapterError(Exception):
@@ -193,9 +194,9 @@ class AdapterRegistry:
     """Resolves an adapter identifier to the Adapter that handles it.
 
     Decouples the executor's dispatch from concrete Adapter construction: the
-    executor looks an Adapter up by the node's ``adapter`` name, so adding the
-    real claude/codex Adapters (#9, #11) is a registry entry, not an executor
-    edit. An unknown identifier is a node-level :class:`AdapterError`.
+    executor looks an Adapter up by the node's ``adapter`` name, so adding a real
+    Adapter (#9 claude, #11 codex) is a registry entry, not an executor edit. An
+    unknown identifier is a node-level :class:`AdapterError`.
     """
 
     def __init__(self, adapters: Mapping[str, Adapter] | None = None) -> None:
@@ -225,11 +226,16 @@ def _default_adapters() -> dict[str, Adapter]:
 
     Mirrors :data:`BUILTIN_ADAPTER_NAMES` so a default-registry run resolves
     every built-in name. Constructing each Adapter has NO side effects — the real
-    ``claude.print`` Adapter probes the CLI lazily at invoke / capability-check
-    time (#9) — so a shell-only or offline Run never requires ``claude`` to be
-    installed. The ClaudePrintAdapter import is deferred to break the import cycle
-    (``caw.claude_print`` imports the interface from this module).
+    ``claude.print`` (#9) and ``codex.exec`` (#11) Adapters probe their CLIs lazily
+    at invoke / capability-check time — so a shell-only or offline Run never requires
+    ``claude`` or ``codex`` to be installed. The real-Adapter imports are deferred to
+    break the import cycle (each adapter module imports the interface from here).
     """
     from caw.claude_print import ClaudePrintAdapter
+    from caw.codex_exec import CodexExecAdapter
 
-    return {"mock": MockAdapter(), "claude.print": ClaudePrintAdapter()}
+    return {
+        "mock": MockAdapter(),
+        "claude.print": ClaudePrintAdapter(),
+        "codex.exec": CodexExecAdapter(),
+    }
