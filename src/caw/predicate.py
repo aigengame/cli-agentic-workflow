@@ -31,8 +31,10 @@ def _address_sub_path(value: object, path: tuple[str | int, ...]) -> object:
     current: object = value
     for step in path:
         if isinstance(step, bool):
-            # A bool is an int in Python, but it is never a meaningful list index;
-            # treat it as a non-applicable step rather than indexing with 0/1.
+            # A `path` bool is rejected at config time (PredicateRef validation), so
+            # this is unreachable for a normally-validated Predicate; it stays as a
+            # defense-in-depth guard for a validation-bypassed one (model_construct),
+            # keeping a bool from indexing list element 0/1 via Python's int aliasing.
             return _ABSENT
         if isinstance(step, str) and isinstance(current, dict):
             if step not in current:

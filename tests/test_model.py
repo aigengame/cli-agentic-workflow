@@ -804,6 +804,32 @@ def test_a_bool_value_against_exit_status_is_a_config_error() -> None:
     assert "bool" in message, "the error names the offending bool type"
 
 
+def test_a_bool_in_a_structured_output_path_is_a_config_error() -> None:
+    # #75 NIT (review): a `bool` in a `path` would silently coerce to a list index
+    # (`true` -> 1, `false` -> 0) and address an unintended element, so it is
+    # rejected at config time with an actionable message — a `path` step is a dict
+    # key (str) or a list index (int), never a bool masquerading as one.
+    raw = gate_workflow(
+        {
+            "ref": {
+                "node": "classify",
+                "field": "structured_output",
+                "path": ["items", True],
+            },
+            "op": "equals",
+            "value": "bug",
+        },
+        upstream_kind="agent",
+    )
+
+    with pytest.raises(WorkflowConfigError) as excinfo:
+        normalize_workflow(raw, source="workflow.yaml")
+
+    message = str(excinfo.value)
+    assert "path" in message, "the error names the offending path step"
+    assert "bool" in message, "the error names the bool that would coerce to an index"
+
+
 def test_an_int_value_against_stdout_is_a_config_error() -> None:
     # #75: `stdout` is a string field, so an `int` value can never match it after
     # the leaf evaluator compares the (string) stdout against the value. Reject the

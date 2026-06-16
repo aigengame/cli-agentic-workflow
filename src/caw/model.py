@@ -305,6 +305,23 @@ class PredicateRef(BaseModel):
 
     _node_non_blank = field_validator("node")(_require_non_blank)
 
+    @field_validator("path", mode="before")
+    @classmethod
+    def _path_steps_are_keys_or_indices(cls, value: object) -> object:
+        # A `path` step is a dict key (str) or a list index (int) — never a bool.
+        # `tuple[str | int, ...]` would otherwise coerce a `bool` to an int (Python
+        # makes `True`/`False` ints), silently addressing list element 1/0 the
+        # author never named; reject it BEFORE coercion so `path: [true]` is an
+        # actionable config error, not a silent index (#75 review NIT).
+        if isinstance(value, list | tuple):
+            for step in value:
+                if isinstance(step, bool):
+                    raise ValueError(
+                        f"`path` step {step!r} is a bool; a step is a dict key (str) "
+                        f"or a list index (int), never a bool"
+                    )
+        return value
+
     @model_validator(mode="after")
     def _path_only_addresses_structured_output(self) -> "PredicateRef":
         # A sub-`path` descends into the structured_output object; `stdout` and
