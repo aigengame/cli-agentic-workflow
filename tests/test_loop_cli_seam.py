@@ -166,6 +166,38 @@ def test_loop_report_unknown_group_is_a_config_error(
     assert "group-nope" in lines[0]
 
 
+def test_loop_init_scaffolds_a_runnable_loop_until_done_example(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # AC7: loop-until-done ships at least one example. `caw loop init` scaffolds a
+    # COMPLETE, runnable bundle (spec + iteration workflow + fixtures); running it
+    # drives the loop to done offline with the mock Adapter — exit 0, a real run.
+    monkeypatch.chdir(tmp_path)
+
+    scaffolded = runner.invoke(app, ["loop", "init"])
+    assert scaffolded.exit_code == 0, scaffolded.output
+
+    spec = tmp_path / "loop.yaml"
+    assert spec.is_file(), "loop init writes the controller spec by default"
+
+    ran = runner.invoke(app, ["loop", "run", str(spec)])
+    assert ran.exit_code == 0, ran.output
+    assert "done" in ran.output, "the scaffolded loop reaches done"
+
+
+def test_loop_init_refuses_to_overwrite_an_existing_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    existing = tmp_path / "loop.yaml"
+    existing.write_text("workflow: mine\n", encoding="utf-8")
+
+    result = runner.invoke(app, ["loop", "init"])
+
+    assert result.exit_code == 2
+    assert existing.read_text(encoding="utf-8") == "workflow: mine\n", "the file is untouched"
+
+
 def test_loop_resume_continues_a_group(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # AC5: `caw loop resume <group_id>` resumes a group. Cap the first pass to one
     # iteration (stops exhausted), bump the cap, and resume to completion.
