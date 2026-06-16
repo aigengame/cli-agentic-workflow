@@ -9,7 +9,6 @@ Events. Real Adapters land in later issues (#9 claude, #11 codex); v0.1 ships
 the interface plus one :class:`MockAdapter` that replays a fixture file offline.
 """
 
-import json
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -74,6 +73,18 @@ class AgentResult:
     (``None`` when the invocation produced none). ``artifacts`` lists durable
     files the invocation produced, for minimal indexing in State (#5); full
     artifact lifecycle is #16.
+
+    ``adapter_failure`` is the first-class, vendor-neutral signal that the Agent
+    CLI RAN but the Adapter normalized its result as a FAILURE — the canonical
+    case being Claude's ``is_error: true`` arriving with a zero process exit
+    (ADR 0006, #83). It is distinct from ``exit_status``: the Adapter keeps the
+    process's REAL exit status in ``exit_status`` (so the trace is honest) and
+    raises this flag, instead of manufacturing a fake non-zero exit through the
+    exit-code channel. The kernel honors it ONCE — a result that exited zero yet
+    carries ``adapter_failure`` is a failed Node — so every real Adapter
+    (claude #9, codex #11) signals an agent-determined failure the same way
+    rather than re-inventing the convention. A failed node carries no trustworthy
+    structured output, so the Adapter drops it and puts the cause on ``stderr``.
     """
 
     exit_status: int
@@ -81,6 +92,7 @@ class AgentResult:
     stderr: str = ""
     structured_output: object | None = None
     artifacts: tuple[Path, ...] = ()
+    adapter_failure: bool = False
 
 
 class Adapter(ABC):
@@ -97,9 +109,12 @@ class MockAdapter(Adapter):
 
     The fixture is the canned normalized result for an agent Node, located by the
     node's ``fixture`` path. It is a JSON object with an ``exit_status`` and
-    optional ``stdout``, ``stderr``, ``structured_output``, and ``artifacts``
-    (a list of file paths). This lets whole Workflows and Patterns run with no
-    real Agent CLI installed (#5 acceptance criteria 1 and 4).
+    optional ``stdout``, ``stderr``, ``structured_output``, ``artifacts`` (a list
+    of file paths), and ``adapter_failure`` (a boolean: the agent ran but the
+    Adapter normalizes its result as a FAILURE — the offline analogue of Claude's
+    ``is_error: true`` arriving with a zero exit, ADR 0006 / #83). This lets whole
+    Workflows and Patterns run with no real Agent CLI installed (#5 acceptance
+    criteria 1 and 4).
 
     The shipped adapter never writes the resolved env to a path: env-observation
     for the env-policy test lives in a test-only adapter seam, so a secret value
@@ -116,30 +131,37 @@ class MockAdapter(Adapter):
         fixture = invocation.fixture
         assert fixture is not None  # guarded by invoke
         node_id = invocation.node_id
-        try:
-            raw = json.loads(fixture.read_text(encoding="utf-8"))
-        except OSError as exc:
-            raise AdapterError(
-                f"cannot read fixture {fixture} for node {node_id!r}: {exc}"
-            ) from exc
-        except json.JSONDecodeError as exc:
-            raise AdapterError(
-                f"invalid JSON fixture {fixture} for node {node_id!r}: {exc}"
-            ) from exc
-        if not isinstance(raw, dict):
-            raise AdapterError(f"fixture {fixture} for node {node_id!r} must be a JSON object")
+        # The read -> json.loads -> dict AdapterError ladder is the SAME one the real
+        # subprocess Adapters use, consolidated in caw.subprocess_adapter (#83), so a
+        # malformed fixture and a malformed CLI wrapper surface the same shape of
+        # error. Imported lazily here to avoid an import cycle (subprocess_adapter
+        # imports this module's AdapterError / AgentInvocation).
+        from caw.subprocess_adapter import node_context, read_json_object
+
+        raw = read_json_object(fixture, context=node_context(invocation), source_label="fixture")
         exit_status = raw.get("exit_status")
         if not isinstance(exit_status, int) or isinstance(exit_status, bool):
             raise AdapterError(
                 f"fixture {fixture} for node {node_id!r} must declare an integer exit_status"
             )
         artifacts = MockAdapter._parse_artifacts(raw.get("artifacts", ()), fixture, node_id)
+        # The first-class adapter-determined-failure signal (ADR 0006, #83): an
+        # optional boolean that lets an offline fixture model the canonical "the
+        # agent ran but its result is a FAILURE" case (Claude's is_error with a zero
+        # exit). A non-boolean is a fixture-authoring error, surfaced like the
+        # exit_status one; absent, it defaults False (an ordinary result).
+        adapter_failure = raw.get("adapter_failure", False)
+        if not isinstance(adapter_failure, bool):
+            raise AdapterError(
+                f"fixture {fixture} for node {node_id!r} 'adapter_failure' must be a boolean"
+            )
         return AgentResult(
             exit_status=exit_status,
             stdout=str(raw.get("stdout", "")),
             stderr=str(raw.get("stderr", "")),
             structured_output=raw.get("structured_output"),
             artifacts=artifacts,
+            adapter_failure=adapter_failure,
         )
 
     @staticmethod
