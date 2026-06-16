@@ -1,6 +1,7 @@
 """Report-seam tests: invoke `caw report` and assert it renders from persisted state."""
 
 import json
+import re
 import sqlite3
 from collections.abc import Callable
 from pathlib import Path
@@ -189,9 +190,171 @@ def test_report_surfaces_skip_causes_distinctly(
     assert by_id["gate"]["status"] == "skipped" and by_id["gate"]["cause"] == "when_false"
     assert by_id["downstream"]["status"] == "skipped" and by_id["downstream"]["cause"] == "blocked"
 
+    # #94: a `blocked` node names the immediate skipped dependency that withheld it
+    # (downstream's `gate`), at parity with the live run; a `when_false` gate is the
+    # skip ORIGIN, not blocked, so it carries no blocker.
+    assert by_id["downstream"]["blocked_by"] == "gate"
+    assert by_id["gate"]["blocked_by"] is None
+
     markdown = runner.invoke(app, ["report", run_id, "--format", "markdown"]).output
     assert "gate — skipped (when_false)" in markdown
-    assert "downstream — skipped (blocked)" in markdown
+    assert "downstream — skipped (blocked by gate)" in markdown
+
+
+def test_report_names_the_root_failed_blocker_down_a_deep_failure_chain(
+    write_workflow_data: Callable[[dict[str, Any]], Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #94: a `blocked`-skipped node's report names WHICH upstream node withheld it, at
+    # parity with the live `caw run` message — read from the persisted `node_skipped`
+    # event's `blocked_by`, the same source the live RunResult uses. boom fails; a deep
+    # chain c1..c4 is skipped in its failure cone. The live executor attributes the
+    # WHOLE failure cone to the ROOT failed node (boom), so every node in the chain
+    # reads `blocked by boom` — and a deep chain exercises the no-recursion path that
+    # PR #105's review flagged (the executor's BFS skip walk, ADR 0007).
+    chain = ["c1", "c2", "c3", "c4"]
+    nodes: list[dict[str, Any]] = [
+        {"id": "boom", "kind": "shell", "inputs": {"command": "exit 3"}}
+    ]
+    for index, node_id in enumerate(chain):
+        parent = "boom" if index == 0 else chain[index - 1]
+        nodes.append(
+            {
+                "id": node_id,
+                "kind": "shell",
+                "needs": [parent],
+                "inputs": {"command": f"echo {node_id}"},
+            }
+        )
+    workflow_file = write_workflow_data({"name": "sample", "version": 1, "nodes": nodes})
+    monkeypatch.chdir(tmp_path)
+    run = runner.invoke(app, ["run", str(workflow_file)])
+    assert run.exit_code == 1, run.output
+    # The live run attributes the whole failure cone to the root failed node.
+    for node_id in chain:
+        assert f"node {node_id} skipped (blocked by boom)" in run.output
+    run_id = _run_dir_name(tmp_path)
+
+    # Structured formats carry the blocker as a field; a failed node is not blocked.
+    report = json.loads(runner.invoke(app, ["report", run_id, "--format", "json"]).output)
+    by_id = {node["id"]: node for node in report["nodes"]}
+    assert by_id["boom"]["blocked_by"] is None
+    for node_id in chain:
+        assert by_id[node_id]["status"] == "skipped" and by_id[node_id]["cause"] == "blocked"
+        assert by_id[node_id]["blocked_by"] == "boom"
+
+    # Markdown / text name the blocker in the node-detail parenthetical, at parity.
+    markdown = runner.invoke(app, ["report", run_id, "--format", "markdown"]).output
+    text = runner.invoke(app, ["report", run_id, "--format", "text"]).output
+    for node_id in chain:
+        assert f"{node_id} — skipped (blocked by boom)" in markdown
+        assert f"{node_id}: skipped (blocked by boom)" in text
+
+
+def test_report_blocker_matches_the_live_run_when_a_node_has_mixed_upstreams(
+    write_workflow_data: Callable[[dict[str, Any]], Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #94 / PR #105 review: a `blocked` node with MULTIPLE upstreams — one that FAILED
+    # and one skipped `when_false` — must name the SAME blocker the live run did: the
+    # upstream that actually triggered skip propagation. The report reads the
+    # authoritative `blocked_by` from the persisted `node_skipped` event, so it matches
+    # the live message by SOURCE, not by re-deriving a (possibly different) blocker
+    # from final statuses + `needs` order. `summary` needs both `boom` (fails) and
+    # `gate` (`when_false`), so which one withheld it is ambiguous from final state.
+    workflow_file = write_workflow_data(
+        {
+            "name": "sample",
+            "version": 1,
+            "nodes": [
+                {"id": "classify", "kind": "shell", "inputs": {"command": "echo billing"}},
+                {
+                    "id": "gate",
+                    "kind": "shell",
+                    "needs": ["classify"],
+                    "when": {
+                        "ref": {"node": "classify", "field": "stdout"},
+                        "op": "equals",
+                        "value": "shipping",
+                    },
+                    "inputs": {"command": "echo gate"},
+                },
+                {"id": "boom", "kind": "shell", "inputs": {"command": "exit 3"}},
+                {
+                    "id": "summary",
+                    "kind": "shell",
+                    "needs": ["boom", "gate"],
+                    "inputs": {"command": "echo summary"},
+                },
+            ],
+        }
+    )
+    monkeypatch.chdir(tmp_path)
+    run = runner.invoke(app, ["run", str(workflow_file)])
+    assert run.exit_code == 1, run.output
+    match = re.search(r"node summary skipped \(blocked by (\w+)\)", run.output)
+    assert match, f"the live run names summary's blocker: {run.output}"
+    live_blocker = match.group(1)
+    assert live_blocker in {"boom", "gate"}
+    run_id = _run_dir_name(tmp_path)
+
+    # The report names the SAME blocker the live run recorded — exact parity, no
+    # re-derivation that could pick the other upstream.
+    report = json.loads(runner.invoke(app, ["report", run_id, "--format", "json"]).output)
+    summary = next(node for node in report["nodes"] if node["id"] == "summary")
+    assert summary["cause"] == "blocked"
+    assert summary["blocked_by"] == live_blocker
+    markdown = runner.invoke(app, ["report", run_id, "--format", "markdown"]).output
+    assert f"summary — skipped (blocked by {live_blocker})" in markdown
+
+
+def test_report_degrades_to_plain_blocked_when_the_blocker_is_indeterminable(
+    write_workflow_data: Callable[[dict[str, Any]], Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #94 AC5: when a `blocked` node's blocker cannot be inferred from persisted data
+    # (no failed/skipped upstream survives in State), the report degrades to plain
+    # `(blocked)` rather than erroring. Simulated by forcing a `blocked` status onto a
+    # node whose only dependency SUCCEEDED — an inconsistency the report tolerates.
+    workflow_file = write_workflow_data(
+        {
+            "name": "sample",
+            "version": 1,
+            "nodes": [
+                {"id": "build", "kind": "shell", "inputs": {"command": "echo build"}},
+                {
+                    "id": "ship",
+                    "kind": "shell",
+                    "needs": ["build"],
+                    "inputs": {"command": "echo ship"},
+                },
+            ],
+        }
+    )
+    monkeypatch.chdir(tmp_path)
+    assert runner.invoke(app, ["run", str(workflow_file)]).exit_code == 0
+    run_id = _run_dir_name(tmp_path)
+    database = tmp_path / ".caw" / "runs" / run_id / "state.sqlite"
+    connection = sqlite3.connect(database)
+    # A real skipped node is never attempted, so drop the attempt too — otherwise its
+    # persisted exit status would render instead of the skip cause.
+    connection.execute(
+        "UPDATE node SET status = 'skipped', cause = 'blocked' WHERE node_id = 'ship'"
+    )
+    connection.execute("DELETE FROM attempt WHERE node_id = 'ship'")
+    connection.commit()
+    connection.close()
+
+    markdown = runner.invoke(app, ["report", run_id, "--format", "markdown"])
+    assert markdown.exit_code == 0, markdown.output
+    assert "ship — skipped (blocked)" in markdown.output
+    assert "blocked by" not in markdown.output
+    report = json.loads(runner.invoke(app, ["report", run_id, "--format", "json"]).output)
+    ship = next(node for node in report["nodes"] if node["id"] == "ship")
+    assert ship["blocked_by"] is None
 
 
 def test_report_refuses_a_run_dir_without_state_and_creates_no_database(

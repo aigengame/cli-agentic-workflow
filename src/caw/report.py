@@ -84,13 +84,40 @@ def _conclusion_nodes(run_dir: Path) -> tuple[str | None, list[dict[str, Any]]]:
 def _gather(run_dir: Path) -> dict[str, Any]:
     """Assemble the full report model from the Run's persisted State and Events."""
     status, nodes = _conclusion_nodes(run_dir)
+    trace = _read_trace(run_dir)
+    blockers = _skip_blockers(trace)
+    for node in nodes:
+        node["blocked_by"] = blockers.get(node["id"])
     return {
         "run_id": run_dir.name,
         "status": status,
         "nodes": nodes,
         "graph": _read_graph(run_dir),
-        "trace": _read_trace(run_dir),
+        "trace": trace,
     }
+
+
+def _skip_blockers(trace: list[dict[str, Any]]) -> dict[str, str | None]:
+    """Map each skipped Node to the upstream that withheld it, from the Event trace.
+
+    The executor records the ACTUAL blocker at skip-propagation time in each
+    ``node_skipped`` event's ``blocked_by`` (#94) — the same authoritative source the
+    live ``caw run`` message reads — so a report reads it back rather than re-deriving
+    a blocker from final statuses, which would be ambiguous when a Node has several
+    failed/skipped upstreams. A ``when_false`` / ``all_branches_skipped`` skip carries
+    no ``blocked_by`` (no blocker); a resume that re-skips a Node appends a fresh
+    event, so the LAST ``node_skipped`` per Node is authoritative. A ``blocked`` Node
+    whose trace lacks the blocker degrades to ``None`` (a plain ``(blocked)``).
+    """
+    blockers: dict[str, str | None] = {}
+    for event in trace:
+        if event.get("type") != "node_skipped":
+            continue
+        data = event.get("data", {})
+        node_id = data.get("node_id")
+        if node_id is not None:
+            blockers[node_id] = data.get("blocked_by")
+    return blockers
 
 
 def _render_json(report: dict[str, Any]) -> str:
@@ -150,10 +177,14 @@ def _node_detail(node: dict[str, Any]) -> str:
 
     A node that ran shows ``(exit N)``; a skipped node shows its cause
     (``(when_false)`` / ``(blocked)`` / ``(all_branches_skipped)``, #7) so the three
-    skip reasons read distinctly; a node with neither shows nothing.
+    skip reasons read distinctly. A ``blocked`` node also names the upstream that
+    withheld it (``(blocked by gate)``, #94) when inferable, at parity with the live
+    ``caw run`` message; a node with neither shows nothing.
     """
     if node["exit_status"] is not None:
         return f" (exit {node['exit_status']})"
+    if node["cause"] == "blocked" and node.get("blocked_by"):
+        return f" (blocked by {node['blocked_by']})"
     if node["cause"]:
         return f" ({node['cause']})"
     return ""
