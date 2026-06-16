@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.0](https://github.com/aigengame/cli-agentic-workflow/compare/v0.9.0...v0.10.0) (2026-06-16)
+
+
+### Features
+
+* pattern expander infrastructure, pipeline/parallel, and caw init/patterns ([#8](https://github.com/aigengame/cli-agentic-workflow/issues/8)) ([#96](https://github.com/aigengame/cli-agentic-workflow/issues/96)) ([a6f0043](https://github.com/aigengame/cli-agentic-workflow/commit/a6f0043d05b805735d72a3d17af27b520fb7a5c7))
+
 ## [0.9.0](https://github.com/aigengame/cli-agentic-workflow/compare/v0.8.0...v0.9.0) (2026-06-15)
 
 
