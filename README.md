@@ -202,23 +202,29 @@ caw report <run-id> --format markdown
 | `caw graph <file>` | Render the planned DAG as text or JSON | ✅ now |
 | `caw run <file>` | Execute a workflow run | ✅ now |
 | `caw resume <run-id>` | Continue an interrupted or failed run, re-running only incomplete nodes | ✅ now |
-| `caw init` | Create a minimal starter workflow | 🚧 planned |
+| `caw init [path]` | Create a minimal starter workflow | ✅ now |
 | `caw report <run-id>` | Render a report (markdown, json, jsonl, text) from persisted state | ✅ now |
-| `caw patterns list` | List built-in workflow patterns | 🚧 planned |
-| `caw patterns init <name>` | Scaffold a complete runnable example of a pattern | 🚧 planned |
+| `caw patterns list` | List built-in workflow patterns | ✅ now |
+| `caw patterns init <name> [path]` | Scaffold a complete runnable example of a pattern | ✅ now |
 
 ## Built-in patterns
 
-| Pattern | Shape |
-| --- | --- |
-| Pipeline | Linear node chain |
-| Parallel | Independent branches joined downstream |
-| Classify and act | Classifier routes to one of several `when`-gated branches |
-| Generate and filter | N candidate generators, then a scoring/validation filter |
-| Fan-out synthesis | Parallel agents, then a synthesis node (the reference sample runs `claude.print` and `codex.exec` side by side) |
-| Adversarial verification | Generator + verifiers, with accept / reject / regenerate |
-| Tournament | Rounds or brackets with winner promotion and comparison evidence |
-| Loop until done | Iterates immutable runs in a run group until a stop condition |
+A built-in pattern is authored as a top-level `pattern:` block (mutually exclusive with
+`nodes:`) that compiles to plain IR at normalize time, so the expanded workflow validates
+and runs identically to the hand-authored equivalent (see
+[ADR 0008](docs/adr/0008-pattern-expanders-compile-to-plain-ir.md)). Scaffold a runnable
+example of any shipped pattern with `caw patterns init <name>`.
+
+| Pattern | Shape | Status |
+| --- | --- | --- |
+| Pipeline | Linear node chain | ✅ now |
+| Parallel | Independent branches joined downstream | ✅ now |
+| Classify and act | Classifier routes to one of several `when`-gated branches | 🚧 planned |
+| Generate and filter | N candidate generators, then a scoring/validation filter | 🚧 planned |
+| Fan-out synthesis | Parallel agents, then a synthesis node (the reference sample runs `claude.print` and `codex.exec` side by side) | 🚧 planned |
+| Adversarial verification | Generator + verifiers, with accept / reject / regenerate | 🚧 planned |
+| Tournament | Rounds or brackets with winner promotion and comparison evidence | 🚧 planned |
+| Loop until done | Iterates immutable runs in a run group until a stop condition | 🚧 planned |
 
 ## Positioning
 
@@ -236,7 +242,8 @@ caw report <run-id> --format markdown
 - Product spec: [`docs/prd/0001-cli-agentic-workflow.md`](docs/prd/0001-cli-agentic-workflow.md)
 - Architecture decisions: [`docs/adr/`](docs/adr/) — local-first kernel (0001), run-group
   iteration (0002), asyncio executor (0003), Python stack (0004), release model (0005),
-  Adapter interface (0006)
+  Adapter interface (0006), `when` predicates and skip semantics (0007), pattern expanders
+  compile to plain IR (0008)
 - Domain vocabulary: [`CONTEXT.md`](CONTEXT.md)
 - CI and release flow: [`docs/release-flow.md`](docs/release-flow.md)
 

@@ -21,6 +21,7 @@ from pydantic import (
 
 from caw.adapter import BUILTIN_ADAPTER_NAMES
 from caw.config import WorkflowConfigError
+from caw.patterns import expand_pattern
 
 
 def _require_non_blank(value: str) -> str:
@@ -650,6 +651,10 @@ def normalize_workflow(
     validates against, for a caller injecting adapters at run time; when ``None``
     the built-in set applies (#64).
     """
+    # A `pattern:` block compiles to plain `nodes:` BEFORE validation (ADR 0008),
+    # so what is validated, checksummed, inspected, and run is an ordinary
+    # Workflow — identical to the hand-authored `nodes:` equivalent.
+    raw = expand_pattern(raw, source)
     context: dict[str, Any] = {}
     if base_dir is not None:
         context["base_dir"] = base_dir

@@ -45,8 +45,10 @@ from caw.executor import (
     resume_run,
 )
 from caw.model import Node, Predicate, Workflow, execution_order, normalize_workflow
+from caw.patterns import expander_names, get_expander
 from caw.report import ReportFormat, render_report
 from caw.runlayout import run_dir, runs_root
+from caw.scaffold import PATTERN_EXAMPLES, STARTER_WORKFLOW
 
 app = typer.Typer(
     name="caw",
@@ -83,6 +85,122 @@ def _load_normalized_workflow(workflow_file: Path) -> Workflow:
     except WorkflowConfigError as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=2) from exc
+
+
+def _write_scaffold(target: Path, content: str, label: str) -> None:
+    """Write a scaffolded workflow file, refusing to clobber an existing one.
+
+    Scaffolding never silently overwrites an author's file: an existing target is a
+    config-class refusal (exit 2, one ``error:`` line), mirroring the CLI's config
+    contract. ``label`` names what was scaffolded (a starter, or a pattern example).
+    """
+    if target.exists():
+        typer.echo(f"error: {target} already exists; refusing to overwrite it", err=True)
+        raise typer.Exit(code=2)
+    try:
+        target.write_text(content, encoding="utf-8")
+    except OSError as exc:
+        typer.echo(f"error: cannot write {target}: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    typer.echo(f"created {label} at {target} (validate it with `caw validate {target}`)")
+
+
+@app.command()
+def init(
+    path: Annotated[Path, typer.Argument(help="Where to write the starter workflow.")] = Path(
+        "workflow.yaml"
+    ),
+) -> None:
+    """Create a minimal starter workflow that validates and runs."""
+    _write_scaffold(path, STARTER_WORKFLOW, "starter workflow")
+
+
+patterns_app = typer.Typer(
+    name="patterns",
+    help="List and scaffold built-in workflow patterns.",
+    no_args_is_help=True,
+)
+app.add_typer(patterns_app)
+
+
+@patterns_app.command("list")
+def patterns_list() -> None:
+    """List the built-in workflow patterns and their one-line shapes.
+
+    Driven off the expander registry, so every registered pattern appears and a
+    newly registered expander shows up with no edit here.
+    """
+    for name in expander_names():
+        expander = get_expander(name)
+        assert expander is not None  # name came from the registry
+        typer.echo(f"{name}: {expander.shape}")
+
+
+@patterns_app.command("init")
+def patterns_init(
+    name: Annotated[str, typer.Argument(help="The built-in pattern to scaffold.")],
+    path: Annotated[
+        Path | None,
+        typer.Argument(help="Where to write the workflow (defaults to <name>.yaml)."),
+    ] = None,
+) -> None:
+    """Scaffold a complete, runnable example of a built-in pattern.
+
+    Writes the workflow file plus any companion fixture files beside it, so the
+    scaffolded bundle runs to success offline with the mock Adapter. The chosen
+    path names the workflow file; companions are written in its directory. The
+    whole bundle is written only if NO target file exists and no two bundle files
+    collide on one destination, so an existing file is never clobbered and the
+    workflow is never overwritten by one of its own companions.
+    """
+    example = PATTERN_EXAMPLES.get(name)
+    if example is None:
+        known = ", ".join(sorted(PATTERN_EXAMPLES)) or "<none>"
+        typer.echo(f"error: unknown pattern {name!r} (known: {known})", err=True)
+        raise typer.Exit(code=2)
+    workflow_path = path if path is not None else Path(example.workflow_filename)
+    directory = workflow_path.parent
+    # Map every bundle file to its destination: the workflow under the chosen path,
+    # each companion fixture beside it in the same directory.
+    targets = {
+        filename: (
+            workflow_path if filename == example.workflow_filename else directory / filename
+        )
+        for filename in example.files
+    }
+    # Guard the WHOLE bundle before writing a single file. First: a chosen workflow
+    # path whose name collides with a companion fixture maps two bundle files to ONE
+    # destination — the write loop would overwrite the workflow with fixture JSON yet
+    # still report success, leaving a non-runnable "workflow". Reject the collision.
+    by_destination: dict[Path, str] = {}
+    for filename, target in targets.items():
+        resolved = target.resolve()
+        collides_with = by_destination.get(resolved)
+        if collides_with is not None:
+            typer.echo(
+                f"error: {target} is the destination of both {collides_with!r} and "
+                f"{filename!r} in the {name} bundle; choose a workflow path whose name "
+                f"does not collide with a companion file",
+                err=True,
+            )
+            raise typer.Exit(code=2)
+        by_destination[resolved] = filename
+    # Second: refuse the whole bundle if any target exists, so a partial scaffold
+    # never clobbers one file and leaves the rest unwritten.
+    for target in targets.values():
+        if target.exists():
+            typer.echo(f"error: {target} already exists; refusing to overwrite it", err=True)
+            raise typer.Exit(code=2)
+    for filename, target in targets.items():
+        try:
+            target.write_text(example.files[filename], encoding="utf-8")
+        except OSError as exc:
+            typer.echo(f"error: cannot write {target}: {exc}", err=True)
+            raise typer.Exit(code=2) from exc
+    typer.echo(
+        f"created {name} pattern example at {workflow_path} "
+        f"(run it with `caw run {workflow_path}`)"
+    )
 
 
 @app.command()
