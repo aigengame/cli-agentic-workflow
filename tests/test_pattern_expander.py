@@ -468,6 +468,34 @@ def test_a_classify_and_act_classifier_declaring_needs_is_a_config_error() -> No
     assert "must not declare `needs`" in str(excinfo.value)
 
 
+def test_a_classify_and_act_branch_without_a_when_gate_is_a_config_error() -> None:
+    # AC: classify-and-act expands into WHEN-GATED branch entry nodes. The `when`
+    # Predicate reading the classifier's output is the sole conditional mechanism
+    # (ADR 0007) that makes a branch a branch; a branch entry with no `when` would
+    # always run, defeating the routing. So a branch missing `when` is rejected.
+    raw = _classify_and_act_raw()
+    del raw["pattern"]["branches"][0]["when"]
+
+    with pytest.raises(WorkflowConfigError) as excinfo:
+        normalize_workflow(raw, source="nowhen.yaml")
+
+    assert "must declare a `when`" in str(excinfo.value)
+
+
+def test_a_classify_and_act_join_without_an_explicit_join_policy_is_a_config_error() -> None:
+    # AC: classify-and-act expands into a join with an EXPLICIT join policy. Only the
+    # matching branch runs and the rest skip, so a join silently defaulting to `all`
+    # would itself skip — the join must state its policy (typically `join: any`, ADR
+    # 0007). A join present but not declaring `join` is rejected.
+    raw = _classify_and_act_raw()
+    del raw["pattern"]["join"]["join"]
+
+    with pytest.raises(WorkflowConfigError) as excinfo:
+        normalize_workflow(raw, source="nojoinpolicy.yaml")
+
+    assert "must declare an explicit `join` policy" in str(excinfo.value)
+
+
 # --- generate-and-filter (#13) -----------------------------------------------
 
 
@@ -689,3 +717,31 @@ def test_a_fan_out_synthesis_synthesize_declaring_needs_is_a_config_error() -> N
         normalize_workflow(raw, source="needs.yaml")
 
     assert "must not declare `needs`" in str(excinfo.value)
+
+
+def test_a_fan_out_synthesis_worker_that_is_not_an_agent_is_a_config_error() -> None:
+    # AC: fan-out-synthesis expands into parallel AGENT nodes. A worker of any other
+    # kind (e.g. a free shell node) is not the parallel-agent fan-out the pattern
+    # names, so a non-agent worker is rejected.
+    raw = _fan_out_synthesis_raw()
+    raw["pattern"]["workers"][0]["kind"] = "shell"
+    raw["pattern"]["workers"][0]["inputs"] = {"command": "echo a"}
+
+    with pytest.raises(WorkflowConfigError) as excinfo:
+        normalize_workflow(raw, source="nonagent.yaml")
+
+    assert "must be `kind: agent`" in str(excinfo.value)
+
+
+def test_a_fan_out_synthesis_synthesize_that_is_not_an_agent_is_a_config_error() -> None:
+    # The synthesize join synthesizes the workers' results into one output — the
+    # "synthesize join" the AC names is itself an agent. A non-agent synthesize node
+    # is rejected, symmetric with the worker enforcement.
+    raw = _fan_out_synthesis_raw()
+    raw["pattern"]["synthesize"]["kind"] = "shell"
+    raw["pattern"]["synthesize"]["inputs"] = {"command": "echo synth"}
+
+    with pytest.raises(WorkflowConfigError) as excinfo:
+        normalize_workflow(raw, source="nonagent.yaml")
+
+    assert "must be `kind: agent`" in str(excinfo.value)
