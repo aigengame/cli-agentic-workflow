@@ -32,6 +32,17 @@ _NODE_ID = "agent"
 
 def _structured_agent_workflow(agent: str, schema: Path) -> Workflow:
     """A one-node structured agent Workflow targeting the selected agent's Adapter."""
+    inputs: dict[str, Any] = {
+        "adapter": harness.adapter_for_agent(agent),
+        "prompt": "Compute 2 + 2. Put the result in the 'answer' field as an integer.",
+        "output_schema": str(schema),
+        "env": list(harness.agent_env_names()),
+    }
+    # The selected agent's headless-run flags (codex: sandbox + skip-git-repo-check;
+    # claude: none) pass through as node args so the run is non-interactive everywhere.
+    run_args = harness.agent_run_args(agent)
+    if run_args:
+        inputs["args"] = list(run_args)
     raw = {
         "name": "e2e-report",
         "version": 1,
@@ -40,12 +51,7 @@ def _structured_agent_workflow(agent: str, schema: Path) -> Workflow:
                 "id": _NODE_ID,
                 "kind": "agent",
                 "timeout": _NODE_TIMEOUT_S,
-                "inputs": {
-                    "adapter": harness.adapter_for_agent(agent),
-                    "prompt": "Compute 2 + 2. Put the result in the 'answer' field as an integer.",
-                    "output_schema": str(schema),
-                    "env": list(harness.agent_env_names()),
-                },
+                "inputs": inputs,
             }
         ],
     }

@@ -59,8 +59,12 @@ def _agent_workflow(
     }
     if output_schema is not None:
         inputs["output_schema"] = str(output_schema)
-    if args:
-        inputs["args"] = list(args)
+    # The selected agent's headless-run flags (sandbox/repo-check for codex; none for
+    # claude) precede any test-supplied args, so e.g. the invalid-flag failure test
+    # still trips the real CLI's argument parser on its bad flag.
+    combined_args = (*harness.agent_run_args(agent), *args)
+    if combined_args:
+        inputs["args"] = list(combined_args)
     raw = {
         "name": "e2e",
         "version": 1,

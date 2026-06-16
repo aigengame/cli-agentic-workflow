@@ -74,6 +74,11 @@ async def test_pipeline_pattern_agent_step_reaches_the_real_agent_cli(
         "output_schema": str(schema),
         "env": list(harness.agent_env_names()),
     }
+    # The selected agent's headless-run flags (codex: sandbox + skip-git-repo-check;
+    # claude: none) pass through as node args so the run is non-interactive everywhere.
+    run_args = harness.agent_run_args(agent)
+    if run_args:
+        agent_inputs["args"] = list(run_args)
     raw = {
         "name": "e2e-pattern",
         "version": 1,
