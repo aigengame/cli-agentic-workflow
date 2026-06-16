@@ -72,28 +72,33 @@ def _write_workflow(directory: Path, first_fixture: str) -> Path:
     return workflow
 
 
-def _spec(workflow: Path, *, max_rounds: int) -> AdversarialSpec:
+def _spec(
+    workflow: Path, *, max_rounds: int, reject: dict[str, object] | None = None
+) -> AdversarialSpec:
     # The accept Predicate reuses the existing `when` algebra: a result is ACCEPTED
     # when the `verify` node's textual `stdout` contains the ACCEPT verdict
     # (`contains` is the op valid on the string `stdout` field, #7). A non-accepted
-    # round REJECTS and regenerates with feedback fed forward into the next round.
-    return AdversarialSpec.model_validate(
-        {
-            "workflow": str(workflow),
-            "max_rounds": max_rounds,
-            "verify_node": "verify",
-            "accept": {
-                "ref": {"node": "verify", "field": "stdout"},
-                "op": "contains",
-                "value": "ACCEPT",
-            },
-            "feedback": {
-                "to_node": "verify",
-                "to_field": "fixture",
-                "from_field": "next_fixture",
-            },
-        }
-    )
+    # round REJECTS and regenerates with feedback fed forward into the next round —
+    # unless the OPTIONAL `reject` Predicate holds, which terminates the group as an
+    # explicit verifier reject (distinct from cap-exhaustion).
+    raw: dict[str, object] = {
+        "workflow": str(workflow),
+        "max_rounds": max_rounds,
+        "verify_node": "verify",
+        "accept": {
+            "ref": {"node": "verify", "field": "stdout"},
+            "op": "contains",
+            "value": "ACCEPT",
+        },
+        "feedback": {
+            "to_node": "verify",
+            "to_field": "fixture",
+            "from_field": "next_fixture",
+        },
+    }
+    if reject is not None:
+        raw["reject"] = reject
+    return AdversarialSpec.model_validate(raw)
 
 
 def test_spec_rejects_an_accept_ref_that_misses_verify_node() -> None:
@@ -151,6 +156,75 @@ async def test_verification_rejects_until_max_rounds(tmp_path: Path) -> None:
 
     assert result.status == "rejected", "the loop stopped at the round cap without acceptance"
     assert len(result.iterations) == 3, "exactly max_rounds runs materialized"
+
+
+@pytest.mark.asyncio
+async def test_explicit_reject_predicate_terminates_the_group_as_rejected(tmp_path: Path) -> None:
+    # AC1: the THREE outcomes are accept / reject / regenerate. An explicit `reject`
+    # Predicate that holds over a round terminates the group `rejected` IMMEDIATELY —
+    # a verifier reject, distinct from cap-exhaustion — rather than regenerating until
+    # the cap. round 1's verdict is REJECT, so the reject Predicate holds on round 1
+    # and the group stops after exactly one round (no regeneration to the cap).
+    _write_fixture(
+        tmp_path / "round1.fixture.json", accept=False, next_fixture="round2.fixture.json"
+    )
+    _write_fixture(tmp_path / "round2.fixture.json", accept=True)
+    workflow = _write_workflow(tmp_path, "round1.fixture.json")
+    spec = _spec(
+        workflow,
+        max_rounds=5,
+        reject={"ref": {"node": "verify", "field": "stdout"}, "op": "contains", "value": "REJECT"},
+    )
+
+    result = await run_adversarial_verification(spec, base=tmp_path)
+
+    assert result.status == "rejected", "the explicit reject Predicate stopped the loop"
+    assert len(result.iterations) == 1, "the reject terminates at round 1, not the cap"
+    persisted = json.loads(group_state_path(result.group_id, tmp_path).read_text())
+    assert persisted["status"] == "rejected"
+
+
+@pytest.mark.asyncio
+async def test_accept_wins_over_reject_when_both_could_hold(tmp_path: Path) -> None:
+    # Per-round order is accept -> reject -> regenerate: when a round could satisfy
+    # BOTH accept and reject, accept wins. round 1's verdict is ACCEPT, and the reject
+    # Predicate would hold on any non-empty stdout, but accept is checked first.
+    _write_fixture(tmp_path / "round1.fixture.json", accept=True)
+    workflow = _write_workflow(tmp_path, "round1.fixture.json")
+    spec = _spec(
+        workflow,
+        max_rounds=5,
+        # A reject Predicate broad enough to also hold on an ACCEPT verdict.
+        reject={"ref": {"node": "verify", "field": "exit_status"}, "op": "equals", "value": 0},
+    )
+
+    result = await run_adversarial_verification(spec, base=tmp_path)
+
+    assert result.status == "accepted", "accept is evaluated before reject"
+    assert len(result.iterations) == 1
+
+
+def test_spec_rejects_a_reject_ref_that_misses_verify_node() -> None:
+    # The OPTIONAL `reject` Predicate is symmetric with `accept`: its leaf refs may
+    # only address `verify_node`, validated identically (fail fast over fail silent).
+    with pytest.raises(ValueError, match="reject predicate references node 'verfy'"):
+        AdversarialSpec.model_validate(
+            {
+                "workflow": "iteration.yaml",
+                "max_rounds": 5,
+                "verify_node": "verify",
+                "accept": {
+                    "ref": {"node": "verify", "field": "stdout"},
+                    "op": "contains",
+                    "value": "ACCEPT",
+                },
+                "reject": {
+                    "ref": {"node": "verfy", "field": "stdout"},
+                    "op": "contains",
+                    "value": "REJECT",
+                },
+            }
+        )
 
 
 @pytest.mark.asyncio

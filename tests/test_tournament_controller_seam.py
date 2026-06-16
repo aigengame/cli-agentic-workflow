@@ -196,6 +196,37 @@ async def test_group_report_carries_each_round_comparison_evidence(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+async def test_group_report_carries_the_persisted_final_winner(tmp_path: Path) -> None:
+    # AC2: the report reports "the final result". The tournament persists a top-level
+    # `winner` to group.json; the aggregate group report must carry it so
+    # `caw tournament report` is as informative as `caw tournament run`.
+    _write_fixture(
+        tmp_path / "round1.fixture.json",
+        winner="candidate-a",
+        scores={"candidate-a": 9, "candidate-b": 4},
+        next_fixture="round2.fixture.json",
+    )
+    _write_fixture(
+        tmp_path / "round2.fixture.json",
+        winner="candidate-c",
+        scores={"candidate-a": 6, "candidate-c": 8},
+    )
+    workflow = _write_workflow(tmp_path, "round1.fixture.json")
+    spec = _spec(workflow, rounds=2)
+
+    result = await run_tournament(spec, base=tmp_path)
+
+    json_report = json.loads(render_group_report(result.group_id, tmp_path, ReportFormat.json))
+    assert json_report["winner"] == "candidate-c", "the JSON group report carries the final winner"
+
+    markdown = render_group_report(result.group_id, tmp_path, ReportFormat.markdown)
+    assert "candidate-c" in markdown, "the markdown group report names the final winner"
+
+    text = render_group_report(result.group_id, tmp_path, ReportFormat.text)
+    assert "candidate-c" in text, "the text group report names the final winner"
+
+
+@pytest.mark.asyncio
 async def test_tournament_records_the_final_winner(tmp_path: Path) -> None:
     # AC2: the final round's winner is the tournament's reported result, surfaced on
     # the GroupResult and persisted to group.json so it is queryable without
@@ -221,6 +252,28 @@ async def test_tournament_records_the_final_winner(tmp_path: Path) -> None:
     assert persisted["winner"] == "candidate-c"
     # Each round's promoted winner is recorded in order, the comparison trail.
     assert [it["promoted"] for it in persisted["iterations"]] == ["candidate-a", "candidate-c"]
+
+
+@pytest.mark.asyncio
+async def test_tournament_with_a_succeeded_round_naming_no_winner_fails(tmp_path: Path) -> None:
+    # AC2: a tournament must "promote winners" and "report the final result". A
+    # compare node that SUCCEEDS but omits the `winner_field` from its
+    # structured_output names no winner, so the tournament cannot complete with a
+    # final result — that is a controller FAILURE, not a `complete` with no winner.
+    (tmp_path / "no-winner.fixture.json").write_text(
+        json.dumps({"exit_status": 0, "structured_output": {"scores": {"candidate-a": 1}}}),
+        encoding="utf-8",
+    )
+    workflow = _write_workflow(tmp_path, "no-winner.fixture.json")
+    spec = _spec(workflow, rounds=2)
+
+    result = await run_tournament(spec, base=tmp_path)
+
+    assert result.status == "failed", "a succeeded round that names no winner fails the tournament"
+    assert result.winner is None, "no winner was promoted"
+    assert len(result.iterations) == 1, "the tournament stops on the winnerless round"
+    persisted = json.loads(group_state_path(result.group_id, tmp_path).read_text())
+    assert persisted["status"] == "failed"
 
 
 @pytest.mark.asyncio

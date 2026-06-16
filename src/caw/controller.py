@@ -536,17 +536,21 @@ async def resume_loop_until_done(
 # ======================================================================================
 #
 # Adversarial verification runs a generator, runs verifier nodes against the result,
-# and either ACCEPTS the result (stops) or REJECTS it and REGENERATES via a new Run in
-# the same Run Group with the verifier's feedback fed forward. It is a Pattern
-# Controller on the SAME Run Group infrastructure ``loop_until_done`` uses — immutable
-# per-round Runs, the membership mirror, the ``group.json`` control state, and
-# structural feedback substitution (ADR 0009, NO string templating) — with its own
-# accept/reject verdict vocabulary and stop reasons.
+# and yields one of THREE outcomes per round (the AC): ACCEPT the result (stops), an
+# explicit REJECT (stops), or REGENERATE via a new Run in the same Run Group with the
+# verifier's feedback fed forward. It is a Pattern Controller on the SAME Run Group
+# infrastructure ``loop_until_done`` uses — immutable per-round Runs, the membership
+# mirror, the ``group.json`` control state, and structural feedback substitution
+# (ADR 0009, NO string templating) — with its own accept/reject verdict vocabulary and
+# stop reasons.
 
 # The adversarial Run Group's status (#17), at parity with the loop-until-done set:
 #   TERMINAL (resume refused — nothing to do):
 #     "accepted" — the accept Predicate held over a round's verifier output
-#     "rejected" — the round index reached max_rounds without an acceptance
+#     "rejected" — an explicit reject Predicate held over a round's output, OR the round
+#                  index reached max_rounds without an acceptance (cap-exhausted). Both
+#                  are a terminal reject; the explicit reject stops early, the cap is the
+#                  fallback when no reject Predicate is declared.
 #   RESUMABLE (resume continues the verification):
 #     "running"  — an in-progress marker persisted BETWEEN rounds
 #     "failed"   — a round's Run failed (resumable per Resume Eligibility)
@@ -560,35 +564,50 @@ class AdversarialSpec(BaseModel):
     ``workflow`` is the round ``Workflow`` file (an ordinary single-iteration graph
     carrying the generator and the verifier nodes); ``max_rounds`` is the hard cap on
     regeneration rounds; ``verify_node`` is the id of the node whose normalized output
-    the ``accept`` Predicate (the ``when`` algebra, ADR 0007) reads; ``accept`` holds
-    when the result is accepted, stopping the loop; ``feedback`` (optional) carries the
-    verifier's critique into the next round's generation (structural substitution).
+    the ``accept`` / ``reject`` Predicates (the ``when`` algebra, ADR 0007) read.
+
+    The verifier yields THREE outcomes (the AC: accept / reject / regenerate), decided
+    per round in order: ``accept`` holds -> terminate ``accepted``; else the OPTIONAL
+    ``reject`` holds -> terminate ``rejected`` (an explicit verifier reject, distinct
+    from cap-exhaustion); else regenerate with the verifier's feedback. Reaching
+    ``max_rounds`` without an acceptance also terminates ``rejected`` (cap-exhausted).
+    ``reject`` is optional: a spec that omits it preserves the cap-only behavior (a
+    non-accepted round always regenerates until the cap). ``feedback`` (optional)
+    carries the verifier's critique into the next round's generation (structural
+    substitution).
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     workflow: Path
     max_rounds: int = Field(ge=1)
-    # The id of the node whose normalized output the accept Predicate and the feedback
-    # source read — the round's verdict carrier, mirroring a `when` ref's node and
-    # ControllerSpec's `evaluate_node`.
+    # The id of the node whose normalized output the accept/reject Predicates and the
+    # feedback source read — the round's verdict carrier, mirroring a `when` ref's node
+    # and ControllerSpec's `evaluate_node`.
     verify_node: str
     accept: Predicate
+    # An OPTIONAL explicit verifier reject (symmetric with `accept`): when it holds the
+    # group terminates `rejected` immediately, distinct from cap-exhaustion. Omitted ->
+    # today's cap-only behavior (a non-accepted round regenerates until max_rounds).
+    reject: Predicate | None = None
     feedback: FeedbackSpec | None = None
 
     @model_validator(mode="after")
-    def _accept_refs_must_target_verify_node(self) -> "AdversarialSpec":
-        # Every leaf ``ref`` in the accept Predicate must address ``verify_node``: at
-        # evaluation time only that node's output is supplied to the Predicate, so a ref
-        # to a typo or a different node would silently evaluate false and the loop would
-        # wrongly REJECT forever. Reject it at validation (fail fast over fail silent),
-        # mirroring ControllerSpec's done-ref invariant.
-        for ref in self.accept.leaf_refs():
-            if ref.node != self.verify_node:
-                raise ValueError(
-                    f"accept predicate references node {ref.node!r}, but only "
-                    f"verify_node {self.verify_node!r}'s output is available to it"
-                )
+    def _verdict_refs_must_target_verify_node(self) -> "AdversarialSpec":
+        # Every leaf ``ref`` in the accept (and optional reject) Predicate must address
+        # ``verify_node``: at evaluation time only that node's output is supplied to the
+        # Predicate, so a ref to a typo or a different node would silently evaluate false
+        # and the loop would misbehave. Reject it at validation (fail fast over fail
+        # silent), mirroring ControllerSpec's done-ref invariant.
+        for verdict_name, predicate in (("accept", self.accept), ("reject", self.reject)):
+            if predicate is None:
+                continue
+            for ref in predicate.leaf_refs():
+                if ref.node != self.verify_node:
+                    raise ValueError(
+                        f"{verdict_name} predicate references node {ref.node!r}, but only "
+                        f"verify_node {self.verify_node!r}'s output is available to it"
+                    )
         return self
 
 
@@ -664,8 +683,11 @@ async def _drive_adversarial(
 def _verification_verdict(spec: AdversarialSpec, run_dir: Path, result: RunResult) -> str | None:
     """The terminal status if the verification should stop after this round, else None.
 
-    Stops on a failed Run, or on the accept Predicate holding over the verify-node's
-    output. Returns ``None`` to REGENERATE (the caller also stops at max_rounds).
+    The per-round order realizes the AC's three outcomes (accept / reject / regenerate):
+    a failed Run stops ``failed``; else the accept Predicate holding stops ``accepted``;
+    else the OPTIONAL reject Predicate holding stops ``rejected`` (an explicit verifier
+    reject); else ``None`` to REGENERATE (the caller stops ``rejected`` at max_rounds).
+    Accept is checked before reject, so a round that could satisfy both is accepted.
     """
     if not result.succeeded:
         return GROUP_FAILED
@@ -676,6 +698,8 @@ def _verification_verdict(spec: AdversarialSpec, run_dir: Path, result: RunResul
 
     if evaluate_predicate(spec.accept, output_of):
         return GROUP_ACCEPTED
+    if spec.reject is not None and evaluate_predicate(spec.reject, output_of):
+        return GROUP_REJECTED
     return None
 
 
@@ -780,7 +804,10 @@ async def resume_adversarial_verification(
 
 # The tournament Run Group's status (#17):
 #   TERMINAL: "complete" — every round ran and the final winner was promoted
-#   RESUMABLE: "running" (interrupted between rounds), "failed" (a round's Run failed)
+#   RESUMABLE: "running" (interrupted between rounds), "failed" (a round's Run failed,
+#              OR a succeeded round named no winner so the tournament cannot complete
+#              with a final result — the AC requires promoting winners and reporting
+#              the final result, so a winnerless round is a failure, not a complete)
 GROUP_COMPLETE = "complete"
 
 
@@ -891,6 +918,17 @@ async def _drive_tournament(
             return GroupResult(group_id=group_id, status=GROUP_FAILED, iterations=tuple(completed))
 
         last_winner = _round_winner(spec, run_dir, result.run_id)
+        if last_winner is None:
+            # A round whose compare node SUCCEEDED but named no winner (its
+            # structured_output omits `winner_field`) cannot promote a winner forward
+            # nor report a final result. The tournament must "promote winners" and
+            # "report the final result" (AC), so a winnerless round is a controller
+            # FAILURE — never a `complete` with no winner.
+            winners.append(None)
+            _persist_tournament_state(
+                spec, base, group_id, tuple(completed), tuple(winners), GROUP_FAILED
+            )
+            return GroupResult(group_id=group_id, status=GROUP_FAILED, iterations=tuple(completed))
         winners.append(last_winner)
         feedback_value = _tournament_feedback(spec, run_dir, result.run_id)
         status = GROUP_COMPLETE if len(completed) >= spec.rounds else GROUP_RUNNING
@@ -927,9 +965,10 @@ def _round_substitutions(
 def _round_winner(spec: TournamentSpec, run_dir: Path, run_id: str) -> str | None:
     """The round's winning candidate: ``compare_node``'s ``structured_output[winner_field]``.
 
-    ``None`` when the compare node produced no structured output or lacks the field, so
-    a malformed round simply promotes nothing forward. The value is coerced to ``str``
-    (a candidate identifier) when present.
+    ``None`` when the compare node produced no structured output or lacks the field. A
+    succeeded round that names ``None`` cannot promote a winner nor report a final
+    result, so the driver treats it as a controller failure (the AC requires promoting
+    winners). The value is coerced to ``str`` (a candidate identifier) when present.
     """
     output = _evaluate_node_output(run_dir, run_id, spec.compare_node)
     if output is None:
@@ -1025,7 +1064,12 @@ async def resume_tournament(
                 succeeded=resumed.succeeded,
             )
             _record_membership(last_run_dir, resumed.run_id, group_id, last.iteration_index)
-            if not resumed.succeeded:
+            resumed_winner = (
+                _round_winner(spec, last_run_dir, resumed.run_id) if resumed.succeeded else None
+            )
+            if not resumed.succeeded or resumed_winner is None:
+                # A failed round, or a succeeded round that named no winner, cannot
+                # promote a winner forward (parity with the fresh-drive guard): fail.
                 if winners:
                     winners[-1] = None
                 _persist_tournament_state(
@@ -1035,7 +1079,7 @@ async def resume_tournament(
                     group_id=group_id, status=GROUP_FAILED, iterations=tuple(completed)
                 )
             if winners:
-                winners[-1] = _round_winner(spec, last_run_dir, resumed.run_id)
+                winners[-1] = resumed_winner
 
     feedback_value: object | None = None
     if completed and completed[-1].succeeded:
