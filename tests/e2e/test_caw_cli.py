@@ -7,12 +7,12 @@ e2e in ``test_claude_print_graph_runs.py`` call ``execute_run`` directly; this f
 closes the CLI-entrypoint gap.) Part of the living e2e suite, co-weighted with the
 mock suite that covers what a fixture can verify offline.
 
-The multi-node test gates a downstream node on the agent node's ``exit_status`` — a
-STRUCTURAL field of its output — so the assertion is deterministic and free of
-model-text matching (#86 decision #4). Gating on the agent's CONTENT (a sub-field of
-``structured_output``) is not expressible today: the predicate algebra references a
-WHOLE field against a SCALAR value with no sub-path (``model.py`` ``PredicateField`` /
-``Predicate.value``), tracked in #89 — so content-driven branching is deferred there.
+The multi-node test gates two downstream nodes on a SUB-FIELD of the agent node's
+``structured_output`` (``path: ["category"]``, the #75 sub-path addressing) — the real
+classify-and-act shape (#13). The agent is prompted to put a fixed literal in that field,
+so the gate is deterministic and free of free-text matching (#86 decision #4): one branch
+matches and runs, the mutually-exclusive other skips. This retires the earlier
+``exit_status`` / ``stdout`` + ``contains`` workaround (#89, folded into #75).
 
 Real agent calls go through ``harness.run_cli_with_transient_retry`` so a transient
 network / 5xx / rate-limit blip is retried (decision #6), like the graph-run e2e; the
@@ -21,6 +21,7 @@ helper also returns the latest run dir, resolving the several a retry materializ
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -64,40 +65,54 @@ def test_caw_run_drives_a_real_agent_graph_with_when_gating(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # `caw run` (the real CLI entrypoint) over a multi-node graph: a real agent node
-    # runs, and two downstream shell nodes are gated by `when` on the agent node's
-    # `exit_status` — one matches (must run), one does not (must skip). Covers the CLI
-    # entrypoint + multi-node data flow + a downstream fate decided by a real agent
-    # node's (structural) output, asserted on State. exit_status is deterministic, so
-    # there is NO model-text matching (#86 decision #4); content gating awaits #89.
+    # emits structured output, and two downstream shell nodes are gated by `when` on a
+    # SUB-FIELD of that output (`structured_output.category`, the #75 sub-path) — the
+    # real classify-and-act shape. The agent is told to put a fixed literal in the
+    # field, so the gate is deterministic with NO free-text matching (#86 decision #4):
+    # `on_alpha` matches and runs, the mutually-exclusive `on_beta` skips. This is the
+    # content gating the earlier exit_status workaround stood in for (#89, folded #75).
     harness.require_agent_cli(agent)
+    schema = tmp_path / "category.schema.json"
+    schema.write_text(
+        json.dumps(
+            {
+                "type": "object",
+                "properties": {"category": {"type": "string"}},
+                "required": ["category"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    classify = _agent_node(
+        "classify",
+        agent,
+        prompt="Set the 'category' field of your structured output to the exact "
+        "string 'alpha'. Respond with only that structured output.",
+    )
+    # Relative to the workflow file's directory (tmp_path), anchored at normalize time.
+    classify["inputs"]["output_schema"] = "category.schema.json"
+
+    def _category_gate(node_id: str, value: str, command: str) -> dict[str, Any]:
+        return {
+            "id": node_id,
+            "kind": "shell",
+            "needs": ["classify"],
+            "when": {
+                "ref": {"node": "classify", "field": "structured_output", "path": ["category"]},
+                "op": "equals",
+                "value": value,
+            },
+            "inputs": {"command": command},
+        }
+
     workflow_file = write_workflow_data(
         {
             "name": "e2e-graph",
             "version": 1,
             "nodes": [
-                _agent_node("answer", agent, prompt="Reply with the single word OK."),
-                {
-                    "id": "on_success",
-                    "kind": "shell",
-                    "needs": ["answer"],
-                    "when": {
-                        "ref": {"node": "answer", "field": "exit_status"},
-                        "op": "equals",
-                        "value": 0,
-                    },
-                    "inputs": {"command": "echo ran"},
-                },
-                {
-                    "id": "on_failure",
-                    "kind": "shell",
-                    "needs": ["answer"],
-                    "when": {
-                        "ref": {"node": "answer", "field": "exit_status"},
-                        "op": "equals",
-                        "value": 1,
-                    },
-                    "inputs": {"command": "echo nope"},
-                },
+                classify,
+                _category_gate("on_alpha", "alpha", "echo ran"),
+                _category_gate("on_beta", "beta", "echo nope"),
             ],
         }
     )
@@ -112,10 +127,12 @@ def test_caw_run_drives_a_real_agent_graph_with_when_gating(
     assert run_dir is not None
     with StateStore(run_dir / "state.sqlite") as state:
         statuses = state.node_statuses(run_dir.name)
-    assert statuses["answer"] == "succeeded", "the real agent node ran and succeeded"
-    assert statuses["on_success"] == "succeeded", "the gate on exit_status == 0 ran"
-    assert statuses["on_failure"] == "skipped", (
-        "the gate on exit_status == 1 was skipped (when_false)"
+    assert statuses["classify"] == "succeeded", "the real agent node ran and succeeded"
+    assert statuses["on_alpha"] == "succeeded", (
+        "the gate on structured_output.category == 'alpha' ran"
+    )
+    assert statuses["on_beta"] == "skipped", (
+        "the gate on structured_output.category == 'beta' was skipped (when_false)"
     )
 
 
