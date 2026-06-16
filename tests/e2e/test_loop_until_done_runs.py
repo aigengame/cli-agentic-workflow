@@ -45,11 +45,15 @@ async def test_loop_until_done_iteration_reaches_the_real_agent_cli(
     harness.require_agent_cli(agent)  # FAIL (not skip) when the selected CLI is absent
     schema = tmp_path / "answer.schema.json"
     schema.write_text(
+        # `additionalProperties: false` + a fully-listed `required` keep the schema valid
+        # under codex's strict `--output-schema` mode (claude accepts it too) — the same
+        # agent-neutral shape the graph e2e uses, so one iteration schema drives both CLIs.
         json.dumps(
             {
                 "type": "object",
                 "properties": {"answer": {"type": "integer"}},
                 "required": ["answer"],
+                "additionalProperties": False,
             }
         ),
         encoding="utf-8",
@@ -61,6 +65,13 @@ async def test_loop_until_done_iteration_reaches_the_real_agent_cli(
         "output_schema": str(schema),
         "env": list(harness.agent_env_names()),
     }
+    # The selected agent's headless-run flags (codex needs --skip-git-repo-check
+    # --sandbox read-only to run unattended in a non-git tmp dir) pass through as the
+    # node's own args, exactly as the agent-neutral graph e2e threads them (#11). Without
+    # them a codex iteration parks/fails and the loop never reaches "done".
+    run_args = harness.agent_run_args(agent)
+    if run_args:
+        agent_inputs["args"] = list(run_args)
     iteration.write_text(
         json.dumps(
             {
