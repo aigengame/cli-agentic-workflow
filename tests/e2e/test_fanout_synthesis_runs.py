@@ -115,8 +115,7 @@ async def test_fanout_synthesis_branches_and_join_reach_the_real_agent_cli(
                     "inputs": _agent_inputs(
                         agent,
                         prompt=(
-                            "Compute 1 + 1. Put the result in the 'answer' field "
-                            "as an integer."
+                            "Compute 1 + 1. Put the result in the 'answer' field as an integer."
                         ),
                         schema=answer_schema,
                     ),
@@ -128,8 +127,7 @@ async def test_fanout_synthesis_branches_and_join_reach_the_real_agent_cli(
                     "inputs": _agent_inputs(
                         agent,
                         prompt=(
-                            "Compute 2 + 2. Put the result in the 'answer' field "
-                            "as an integer."
+                            "Compute 2 + 2. Put the result in the 'answer' field as an integer."
                         ),
                         schema=answer_schema,
                     ),
@@ -142,8 +140,7 @@ async def test_fanout_synthesis_branches_and_join_reach_the_real_agent_cli(
                 "inputs": _agent_inputs(
                     agent,
                     prompt=(
-                        "Synthesize: add 2 and 4. Put the sum in the 'total' field "
-                        "as an integer."
+                        "Synthesize: add 2 and 4. Put the sum in the 'total' field as an integer."
                     ),
                     schema=synth_schema,
                 ),

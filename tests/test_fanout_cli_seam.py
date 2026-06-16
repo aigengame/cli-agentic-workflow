@@ -63,15 +63,11 @@ def test_fanout_sample_graph_fans_two_branches_into_one_synthesis_node(
 
     import json
 
-    plan = json.loads(
-        runner.invoke(app, ["graph", str(sample), "--format", "json"]).output
-    )
+    plan = json.loads(runner.invoke(app, ["graph", str(sample), "--format", "json"]).output)
     branches = [node["id"] for node in plan["nodes"] if not node["needs"]]
     assert len(branches) == 2, "two independent fan-out branches"
     synth = next(node for node in plan["nodes"] if node["id"] == _SYNTH_ID)
-    assert sorted(synth["needs"]) == sorted(branches), (
-        "the synthesis node fans in both branches"
-    )
+    assert sorted(synth["needs"]) == sorted(branches), "the synthesis node fans in both branches"
 
 
 def test_fanout_report_separates_conclusion_from_trace(
@@ -88,9 +84,7 @@ def test_fanout_report_separates_conclusion_from_trace(
 
     ran = runner.invoke(app, ["run", str(sample)])
     assert ran.exit_code == 0, ran.output
-    run_id = next(
-        line.split()[1] for line in ran.output.splitlines() if line.startswith("run ")
-    )
+    run_id = next(line.split()[1] for line in ran.output.splitlines() if line.startswith("run "))
 
     report = runner.invoke(app, ["report", run_id, "--format", "markdown"])
     assert report.exit_code == 0, report.output
