@@ -6,6 +6,7 @@ import json
 import os
 import secrets
 import signal
+from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -126,6 +127,10 @@ class NodeResult:
         }
         # Only agent Nodes carry structured output / artifacts; omit them for
         # shell Nodes so the persisted output shape is unchanged from before #5.
+        # A produced JSON `null` is omitted here too: caw deliberately does NOT
+        # distinguish "produced null" from "produced nothing" (#75 decision) — null
+        # collapses to absent end-to-end (absent from normalized_output, false in a
+        # `when` predicate, and `equals null` rejected at validation; ADR 0007).
         if self.structured_output is not None:
             output["structured_output"] = self.structured_output
         if self.artifacts:
@@ -847,13 +852,16 @@ class _Scheduler:
         ``orphaning_id`` is the just-skipped predecessor that reached the
         dependent — the blocker a ``join: all`` skip records. For the failure
         origin the blocker is pinned to ``origin_id`` instead, so the whole cone
-        names the original failure.
+        names the original failure. It is a ``deque`` dequeued from the left
+        (``popleft``) so each dequeue is O(1): a plain ``list.pop(0)`` shifts the
+        whole list on every pop, making a WIDE cone O(N^2) even with the O(1)
+        membership sets — the queue itself must stay O(1) per step (#77).
         """
-        queue: list[tuple[str, str]] = [
+        queue: deque[tuple[str, str]] = deque(
             (dependent_id, origin_id) for dependent_id in self._dependents[origin_id]
-        ]
+        )
         while queue:
-            dependent_id, orphaning_id = queue.pop(0)
+            dependent_id, orphaning_id = queue.popleft()
             if self._is_terminal(dependent_id):
                 continue
             dependent = self._by_id[dependent_id]
@@ -877,7 +885,7 @@ class _Scheduler:
                 )
 
     def _skip_in_walk(
-        self, node_id: str, *, cause: str, blocker: str | None, queue: list[tuple[str, str]]
+        self, node_id: str, *, cause: str, blocker: str | None, queue: deque[tuple[str, str]]
     ) -> None:
         """Record one skip inside the BFS, decrement indegree, and enqueue dependents.
 

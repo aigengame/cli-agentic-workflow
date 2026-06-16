@@ -9,7 +9,7 @@ import subprocess
 import sys
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from conftest import read_events, single_run_dir, state_rows
@@ -1259,11 +1259,13 @@ async def test_a_long_when_skip_chain_does_not_blow_the_stack(tmp_path: Path) ->
 
 @pytest.mark.asyncio
 async def test_a_wide_when_skip_cone_stays_within_a_generous_time_bound(tmp_path: Path) -> None:
-    # #77 O(1) membership: the skip cascade must not be O(N^2). A `join: all` fan-out
-    # where one closed gate orphans a WIDE set of dependents stresses the per-skip
-    # terminal/`_skipped` membership tests the walk performs; with an incrementally
-    # maintained terminal set and a `_skipped` set, a wide cone stays near-linear. A
-    # quadratic cascade over this width blows well past the generous bound.
+    # #77: a `join: all` fan-out where one closed gate orphans a WIDE set of
+    # dependents must skip the WHOLE cone correctly — the gate plus every leaf —
+    # through the real run path. This is the CORRECTNESS end of the wide-cascade
+    # coverage; the queue's O(1)-dequeue COMPLEXITY is pinned separately by
+    # `test_the_skip_cascade_queue_is_not_quadratic`, because a real run's wall-clock
+    # is dominated by O(N) State writes that mask the queue's cost — so the bound
+    # here is only a loose smoke guard, not the complexity assertion.
     import time
 
     width = 1500
@@ -1290,9 +1292,72 @@ async def test_a_wide_when_skip_cone_stays_within_a_generous_time_bound(tmp_path
 
     assert result.succeeded
     assert len(result.skipped_node_ids) == width + 1, "the gate and every fan-out leaf skipped"
-    assert elapsed < 10.0, (
-        f"a {width}-wide skip cone took {elapsed:.2f}s (expected < 10s); "
-        f"a quadratic cascade would regress here"
+    assert elapsed < 10.0, f"a {width}-wide skip cone took {elapsed:.2f}s (expected < 10s)"
+
+
+def _isolated_skip_cascade_seconds(workflow: Workflow) -> float:
+    """Time the skip cascade over ``workflow``'s fan-out, ISOLATED from State I/O.
+
+    A real run's wall-clock is dominated by the O(N) per-Node SQLite writes the skip
+    cascade performs, which mask the queue's own cost. This drives the scheduler's
+    skip walk directly with no-op State/Event sinks, so the timed work is the queue
+    plus its O(N) bookkeeping and NOTHING else. GC is disabled across the timed
+    region so a collection pause cannot perturb the measurement. (White-box by
+    necessity: the queue is internal to the walk and invisible end-to-end.)
+    """
+    import gc
+    import time
+
+    from caw.executor import SKIP_WHEN_FALSE, _Scheduler
+
+    class _NoOpState:
+        def record_node_skipped(self, **_kwargs: object) -> None: ...
+        def record_node_finished(self, **_kwargs: object) -> None: ...
+
+    class _NoOpEvents:
+        def append(self, *_args: object, **_kwargs: object) -> None: ...
+
+    scheduler = _Scheduler(
+        workflow, cast(Any, _NoOpState()), cast(Any, _NoOpEvents()), "run", AdapterRegistry()
+    )
+    gc.disable()
+    try:
+        start = time.perf_counter()
+        scheduler._skip_with_cause("origin", cause=SKIP_WHEN_FALSE, blocker=None)
+        elapsed = time.perf_counter() - start
+    finally:
+        gc.enable()
+    assert len(scheduler._skipped) == len(workflow.nodes), "the whole cone skipped"
+    return elapsed
+
+
+def _wide_fanout(width: int) -> Workflow:
+    """An ``origin`` with ``width`` ``join: all`` dependents — a maximal skip cone."""
+    nodes: list[dict[str, Any]] = [{"id": "origin", "kind": "shell", "inputs": {"command": ":"}}]
+    nodes += [
+        {"id": f"leaf{i}", "kind": "shell", "needs": ["origin"], "inputs": {"command": ":"}}
+        for i in range(width)
+    ]
+    return normalize_workflow({"name": "cone", "version": 1, "nodes": nodes}, source="<perf>")
+
+
+def test_the_skip_cascade_queue_is_not_quadratic() -> None:
+    # #77 regression (PR #99 review): the skip-walk queue must dequeue in O(1). A
+    # `list.pop(0)` shifts the whole list on every dequeue, so a WIDE cone is O(N^2)
+    # in the queue ALONE — and that cost is INVISIBLE end-to-end because a real run's
+    # time is dominated by O(N) State writes. This isolates the cascade from State and
+    # asserts it scales SUB-QUADRATICALLY: quadrupling the cone width multiplies the
+    # cascade time by ~4-5x with a `deque` (O(1) popleft) but by ~12-16x with a
+    # `list.pop(0)` queue. The RATIO cancels machine-speed variance, so the bound is
+    # stable across boxes (a slow box scales both widths equally).
+    base = _isolated_skip_cascade_seconds(_wide_fanout(25_000))
+    quad = _isolated_skip_cascade_seconds(_wide_fanout(100_000))
+
+    ratio = quad / base
+    assert ratio < 8.0, (
+        f"quadrupling the skip cone multiplied the cascade time by {ratio:.1f}x "
+        f"(expected < 8x for an O(1)-dequeue queue; a list.pop(0) queue is ~16x) — "
+        f"the queue regressed to O(N^2)"
     )
 
 
