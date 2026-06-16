@@ -53,6 +53,18 @@ than comparing a scalar against the whole dict (which could never match). An abs
 like an absent top-level field. A `path` on a scalar field (`stdout` / `exit_status`) is a
 config error.
 
+**Produced `null` vs produced nothing — collapsed by decision (#75).** caw deliberately does
+NOT distinguish a structured output an agent produced as JSON `null` from one it did not
+produce: `null` collapses to ABSENCE end-to-end. `NodeResult.normalized_output` omits a
+`None` `structured_output`, `_evaluate_leaf` reads an absent field as false, and `equals null`
+is rejected at validation — so a `null` value and an absent field read identically in State
+and in every `when` predicate. (The Output-Contract validation layer still sees a present
+`null` and lets the schema be its sole arbiter — ADR 0006 — but that distinction is not
+carried into State or the predicate algebra.) Preserving a first-class `null` would need a
+normalized-output sentinel plus a predicate presence / is-null operator for a niche gain; the
+collapse keeps the algebra and the persisted shape simple. This resolves the null-vs-absent
+gap folded into #75 from the #80 review.
+
 A leaf whose referenced upstream produced NO output — because that upstream was itself
 SKIPPED — evaluates **false** (#74). This is reachable for a tolerant `join: any` Node whose
 `when` references a dependency that skipped: the dependency-ref invariant guarantees the ref
