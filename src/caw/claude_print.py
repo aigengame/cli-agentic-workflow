@@ -157,6 +157,7 @@ class ClaudePrintAdapter(Adapter):
         # a non-zero exit is already a node failure (ADR 0006), so unparseable
         # stdout from a failed process is moot and must NOT mask the real exit.
         structured_output: object | None = None
+        adapter_failure = False
         if wants_structured and exit_status == 0:
             wrapper = self._parse_result_wrapper(stdout, invocation)
             # Defense-in-depth (#9 review follow-up): `claude` is EXPECTED to exit
@@ -167,13 +168,16 @@ class ClaudePrintAdapter(Adapter):
             # says `is_error: true` — known for some subtypes such as `error_max_turns`
             # (ref anthropics/claude-code-action#823). It is NOT the primary path.
             if wrapper.get("is_error") is True:
-                # Normalize to a FAILED node: force a non-zero exit_status, drop the
-                # structured_output (a failed node carries no trustworthy output,
-                # matching the existing non-zero-exit behavior — and the kernel skips
-                # Output Contract validation for a non-zero exit per #63), and append
-                # an actionable annotation to stderr (preserving any the process
-                # emitted). stdout keeps the raw wrapper so the trace stays complete.
-                exit_status = 1
+                # Normalize to a FAILED node via the first-class adapter-determined-
+                # failure signal (ADR 0006, #83): raise `adapter_failure` and KEEP the
+                # process's real exit_status (here 0) rather than fabricating a non-zero
+                # exit through the exit-code channel. The kernel honors the flag once.
+                # Drop the structured_output (a failed node carries no trustworthy
+                # output — the kernel also skips Output Contract validation for an
+                # adapter-determined failure, per #63), and append an actionable
+                # annotation to stderr (preserving any the process emitted). stdout
+                # keeps the raw wrapper so the trace stays complete.
+                adapter_failure = True
                 stderr = self._annotate_cli_error(stderr, wrapper)
             elif "structured_output" not in wrapper:
                 # The adapter asked for structured output (via --json-schema) but the
@@ -207,6 +211,7 @@ class ClaudePrintAdapter(Adapter):
             stdout=stdout,
             stderr=stderr,
             structured_output=structured_output,
+            adapter_failure=adapter_failure,
         )
 
     async def capability_check(self) -> str:
@@ -299,8 +304,8 @@ class ClaudePrintAdapter(Adapter):
         already emitted by appending rather than clobbering (#9 review follow-up).
         The process stderr is rstripped before the join so a process whose stderr
         already ends in a newline does not get a doubled/trailing blank line: the
-        is_error path forces exit_status=1, so the executor's exit==0-only `.strip()`
-        never cleans this persisted stderr.
+        is_error path raises `adapter_failure` (#83), so the node is failed and the
+        executor's success-only `.strip()` never cleans this persisted stderr.
         """
         subtype = wrapper.get("subtype")
         annotation = "claude reported an error"

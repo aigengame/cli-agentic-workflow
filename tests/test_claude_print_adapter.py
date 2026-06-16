@@ -640,9 +640,11 @@ async def test_zero_exit_but_wrapper_reports_error_normalizes_to_a_failed_node(
     # when the wrapper says `is_error: true`, so the exit code already catches the
     # common case. But some error subtypes can accompany a ZERO exit, so on the
     # structured path the adapter also inspects the wrapper: exit 0 + is_error true
-    # is normalized to a FAILED node — exit_status forced non-zero, structured_output
-    # dropped (a failed node carries no trustworthy output, matching the existing
-    # non-zero-exit behavior), and an actionable annotation appended to stderr.
+    # is normalized to a FAILED node via the FIRST-CLASS `adapter_failure` signal
+    # (#83) — NOT by manufacturing a non-zero exit_status. The adapter keeps the
+    # process's REAL exit_status (here 0), raises `adapter_failure`, drops the
+    # structured_output (a failed node carries no trustworthy output), and appends
+    # an actionable annotation to stderr. The kernel honors the flag once.
     schema = write_schema(tmp_path / "s.schema.json", {"type": "object"})
     stdout = claude_json_result(
         result="partial work",
@@ -657,7 +659,8 @@ async def test_zero_exit_but_wrapper_reports_error_normalizes_to_a_failed_node(
         AgentInvocation(node_id="n", adapter="claude.print", prompt="p", output_schema=schema)
     )
 
-    assert result.exit_status != 0
+    assert result.adapter_failure is True, "the failure rides the first-class signal"
+    assert result.exit_status == 0, "the real process exit_status is preserved, not fabricated"
     assert result.structured_output is None
     assert "error" in result.stderr.lower(), "stderr carries an actionable CLI-error annotation"
     # The raw JSON wrapper is preserved in stdout so the trace retains full CLI output.
@@ -681,7 +684,7 @@ async def test_zero_exit_error_wrapper_names_the_subtype_and_preserves_process_s
         AgentInvocation(node_id="n", adapter="claude.print", prompt="p", output_schema=schema)
     )
 
-    assert result.exit_status != 0
+    assert result.adapter_failure is True
     assert "error_max_turns" in result.stderr, "the annotation names the wrapper subtype"
     assert "prior process noise" in result.stderr, "existing process stderr is preserved"
 
@@ -690,10 +693,10 @@ async def test_zero_exit_error_wrapper_names_the_subtype_and_preserves_process_s
 async def test_zero_exit_error_wrapper_stderr_ending_in_newline_has_no_blank_line(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    # The is_error path forces exit_status=1, so the executor's exit==0-only `.strip()`
-    # never cleans the persisted stderr. When the process stderr already ends in a
-    # newline, the annotation must NOT introduce a doubled/trailing blank line — yet
-    # it must still name the subtype.
+    # The is_error path raises `adapter_failure` (#83), so the node is failed and the
+    # executor's success-only `.strip()` never cleans the persisted stderr. When the
+    # process stderr already ends in a newline, the annotation must NOT introduce a
+    # doubled/trailing blank line — yet it must still name the subtype.
     schema = write_schema(tmp_path / "s.schema.json", {"type": "object"})
     stdout = claude_json_result(result="hit the cap", is_error=True, subtype="error_max_turns")
     patch_which(monkeypatch)
