@@ -341,14 +341,25 @@ workflow: verify-round.yaml
 max_rounds: 5
 # The node whose normalized output the accept Predicate and feedback source read.
 verify_node: verify
-# The accept Predicate reuses the `when` Predicate algebra (the sole conditional
-# mechanism): accepted when the `verify` node's stdout contains ACCEPT.
+# The verifier yields THREE outcomes, decided per round in order: accept -> stop
+# `accepted`; else reject -> stop `rejected`; else regenerate with feedback. Both
+# predicates reuse the `when` Predicate algebra (the sole conditional mechanism).
+# Accepted when the `verify` node's stdout contains ACCEPT.
 accept:
   ref:
     node: verify
     field: stdout
   op: contains
   value: ACCEPT
+# OPTIONAL explicit verifier reject: stop `rejected` immediately (distinct from
+# cap-exhaustion) when the verifier hard-rejects. Here a plain REJECT just regenerates;
+# only a HARD_REJECT verdict terminates the group. Omit `reject` for cap-only behavior.
+reject:
+  ref:
+    node: verify
+    field: stdout
+  op: contains
+  value: HARD_REJECT
 # Verifier feedback from round N -> round N+1: the prior round's
 # `structured_output.next_fixture` is substituted into the `verify` node's `fixture`
 # field for the next round (structural substitution, not templating).
