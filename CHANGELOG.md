@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.13.0](https://github.com/aigengame/cli-agentic-workflow/compare/v0.12.0...v0.13.0) (2026-06-16)
+
+
+### Features
+
+* **report:** name the blocker for a blocked-skipped node ([#94](https://github.com/aigengame/cli-agentic-workflow/issues/94)) ([#105](https://github.com/aigengame/cli-agentic-workflow/issues/105)) ([c67fa1d](https://github.com/aigengame/cli-agentic-workflow/commit/c67fa1d4a0f1d4bf86fe8b0422e8debc45224843))
+
 ## [0.12.0](https://github.com/aigengame/cli-agentic-workflow/compare/v0.11.0...v0.12.0) (2026-06-16)
 
 
