@@ -9,7 +9,6 @@ Events. Real Adapters land in later issues (#9 claude, #11 codex); v0.1 ships
 the interface plus one :class:`MockAdapter` that replays a fixture file offline.
 """
 
-import json
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -129,18 +128,14 @@ class MockAdapter(Adapter):
         fixture = invocation.fixture
         assert fixture is not None  # guarded by invoke
         node_id = invocation.node_id
-        try:
-            raw = json.loads(fixture.read_text(encoding="utf-8"))
-        except OSError as exc:
-            raise AdapterError(
-                f"cannot read fixture {fixture} for node {node_id!r}: {exc}"
-            ) from exc
-        except json.JSONDecodeError as exc:
-            raise AdapterError(
-                f"invalid JSON fixture {fixture} for node {node_id!r}: {exc}"
-            ) from exc
-        if not isinstance(raw, dict):
-            raise AdapterError(f"fixture {fixture} for node {node_id!r} must be a JSON object")
+        # The read -> json.loads -> dict AdapterError ladder is the SAME one the real
+        # subprocess Adapters use, consolidated in caw.subprocess_adapter (#83), so a
+        # malformed fixture and a malformed CLI wrapper surface the same shape of
+        # error. Imported lazily here to avoid an import cycle (subprocess_adapter
+        # imports this module's AdapterError / AgentInvocation).
+        from caw.subprocess_adapter import node_context, read_json_object
+
+        raw = read_json_object(fixture, context=node_context(invocation), source_label="fixture")
         exit_status = raw.get("exit_status")
         if not isinstance(exit_status, int) or isinstance(exit_status, bool):
             raise AdapterError(

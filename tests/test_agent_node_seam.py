@@ -537,9 +537,7 @@ async def test_adapter_determined_failure_fails_the_node_even_on_a_zero_exit(
     marker = tmp_path / "side.txt"
     raw = agent_plus_independent_shell({"prompt": "p"}, marker)
     raw["nodes"][0]["inputs"]["adapter"] = "adapterfail"
-    workflow = normalize_workflow(
-        raw, source="<test>", known_adapters=frozenset({"adapterfail"})
-    )
+    workflow = normalize_workflow(raw, source="<test>", known_adapters=frozenset({"adapterfail"}))
 
     result = await execute_run(workflow, tmp_path / "runs", registry=registry)
 
