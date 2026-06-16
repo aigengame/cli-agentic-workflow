@@ -172,10 +172,11 @@ async def test_real_failure_non_zero_path(agent: str, tmp_path: Path) -> None:
 async def test_capability_check_reports_a_version(agent: str) -> None:
     # The real-CLI capability probe (`claude --version`): adapter infrastructure that
     # is free and tokenless, but still real-CLI-dependent — so it belongs in the e2e
-    # tier (fail, never skip), not the mock suite. NOTE: capability_check is currently
-    # claude.print-specific (not on the base Adapter), so this drives ClaudePrintAdapter
-    # directly; today `claude` is the only wired agent, so a non-claude CAW_E2E_AGENT
-    # already fails earlier at the require_agent_cli / adapter-resolution guard.
+    # tier (fail, never skip), not the mock suite. NOTE: capability_check lives on the
+    # shared SubprocessAdapter base (#83), inherited by claude and codex (#11); this
+    # drives ClaudePrintAdapter directly since `claude` is the only wired agent today,
+    # so a non-claude CAW_E2E_AGENT already fails earlier at the require_agent_cli /
+    # adapter-resolution guard.
     harness.require_agent_cli(agent)
 
     version = await ClaudePrintAdapter().capability_check()
