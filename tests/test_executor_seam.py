@@ -885,17 +885,18 @@ async def test_a_node_whose_when_predicate_is_false_is_skipped_and_never_execute
 
 
 @pytest.mark.asyncio
-async def test_an_equals_leaf_does_not_coerce_a_bool_value_to_an_int_exit_status(
+async def test_an_equals_leaf_on_exit_status_matches_a_genuine_int_value(
     tmp_path: Path,
 ) -> None:
-    # FIX 3 (#74): Python evaluates `0 == False` as True, so an `equals` leaf must
-    # NOT coerce bool to int. `probe` exits 0 (succeeds). `match_int` gates on
-    # exit_status == 0 — a genuine int match, so it RUNS — while `match_bool` gates
-    # on exit_status == false, which must be FALSE (bool vs int mismatch) so it is
-    # SKIPPED. Without the guard `0 == False` would wrongly open `match_bool`'s
-    # gate.
+    # An `equals` leaf on `exit_status` against a genuine int value (#7): `probe`
+    # exits 0 (succeeds); `match_int` gates on exit_status == 0 — a real int match —
+    # so its gate opens and it runs. The COMPLEMENTARY bool-vs-exit_status case (a
+    # `value: False` against the integer field) is now rejected at CONFIG time by
+    # #75's value-type validator — it never reaches the scheduler — so it is proven
+    # at the model seam (test_a_bool_value_against_exit_status_is_a_config_error)
+    # rather than here; the eval-level bool/int guard in predicate.py remains as
+    # defense-in-depth for the type-unconstrained structured_output field.
     int_marker = tmp_path / "int.txt"
-    bool_marker = tmp_path / "bool.txt"
     workflow = conditional_workflow(
         shell("probe", "true"),
         shell(
@@ -904,24 +905,13 @@ async def test_an_equals_leaf_does_not_coerce_a_bool_value_to_an_int_exit_status
             needs=["probe"],
             when={"ref": {"node": "probe", "field": "exit_status"}, "op": "equals", "value": 0},
         ),
-        shell(
-            "match_bool",
-            f"touch {bool_marker}",
-            needs=["probe"],
-            when={
-                "ref": {"node": "probe", "field": "exit_status"},
-                "op": "equals",
-                "value": False,
-            },
-        ),
     )
 
     result = await execute_run(workflow, tmp_path / "runs")
 
     assert result.succeeded
     assert int_marker.exists(), "exit_status == 0 is a real int match, so the gate opens"
-    assert not bool_marker.exists(), "exit_status == false must not match via 0 == False coercion"
-    assert result.skipped_causes.get("match_bool") == "when_false"
+    assert result.skipped_node_ids == (), "the gate is open, so nothing is skipped"
 
 
 @pytest.mark.asyncio
@@ -1074,6 +1064,115 @@ async def test_a_not_when_predicate_drives_a_skip_in_the_scheduler(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+async def test_a_structured_output_sub_path_leaf_routes_classify_and_act(
+    tmp_path: Path,
+) -> None:
+    # #75 / #13: a `when` leaf addresses a sub-path INTO an agent Node's
+    # structured_output and routes on it. `classify` is an agent Node whose
+    # structured_output is {"category": "bug"}; `act` gates on
+    # structured_output.category == "bug" via `ref.path: ["category"]`, so the
+    # addressed sub-value (a scalar) is compared — not the whole dict — and the
+    # gate opens. This is the reusable addressing mechanism #13's classify-and-act
+    # routes on, proven end-to-end through the scheduler.
+    from conftest import write_fixture
+
+    fixture = write_fixture(
+        tmp_path / "classify.json",
+        exit_status=0,
+        stdout="classified",
+        structured_output={"category": "bug", "confidence": 9},
+    )
+    marker = tmp_path / "acted.txt"
+    raw: dict[str, Any] = {
+        "name": "sample",
+        "version": 1,
+        "nodes": [
+            {
+                "id": "classify",
+                "kind": "agent",
+                "inputs": {"adapter": "mock", "prompt": "classify", "fixture": str(fixture)},
+            },
+            {
+                "id": "act",
+                "kind": "shell",
+                "needs": ["classify"],
+                "when": {
+                    "ref": {
+                        "node": "classify",
+                        "field": "structured_output",
+                        "path": ["category"],
+                    },
+                    "op": "equals",
+                    "value": "bug",
+                },
+                "inputs": {"command": f"touch {marker}"},
+            },
+        ],
+    }
+    workflow = normalize_workflow(raw, source="<test>")
+
+    result = await execute_run(workflow, tmp_path / "runs")
+
+    assert result.succeeded
+    assert marker.exists(), "the addressed structured_output.category == 'bug' opened the gate"
+    assert result.skipped_node_ids == (), "an open structured_output gate skips nothing"
+
+
+@pytest.mark.asyncio
+async def test_a_structured_output_sub_path_leaf_skips_when_the_sub_value_differs(
+    tmp_path: Path,
+) -> None:
+    # The complement (#75 / #13): the addressed structured_output sub-value is
+    # compared, so a leaf that does not match the addressed sub-field closes the
+    # gate. `classify` emits {"category": "feature"}; `act` gates on
+    # structured_output.category == "bug", which is false, so `act` is skipped
+    # when_false — distinguishing routing-on-a-sub-value from the old whole-dict
+    # comparison (which a scalar could never match at all).
+    from conftest import write_fixture
+
+    fixture = write_fixture(
+        tmp_path / "classify.json",
+        exit_status=0,
+        stdout="classified",
+        structured_output={"category": "feature"},
+    )
+    marker = tmp_path / "acted.txt"
+    raw: dict[str, Any] = {
+        "name": "sample",
+        "version": 1,
+        "nodes": [
+            {
+                "id": "classify",
+                "kind": "agent",
+                "inputs": {"adapter": "mock", "prompt": "classify", "fixture": str(fixture)},
+            },
+            {
+                "id": "act",
+                "kind": "shell",
+                "needs": ["classify"],
+                "when": {
+                    "ref": {
+                        "node": "classify",
+                        "field": "structured_output",
+                        "path": ["category"],
+                    },
+                    "op": "equals",
+                    "value": "bug",
+                },
+                "inputs": {"command": f"touch {marker}"},
+            },
+        ],
+    }
+    workflow = normalize_workflow(raw, source="<test>")
+
+    result = await execute_run(workflow, tmp_path / "runs")
+
+    assert result.succeeded, "a closed structured_output gate does not fail the run"
+    assert not marker.exists(), "structured_output.category != 'bug', so the gate is closed"
+    assert result.skipped_causes.get("act") == "when_false"
+
+
+@pytest.mark.asyncio
 async def test_a_dependent_of_a_when_skipped_node_is_skipped_blocked_along_the_whole_chain(
     tmp_path: Path,
 ) -> None:
@@ -1117,6 +1216,208 @@ async def test_a_dependent_of_a_when_skipped_node_is_skipped_blocked_along_the_w
     )
     assert result.skipped_blockers["audit"] == "notify", (
         "the transitive dependent is blocked by the skip that orphaned it"
+    )
+
+
+@pytest.mark.asyncio
+async def test_blocked_cause_and_blocker_membership_are_consistent_across_skip_causes(
+    tmp_path: Path,
+) -> None:
+    # #77 invariant: `cause == "blocked"` iff `node_id in skipped_blockers`, kept
+    # consistent in ONE place (`_record_skip`). A workflow mixing all three skip
+    # causes proves it: `classify` emits "billing"; `gate` gates on "shipping" so
+    # it skips `when_false` (no blocker); `blocked_dependent` needs `gate` so it
+    # skips `blocked` (blocker `gate`); `tolerant` is a `join: any` over `gate` and
+    # an independently-skipped `other_gate`, so once BOTH branches skip it is
+    # `all_branches_skipped` (no blocker). Across the whole result, the two maps
+    # agree exactly — a `blocked` node always has a blocker and a non-`blocked`
+    # node never does.
+    workflow = conditional_workflow(
+        shell("classify", "echo billing"),
+        shell(
+            "gate",
+            "echo gate",
+            needs=["classify"],
+            when={
+                "ref": {"node": "classify", "field": "stdout"},
+                "op": "equals",
+                "value": "shipping",
+            },
+        ),
+        shell(
+            "other_gate",
+            "echo other",
+            needs=["classify"],
+            when={
+                "ref": {"node": "classify", "field": "stdout"},
+                "op": "equals",
+                "value": "refund",
+            },
+        ),
+        shell("blocked_dependent", "echo blocked", needs=["gate"]),
+        shell("tolerant", "echo tolerant", needs=["gate", "other_gate"], join="any"),
+    )
+
+    result = await execute_run(workflow, tmp_path / "runs")
+
+    assert result.succeeded, "benign skips do not fail the run"
+    # The discriminating invariant: blocked-ness is derivable from blocker membership.
+    for node_id, cause in result.skipped_causes.items():
+        has_blocker = node_id in result.skipped_blockers
+        assert (cause == "blocked") == has_blocker, (
+            f"node {node_id!r} cause {cause!r} disagrees with blocker membership "
+            f"{has_blocker}: the two maps must stay consistent"
+        )
+    assert result.skipped_causes["gate"] == "when_false"
+    assert result.skipped_causes["blocked_dependent"] == "blocked"
+    assert result.skipped_blockers["blocked_dependent"] == "gate"
+    assert result.skipped_causes["tolerant"] == "all_branches_skipped"
+    assert "tolerant" not in result.skipped_blockers, "a tolerant-join skip carries no blocker"
+
+
+@pytest.mark.asyncio
+async def test_a_long_when_skip_chain_does_not_blow_the_stack(tmp_path: Path) -> None:
+    # #77 depth-safety: the skip-origin walk must be BFS (no recursion), so a long
+    # pipeline whose HEAD gate closes — reachable at Pattern-Expander scale — skips
+    # its whole transitive cone without a RecursionError. A 4,000-node linear chain
+    # `gate -> n1 -> ... -> n3999` far exceeds Python's ~1000 default recursion
+    # limit, so the previously mutually-recursive skip-origin walk would overflow
+    # the stack here; the unified BFS walk handles it.
+    depth = 4000
+    nodes: list[dict[str, Any]] = [
+        shell(
+            "gate",
+            "echo gate",
+            needs=["classify"],
+            when={
+                "ref": {"node": "classify", "field": "stdout"},
+                "op": "equals",
+                "value": "shipping",
+            },
+        )
+    ]
+    previous = "gate"
+    for index in range(depth):
+        node_id = f"n{index}"
+        nodes.append(shell(node_id, "echo x", needs=[previous]))
+        previous = node_id
+    workflow = conditional_workflow(shell("classify", "echo billing"), *nodes)
+
+    result = await execute_run(workflow, tmp_path / "runs")
+
+    assert result.succeeded, "a closed head gate and its skipped cone do not fail the run"
+    attempted = {node_result.node_id for node_result in result.node_results}
+    assert attempted == {"classify"}, "only the classifier ran; the whole chain skipped"
+    assert len(result.skipped_node_ids) == depth + 1, (
+        "the gate and every one of its transitive dependents were skipped, BFS-safely"
+    )
+    assert result.skipped_causes["gate"] == "when_false"
+    assert result.skipped_causes[f"n{depth - 1}"] == "blocked", (
+        "the deep tail is blocked, not lost"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_wide_when_skip_cone_stays_within_a_generous_time_bound(tmp_path: Path) -> None:
+    # #77: a `join: all` fan-out where one closed gate orphans a WIDE set of
+    # dependents must skip the WHOLE cone correctly — the gate plus every leaf —
+    # through the real run path. This is the CORRECTNESS end of the wide-cascade
+    # coverage; the queue's O(1)-dequeue COMPLEXITY is pinned separately by
+    # `test_the_skip_cascade_queue_is_not_quadratic`, because a real run's wall-clock
+    # is dominated by O(N) State writes that mask the queue's cost — so the bound
+    # here is only a loose smoke guard, not the complexity assertion.
+    import time
+
+    width = 1500
+    nodes = [
+        shell(
+            "gate",
+            "echo gate",
+            needs=["classify"],
+            when={
+                "ref": {"node": "classify", "field": "stdout"},
+                "op": "equals",
+                "value": "shipping",
+            },
+        )
+    ]
+    # A wide fan-out off the skipped gate: every `leafN` is a default-join dependent
+    # of the gate, so each is skipped `blocked` when the gate closes.
+    nodes.extend(shell(f"leaf{index}", "echo x", needs=["gate"]) for index in range(width))
+    workflow = conditional_workflow(shell("classify", "echo billing"), *nodes)
+
+    start = time.perf_counter()
+    result = await execute_run(workflow, tmp_path / "runs")
+    elapsed = time.perf_counter() - start
+
+    assert result.succeeded
+    assert len(result.skipped_node_ids) == width + 1, "the gate and every fan-out leaf skipped"
+    assert elapsed < 10.0, f"a {width}-wide skip cone took {elapsed:.2f}s (expected < 10s)"
+
+
+def _isolated_skip_cascade_seconds(workflow: Workflow) -> float:
+    """Time the skip cascade over ``workflow``'s fan-out, ISOLATED from State I/O.
+
+    A real run's wall-clock is dominated by the O(N) per-Node SQLite writes the skip
+    cascade performs, which mask the queue's own cost. This drives the scheduler's
+    skip walk directly with no-op State/Event sinks, so the timed work is the queue
+    plus its O(N) bookkeeping and NOTHING else. GC is disabled across the timed
+    region so a collection pause cannot perturb the measurement. (White-box by
+    necessity: the queue is internal to the walk and invisible end-to-end.)
+    """
+    import gc
+    import time
+
+    from caw.executor import SKIP_WHEN_FALSE, _Scheduler
+
+    class _NoOpState:
+        def record_node_skipped(self, **_kwargs: object) -> None: ...
+        def record_node_finished(self, **_kwargs: object) -> None: ...
+
+    class _NoOpEvents:
+        def append(self, *_args: object, **_kwargs: object) -> None: ...
+
+    scheduler = _Scheduler(
+        workflow, cast(Any, _NoOpState()), cast(Any, _NoOpEvents()), "run", AdapterRegistry()
+    )
+    gc.disable()
+    try:
+        start = time.perf_counter()
+        scheduler._skip_with_cause("origin", cause=SKIP_WHEN_FALSE, blocker=None)
+        elapsed = time.perf_counter() - start
+    finally:
+        gc.enable()
+    assert len(scheduler._skipped) == len(workflow.nodes), "the whole cone skipped"
+    return elapsed
+
+
+def _wide_fanout(width: int) -> Workflow:
+    """An ``origin`` with ``width`` ``join: all`` dependents — a maximal skip cone."""
+    nodes: list[dict[str, Any]] = [{"id": "origin", "kind": "shell", "inputs": {"command": ":"}}]
+    nodes += [
+        {"id": f"leaf{i}", "kind": "shell", "needs": ["origin"], "inputs": {"command": ":"}}
+        for i in range(width)
+    ]
+    return normalize_workflow({"name": "cone", "version": 1, "nodes": nodes}, source="<perf>")
+
+
+def test_the_skip_cascade_queue_is_not_quadratic() -> None:
+    # #77 regression (PR #99 review): the skip-walk queue must dequeue in O(1). A
+    # `list.pop(0)` shifts the whole list on every dequeue, so a WIDE cone is O(N^2)
+    # in the queue ALONE — and that cost is INVISIBLE end-to-end because a real run's
+    # time is dominated by O(N) State writes. This isolates the cascade from State and
+    # asserts it scales SUB-QUADRATICALLY: quadrupling the cone width multiplies the
+    # cascade time by ~4-5x with a `deque` (O(1) popleft) but by ~12-16x with a
+    # `list.pop(0)` queue. The RATIO cancels machine-speed variance, so the bound is
+    # stable across boxes (a slow box scales both widths equally).
+    base = _isolated_skip_cascade_seconds(_wide_fanout(25_000))
+    quad = _isolated_skip_cascade_seconds(_wide_fanout(100_000))
+
+    ratio = quad / base
+    assert ratio < 8.0, (
+        f"quadrupling the skip cone multiplied the cascade time by {ratio:.1f}x "
+        f"(expected < 8x for an O(1)-dequeue queue; a list.pop(0) queue is ~16x) — "
+        f"the queue regressed to O(N^2)"
     )
 
 

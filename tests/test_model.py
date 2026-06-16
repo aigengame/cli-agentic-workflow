@@ -361,6 +361,71 @@ def test_a_node_accepts_a_leaf_when_predicate_referencing_an_upstream_node() -> 
     assert act.when.value == "billing"
 
 
+def test_the_predicate_fold_drives_every_consumer_over_one_representative_tree() -> None:
+    # #77: predicate shape dispatch lives in ONE place — `Predicate.fold` — that
+    # each consumer drives with leaf/all_of/any_of/not callbacks, so adding a
+    # combinator touches one site. This pins the contract by asserting all four
+    # historical consumers agree on the SAME representative tree (an all_of of a
+    # leaf and a not-wrapped any_of): the runtime evaluator, the leaf-ref walk,
+    # the CLI summary, and the JSON-plan serialization. If a future combinator is
+    # added to the model but a consumer is not rewired through the fold, one of
+    # these will disagree.
+    from caw.cli import _predicate_summary
+    from caw.model import Predicate
+    from caw.predicate import evaluate_predicate
+
+    predicate = Predicate.model_validate(
+        {
+            "all_of": [
+                {"ref": {"node": "a", "field": "stdout"}, "op": "equals", "value": "x"},
+                {
+                    "not": {
+                        "any_of": [
+                            {
+                                "ref": {"node": "b", "field": "exit_status"},
+                                "op": "equals",
+                                "value": 1,
+                            },
+                            {
+                                "ref": {"node": "b", "field": "stdout"},
+                                "op": "contains",
+                                "value": "no",
+                            },
+                        ]
+                    }
+                },
+            ]
+        }
+    )
+
+    # The leaf-ref walk reaches every leaf buried in the combinators.
+    assert {(r.node, r.field) for r in predicate.leaf_refs()} == {
+        ("a", "stdout"),
+        ("b", "exit_status"),
+        ("b", "stdout"),
+    }
+    # The CLI summary renders the whole shape, naming each combinator.
+    summary = _predicate_summary(predicate)
+    assert summary.startswith("all_of(") and "not(" in summary and "any_of(" in summary
+    # The runtime evaluator folds to a concrete bool over given outputs: a.stdout
+    # == "x" is true; the not-of-any_of is true iff NEITHER inner leaf holds —
+    # here b.exit_status == 1 holds, so the any_of is true, the not is false, and
+    # the all_of is false.
+    outputs = {
+        "a": {"stdout": "x", "exit_status": 0},
+        "b": {"stdout": "yes", "exit_status": 1},
+    }
+    assert evaluate_predicate(predicate, lambda node_id: outputs.get(node_id)) is False
+    # The serialized plan form carries the full active shape, no inactive None keys.
+    plan = predicate.to_plan_dict()
+    assert set(plan) == {"all_of"}, "only the active combinator key is serialized"
+    assert plan["all_of"][0] == {
+        "ref": {"node": "a", "field": "stdout"},
+        "op": "equals",
+        "value": "x",
+    }, "a leaf serializes to its active fields only, no empty path or None keys"
+
+
 def test_a_node_accepts_all_of_any_of_and_not_combinators_nesting_leaves() -> None:
     # Composability (#7): a predicate is recursively a leaf OR a combinator, and
     # combinators (all_of / any_of / not) nest arbitrarily. This exercises all
@@ -670,6 +735,208 @@ def test_contains_on_a_non_string_field_is_a_config_error() -> None:
     message = str(excinfo.value)
     assert "contains" in message, "the error names the misused operator"
     assert "exit_status" in message, "the error names the offending field"
+
+
+def gate_workflow(when: dict[str, Any], *, upstream_kind: str = "shell") -> dict[str, Any]:
+    """A two-node `classify -> gate` workflow whose gate carries the given `when`.
+
+    The upstream `classify` is a shell Node by default; pass ``upstream_kind="agent"``
+    for the kind-aware `structured_output` reference tests (an agent Node is the only
+    kind that can emit `structured_output`). This keeps the value-type and
+    structured-output validation tests free of repeated raw-workflow scaffolding.
+    """
+    if upstream_kind == "agent":
+        classify: dict[str, Any] = {
+            "id": "classify",
+            "kind": "agent",
+            "inputs": {"adapter": "mock", "prompt": "classify the ticket"},
+        }
+    else:
+        classify = {"id": "classify", "kind": "shell", "inputs": {"command": "echo billing"}}
+    return {
+        "name": "sample",
+        "version": 1,
+        "nodes": [
+            classify,
+            {
+                "id": "gate",
+                "kind": "shell",
+                "needs": ["classify"],
+                "when": when,
+                "inputs": {"command": "echo gate"},
+            },
+        ],
+    }
+
+
+def test_a_string_value_against_exit_status_is_a_config_error() -> None:
+    # #75: `exit_status` is an integer field, so a STRING `value` can never match
+    # it — `0 == "0"` is always false, silently skipping the gated node on every
+    # run. Reject the type mismatch at validation time with an actionable message
+    # rather than accepting an always-false gate.
+    raw = gate_workflow(
+        {"ref": {"node": "classify", "field": "exit_status"}, "op": "equals", "value": "0"}
+    )
+
+    with pytest.raises(WorkflowConfigError) as excinfo:
+        normalize_workflow(raw, source="workflow.yaml")
+
+    message = str(excinfo.value)
+    assert "exit_status" in message, "the error names the integer field"
+    assert "value" in message, "the error names the offending value"
+
+
+def test_a_bool_value_against_exit_status_is_a_config_error() -> None:
+    # #75: a `bool` value against `exit_status` is rejected at config time even
+    # though Python aliases `True == 1` / `False == 0`. That aliasing is the
+    # confusing always-or-never match #74 refused at eval time; here it is a config
+    # error, so a bool-vs-exit_status gate never reaches the scheduler (this is the
+    # config-time home of the former executor-seam bool-coercion case).
+    raw = gate_workflow(
+        {"ref": {"node": "classify", "field": "exit_status"}, "op": "equals", "value": False}
+    )
+
+    with pytest.raises(WorkflowConfigError) as excinfo:
+        normalize_workflow(raw, source="workflow.yaml")
+
+    message = str(excinfo.value)
+    assert "exit_status" in message, "the error names the integer field"
+    assert "bool" in message, "the error names the offending bool type"
+
+
+def test_a_bool_in_a_structured_output_path_is_a_config_error() -> None:
+    # #75 NIT (review): a `bool` in a `path` would silently coerce to a list index
+    # (`true` -> 1, `false` -> 0) and address an unintended element, so it is
+    # rejected at config time with an actionable message — a `path` step is a dict
+    # key (str) or a list index (int), never a bool masquerading as one.
+    raw = gate_workflow(
+        {
+            "ref": {
+                "node": "classify",
+                "field": "structured_output",
+                "path": ["items", True],
+            },
+            "op": "equals",
+            "value": "bug",
+        },
+        upstream_kind="agent",
+    )
+
+    with pytest.raises(WorkflowConfigError) as excinfo:
+        normalize_workflow(raw, source="workflow.yaml")
+
+    message = str(excinfo.value)
+    assert "path" in message, "the error names the offending path step"
+    assert "bool" in message, "the error names the bool that would coerce to an index"
+
+
+def test_an_int_value_against_stdout_is_a_config_error() -> None:
+    # #75: `stdout` is a string field, so an `int` value can never match it after
+    # the leaf evaluator compares the (string) stdout against the value. Reject the
+    # mismatch at config time rather than accepting an always-false gate.
+    raw = gate_workflow(
+        {"ref": {"node": "classify", "field": "stdout"}, "op": "equals", "value": 1}
+    )
+
+    with pytest.raises(WorkflowConfigError) as excinfo:
+        normalize_workflow(raw, source="workflow.yaml")
+
+    message = str(excinfo.value)
+    assert "stdout" in message, "the error names the string field"
+
+
+def test_a_leaf_missing_value_is_a_config_error() -> None:
+    # #75 DECISION: `value` is REQUIRED for a leaf. A leaf with an `op` but no
+    # `value` defaults `value` to None, which would silently become a
+    # near-always-false gate (with `contains` it degrades to `'None' in actual`).
+    # Reject the missing value at config time rather than accepting the silent gate.
+    raw = gate_workflow({"ref": {"node": "classify", "field": "stdout"}, "op": "equals"})
+
+    with pytest.raises(WorkflowConfigError) as excinfo:
+        normalize_workflow(raw, source="workflow.yaml")
+
+    message = str(excinfo.value)
+    assert "value" in message, "the error names the missing value"
+
+
+def test_an_explicit_equals_null_value_is_a_config_error() -> None:
+    # #75 DECISION: `equals null` is NOT a supported comparison. No normalized
+    # field is ever JSON null (exit_status is int, stdout is str; an absent
+    # structured_output sub-path is ABSENCE, evaluating false, not a null match),
+    # so an explicit `value: null` leaf could never meaningfully match — it is a
+    # config error, indistinguishable in intent from a forgotten value.
+    raw = gate_workflow(
+        {"ref": {"node": "classify", "field": "stdout"}, "op": "equals", "value": None}
+    )
+
+    with pytest.raises(WorkflowConfigError) as excinfo:
+        normalize_workflow(raw, source="workflow.yaml")
+
+    message = str(excinfo.value)
+    assert "value" in message, "the error names the unsupported null value"
+
+
+def test_a_path_on_a_scalar_field_is_a_config_error() -> None:
+    # #75: a sub-`path` addresses INTO structured_output only; `stdout` (and
+    # `exit_status`) are scalars with no interior to descend into, so a `path` on
+    # either is a config error rather than a silently-ignored attribute.
+    raw = gate_workflow(
+        {
+            "ref": {"node": "classify", "field": "stdout", "path": ["category"]},
+            "op": "equals",
+            "value": "bug",
+        }
+    )
+
+    with pytest.raises(WorkflowConfigError) as excinfo:
+        normalize_workflow(raw, source="workflow.yaml")
+
+    message = str(excinfo.value)
+    assert "path" in message, "the error names the misused sub-path"
+    assert "structured_output" in message, "the error names where path is valid"
+
+
+def test_a_structured_output_ref_to_a_shell_dependency_is_a_config_error() -> None:
+    # #75 kind-aware ref validation: only an agent Node emits structured_output, so
+    # a `when` referencing `structured_output` of a SHELL dependency can never be
+    # anything but false. The validator knows the referenced node's kind, so it
+    # rejects the impossible reference at config time rather than silently
+    # evaluating false on every run.
+    raw = gate_workflow(
+        {
+            "ref": {"node": "classify", "field": "structured_output", "path": ["category"]},
+            "op": "equals",
+            "value": "bug",
+        }
+    )  # `classify` is a shell Node by default
+
+    with pytest.raises(WorkflowConfigError) as excinfo:
+        normalize_workflow(raw, source="workflow.yaml")
+
+    message = str(excinfo.value)
+    assert "structured_output" in message, "the error names the impossible field"
+    assert "classify" in message, "the error names the shell dependency"
+
+
+def test_a_structured_output_ref_to_an_agent_dependency_is_accepted() -> None:
+    # The complement: an AGENT dependency CAN emit structured_output, so a
+    # `structured_output` ref to one is accepted — the kind-aware check rejects
+    # only the impossible (shell) reference, not the legitimate (agent) one.
+    raw = gate_workflow(
+        {
+            "ref": {"node": "classify", "field": "structured_output", "path": ["category"]},
+            "op": "equals",
+            "value": "bug",
+        },
+        upstream_kind="agent",
+    )
+
+    workflow = normalize_workflow(raw, source="<test>")
+
+    gate = workflow.nodes[1]
+    assert gate.when is not None and gate.when.ref is not None
+    assert gate.when.ref.field == "structured_output"
+    assert gate.when.ref.path == ("category",), "the sub-path round-trips on the frozen ref"
 
 
 def test_join_defaults_to_all_and_accepts_any() -> None:

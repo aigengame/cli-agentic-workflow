@@ -235,13 +235,14 @@ def _json_plan(workflow: Workflow) -> dict[str, Any]:
                 # The conditional structure (#7): a Node's `when` predicate and its
                 # `join` policy, so a consumer reads the gating without running it.
                 # `when` is the serialized predicate algebra (None when
-                # unconditional); `exclude_none` keeps each leaf/combinator dict to
-                # only its present fields. `join` is always shown (defaults to all).
-                "when": (
-                    node.when.model_dump(mode="json", exclude_none=True)
-                    if node.when is not None
-                    else None
-                ),
+                # unconditional). `to_plan_dict` emits exactly the active shape's
+                # keys (#77) — a leaf's meaningful `value` (including a falsy 0 /
+                # false / "") survives and a leaf's `path` appears only when it
+                # addresses a structured_output sub-path — without the
+                # `exclude_none` hazard of stripping an intentional key as if it
+                # were an inactive-shape None. `join` is always shown (defaults to
+                # all).
+                "when": (node.when.to_plan_dict() if node.when is not None else None),
                 "join": node.join,
             }
             for node in workflow.nodes
@@ -296,18 +297,26 @@ def _predicate_summary(predicate: Predicate) -> str:
     """A compact one-line rendering of a `when` predicate's structure (#7).
 
     Mirrors the typed algebra without re-implementing evaluation: a leaf reads
-    ``node.field op value``; a combinator names its shape and renders its children
-    recursively. The JSON plan carries the full serialized predicate, so this stays
-    a human glance, not the authoritative form.
+    ``node.field[.path] op value``; a combinator names its shape and renders its
+    children. The shape recursion is a ``Predicate.fold`` (#77), so this consumer
+    drives the single shape-dispatch site rather than re-deriving it. The JSON plan
+    carries the full serialized predicate, so this stays a human glance, not the
+    authoritative form.
     """
-    if predicate.ref is not None:
-        return f"{predicate.ref.node}.{predicate.ref.field} {predicate.op} {predicate.value!r}"
-    if predicate.all_of is not None:
-        return f"all_of({', '.join(_predicate_summary(child) for child in predicate.all_of)})"
-    if predicate.any_of is not None:
-        return f"any_of({', '.join(_predicate_summary(child) for child in predicate.any_of)})"
-    assert predicate.not_ is not None, "a non-leaf predicate is exactly one combinator"
-    return f"not({_predicate_summary(predicate.not_)})"
+
+    def _leaf(node: Predicate) -> str:
+        assert node.ref is not None, "the fold's leaf callback receives a leaf"
+        # A structured_output sub-path is shown as a dotted suffix so a routing
+        # gate reads as `classify.structured_output.category equals 'bug'`.
+        path = "".join(f".{step}" for step in node.ref.path)
+        return f"{node.ref.node}.{node.ref.field}{path} {node.op} {node.value!r}"
+
+    return predicate.fold(
+        leaf=_leaf,
+        all_of=lambda children: f"all_of({', '.join(children)})",
+        any_of=lambda children: f"any_of({', '.join(children)})",
+        not_=lambda child: f"not({child})",
+    )
 
 
 def _failure_line(workflow_label: str, node_result: NodeResult) -> str:

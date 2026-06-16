@@ -6,6 +6,7 @@ import json
 import os
 import secrets
 import signal
+from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -126,6 +127,10 @@ class NodeResult:
         }
         # Only agent Nodes carry structured output / artifacts; omit them for
         # shell Nodes so the persisted output shape is unchanged from before #5.
+        # A produced JSON `null` is omitted here too: caw deliberately does NOT
+        # distinguish "produced null" from "produced nothing" (#75 decision) — null
+        # collapses to absent end-to-end (absent from normalized_output, false in a
+        # `when` predicate, and `equals null` rejected at validation; ADR 0007).
         if self.structured_output is not None:
             output["structured_output"] = self.structured_output
         if self.artifacts:
@@ -548,6 +553,14 @@ class _Scheduler:
         self._skipped: list[str] = []
         self._skipped_blockers: dict[str, str] = {}
         self._skipped_causes: dict[str, str] = {}
+        # O(1) membership for the skip cascade (#77). ``_skipped`` keeps insertion
+        # order for the RunResult; ``_skipped_set`` mirrors it for membership, and
+        # ``_result_ids`` mirrors ``_results``, so the per-dependent "already
+        # terminal?" and "every branch skipped?" tests inside the skip walk are
+        # O(1) set lookups rather than rebuilding a set from ``_results`` /
+        # ``_skipped`` on every visit (which made a wide skip cone quadratic).
+        self._skipped_set: set[str] = set()
+        self._result_ids: set[str] = set()
         # Per-Node Attempt bookkeeping for the in-run retry loop (#6). ``_attempt``
         # is the Attempt NUMBER the next launch of a Node uses, so re-launched
         # Nodes write distinct ``attempt`` rows ((run_id, node_id, attempt) is the
@@ -577,11 +590,7 @@ class _Scheduler:
     def _ready_nodes(self) -> list[Node]:
         """Nodes whose needs are all satisfied and that are neither running nor done."""
         running = {node.id for node in self._in_flight.values()}
-        done = (
-            {result.node_id for result in self._results}
-            | set(self._skipped)
-            | set(self._satisfied)
-        )
+        done = self._result_ids | self._skipped_set | self._satisfied.keys()
         return [
             node
             for node in self._ordered
@@ -612,7 +621,7 @@ class _Scheduler:
         persisted = self._state.node_output(self._run_id, node_id)
         if persisted is not None:
             return persisted
-        if node_id in self._skipped:
+        if node_id in self._skipped_set:
             # A skipped dependency has no output; the leaf evaluating it is false.
             return None
         # Not in memory, not in State, and not skipped: the dependency is recorded
@@ -719,7 +728,7 @@ class _Scheduler:
             self._state.record_node_finished(
                 run_id=self._run_id, node_id=node.id, status=terminal.status
             )
-            self._results.append(terminal)
+            self._add_result(terminal)
             self._on_success(node)
             return
         if terminal.retryable and self._retries_remaining(node):
@@ -736,8 +745,13 @@ class _Scheduler:
         self._state.record_node_finished(
             run_id=self._run_id, node_id=node.id, status=terminal.status
         )
-        self._results.append(terminal)
+        self._add_result(terminal)
         self._skip_failed_dependents(node)
+
+    def _add_result(self, result: NodeResult) -> None:
+        """Record one terminal NodeResult, keeping the O(1) id set in sync (#77)."""
+        self._results.append(result)
+        self._result_ids.add(result.node_id)
 
     def _on_success(self, node: Node) -> None:
         for dependent in self._dependents[node.id]:
@@ -749,25 +763,38 @@ class _Scheduler:
         Mirrors ``_on_success`` so a skip unblocks dependents the same way a
         success does: a ``join: any`` Node's indegree can still reach 0 after one
         branch skips, leaving it ready to run on its surviving branch. The join
-        tolerance is enforced not by an extra readiness gate but by skip
-        propagation (``_propagate_skip_to_dependents``): a ``join: any`` Node is
-        skipped — cause ``all_branches_skipped`` — only once EVERY dependency has
-        skipped, and the ``done``-set exclusion in ``_ready_nodes`` then keeps it
-        from being launched. A ``join: all`` Node is instead skipped as soon as
-        any one dependency skips.
+        tolerance is enforced not by an extra readiness gate but by the skip walk
+        (``_propagate_skips``): a ``join: any`` Node is skipped — cause
+        ``all_branches_skipped`` — only once EVERY dependency has skipped, and the
+        ``done``-set exclusion in ``_ready_nodes`` then keeps it from being
+        launched. A ``join: all`` Node is instead skipped as soon as any one
+        dependency skips.
         """
         for dependent in self._dependents[node_id]:
             self._indegree[dependent] -= 1
 
     def _record_skip(self, node_id: str, cause: str, blocker: str | None) -> None:
-        """Record one Node skipped, with its cause and optional blocker (#7).
+        """Record one Node skipped, with its cause and blocker, enforcing one map (#7, #77).
 
-        The ``node`` row is INSERTed the first time a Node is skipped; a Node
-        whose row already exists (the resume re-skip path) is flipped with an
-        UPDATE instead, so re-skipping never breaches the ``(run_id, node_id)``
-        PK. ``_started`` is the single source of truth for whether a row exists.
+        The two parallel maps are kept consistent HERE, in one place (#77): a
+        ``blocked`` skip MUST carry a blocker and a non-``blocked`` skip must NOT,
+        so ``cause == "blocked"`` iff ``node_id in skipped_blockers`` is an
+        invariant the caller can no longer break by passing a ``blocked`` cause
+        with no blocker (or vice versa) — it is asserted rather than left to
+        call-site convention. The ``blocked`` literal is thus not redundantly
+        stored: it is derivable from ``skipped_blockers`` membership.
+
+        The ``node`` row is INSERTed the first time a Node is skipped; a Node whose
+        row already exists (the resume re-skip path) is flipped with an UPDATE
+        instead, so re-skipping never breaches the ``(run_id, node_id)`` PK.
+        ``_started`` is the single source of truth for whether a row exists.
         """
+        assert (cause == SKIP_BLOCKED) == (blocker is not None), (
+            "a `blocked` skip carries a blocker and only a `blocked` skip does; "
+            "this is the one place the skipped_causes/skipped_blockers invariant lives"
+        )
         self._skipped.append(node_id)
+        self._skipped_set.add(node_id)
         self._skipped_causes[node_id] = cause
         if blocker is not None:
             self._skipped_blockers[node_id] = blocker
@@ -783,65 +810,121 @@ class _Scheduler:
             event["blocked_by"] = blocker
         self._events.append("node_skipped", event)
 
-    def _skip_with_cause(self, node_id: str, cause: str, blocker: str | None) -> None:
-        """Skip a Node with a cause, then walk its dependents — join-aware (#7).
+    def _is_terminal(self, node_id: str) -> bool:
+        """Whether a Node is already attempted or skipped — O(1) (#77).
 
-        The ORIGIN skip carries the given cause (``when_false`` for a closed gate,
-        ``all_branches_skipped`` for a fully skipped tolerant join). Every
-        transitive dependent reached purely through skips is itself a
-        skip-origin: a ``join: all`` dependent is ``blocked`` by the skip, while a
-        ``join: any`` dependent only becomes skipped once ALL its dependencies
-        skipped (cause ``all_branches_skipped``) — otherwise it is left to run on
-        its surviving succeeded branch. Only this skip-origin walk consults
-        ``join``; the failure-origin walk (``_skip_failed_dependents``) never does,
-        which is how a failed dependency blocks dependents regardless of join.
+        Two set lookups against the incrementally-maintained result/skip sets, so
+        the per-dependent "already terminal?" test inside the skip walk never
+        rebuilds a set from ``_results`` / ``_skipped`` (which made a wide skip
+        cone quadratic).
         """
-        if node_id in self._terminal_node_ids():
+        return node_id in self._result_ids or node_id in self._skipped_set
+
+    def _skip_with_cause(self, node_id: str, cause: str, blocker: str | None) -> None:
+        """Skip a Node with a cause, then propagate to dependents — join-aware (#7, #77).
+
+        The single entry point for a SKIP-origin cascade (a closed `when` gate,
+        cause ``when_false``, or a fully-skipped tolerant join, cause
+        ``all_branches_skipped``): the origin node is skipped with the given cause,
+        then ``_propagate_skips`` walks its transitive dependents BFS. The walk is
+        join-AWARE — a ``join: all`` dependent is ``blocked`` by the skip that
+        orphaned it, while a ``join: any`` dependent skips (cause
+        ``all_branches_skipped``) only once EVERY dependency has skipped, otherwise
+        running on its surviving branch.
+        """
+        if self._is_terminal(node_id):
             return
         self._record_skip(node_id, cause=cause, blocker=blocker)
         self._on_skip(node_id)
-        self._propagate_skip_to_dependents(node_id)
-
-    def _propagate_skip_to_dependents(self, skipped_id: str) -> None:
-        """Skip the dependents a skip newly orphans, honoring each one's join (#7)."""
-        for dependent_id in self._dependents[skipped_id]:
-            if dependent_id in self._terminal_node_ids():
-                continue
-            dependent = self._by_id[dependent_id]
-            if dependent.join == "any":
-                # A tolerant join is skipped only when EVERY dependency has
-                # skipped (no branch executed); while any dependency is still
-                # pending or succeeded, leave it to run on its surviving branch.
-                if all(need in self._skipped for need in dependent.needs):
-                    self._skip_with_cause(
-                        dependent_id, cause=SKIP_ALL_BRANCHES_SKIPPED, blocker=None
-                    )
-            else:
-                # The default guard: any skipped dependency skips a `join: all`
-                # dependent, blocked by the skip that orphaned it.
-                self._skip_with_cause(dependent_id, cause=SKIP_BLOCKED, blocker=skipped_id)
-
-    def _terminal_node_ids(self) -> set[str]:
-        """Nodes already attempted or skipped — never (re-)skipped a second time."""
-        return {result.node_id for result in self._results} | set(self._skipped)
+        self._propagate_skips(node_id, join_aware=True)
 
     def _skip_failed_dependents(self, node: Node) -> None:
-        """Skip every transitive dependent of a FAILED Node — join policy ignored.
+        """Skip every transitive dependent of a FAILED Node — join policy IGNORED (#7, #77).
 
-        A failed dependency blocks its dependents REGARDLESS of join policy (#7):
-        join tolerates skips, never failures. So this walk never consults
-        ``join`` — it skips the whole transitive cone of the failure, each
-        dependent ``blocked`` by the original failed Node, exactly as #4 did.
+        The single entry point for a FAILURE-origin cascade: a failed dependency
+        blocks its dependents REGARDLESS of join policy — join tolerates skips,
+        never failures. The failed ``node`` is already terminal in ``_results``
+        (not skipped), so the walk seeds from its dependents directly; each reached
+        dependent is ``blocked`` by the ORIGINAL failed node, never tolerated as a
+        skipped branch. It shares the one ``_propagate_skips`` BFS with the
+        skip-origin path, only with ``join_aware=False``.
         """
-        queue = list(self._dependents[node.id])
-        seen: set[str] = set()
+        self._propagate_skips(node.id, join_aware=False)
+
+    def _propagate_skips(self, origin_id: str, *, join_aware: bool) -> None:
+        """The ONE transitive-skip walk both origins share — BFS, depth-safe (#77).
+
+        Replaces the two forked walks (the mutually-recursive skip-origin walk and
+        the iterative failure walk) with a single iterative BFS over ``origin_id``'s
+        transitive dependents, so a long skip chain — a Pattern-Expander-scale
+        pipeline whose head gate closes — never risks a ``RecursionError``.
+        Indegree accounting is now SYMMETRIC: every Node this walk skips decrements
+        its dependents' indegree via ``_on_skip`` (the old failure walk omitted
+        this), so a ``join: any`` dependent's readiness is computed identically
+        whether the cause it tolerates is a skip or a failure cone.
+
+        ``join_aware`` discriminates the two origins on the one axis that differs:
+
+        - SKIP origin (``join_aware=True``): ``origin_id`` is an already-recorded
+          skip. A reached ``join: any`` dependent skips ``all_branches_skipped``
+          only once EVERY dependency has skipped, else is left to run on its
+          surviving branch; a ``join: all`` dependent is ``blocked`` by the
+          IMMEDIATE skip that orphaned it (its parent in the walk).
+        - FAILURE origin (``join_aware=False``): ``origin_id`` is the already-
+          terminal FAILED node (not skipped). Every reached dependent is
+          ``blocked`` by ``origin_id`` — the original failed node — regardless of
+          its join, so a failed branch blocks even a tolerant join.
+
+        The queue holds ``(dependent_id, orphaning_id)`` pairs, where
+        ``orphaning_id`` is the just-skipped predecessor that reached the
+        dependent — the blocker a ``join: all`` skip records. For the failure
+        origin the blocker is pinned to ``origin_id`` instead, so the whole cone
+        names the original failure. It is a ``deque`` dequeued from the left
+        (``popleft``) so each dequeue is O(1): a plain ``list.pop(0)`` shifts the
+        whole list on every pop, making a WIDE cone O(N^2) even with the O(1)
+        membership sets — the queue itself must stay O(1) per step (#77).
+        """
+        queue: deque[tuple[str, str]] = deque(
+            (dependent_id, origin_id) for dependent_id in self._dependents[origin_id]
+        )
         while queue:
-            node_id = queue.pop()
-            if node_id in seen or node_id in self._terminal_node_ids():
+            dependent_id, orphaning_id = queue.popleft()
+            if self._is_terminal(dependent_id):
                 continue
-            seen.add(node_id)
-            self._record_skip(node_id, cause=SKIP_BLOCKED, blocker=node.id)
-            queue.extend(self._dependents[node_id])
+            dependent = self._by_id[dependent_id]
+            if not join_aware:
+                # Failure origin: block regardless of join, by the original failure.
+                self._skip_in_walk(
+                    dependent_id, cause=SKIP_BLOCKED, blocker=origin_id, queue=queue
+                )
+            elif dependent.join == "any":
+                # A tolerant join skips only when EVERY dependency has skipped; while
+                # any branch is still pending or succeeded, leave it to run.
+                if all(need in self._skipped_set for need in dependent.needs):
+                    self._skip_in_walk(
+                        dependent_id, cause=SKIP_ALL_BRANCHES_SKIPPED, blocker=None, queue=queue
+                    )
+            else:
+                # Default `join: all`: any skipped dependency skips it, blocked by
+                # the immediate skip that orphaned it.
+                self._skip_in_walk(
+                    dependent_id, cause=SKIP_BLOCKED, blocker=orphaning_id, queue=queue
+                )
+
+    def _skip_in_walk(
+        self, node_id: str, *, cause: str, blocker: str | None, queue: deque[tuple[str, str]]
+    ) -> None:
+        """Record one skip inside the BFS, decrement indegree, and enqueue dependents.
+
+        The shared per-Node body of ``_propagate_skips``: record the skip, mirror
+        ``_on_skip`` so indegree bookkeeping stays symmetric across both origins,
+        and append this node's dependents to the BFS queue, each paired with this
+        node as their orphaning predecessor (the blocker a ``join: all`` skip
+        records).
+        """
+        self._record_skip(node_id, cause=cause, blocker=blocker)
+        self._on_skip(node_id)
+        queue.extend((dep_id, node_id) for dep_id in self._dependents[node_id])
 
     async def run(self) -> RunResult:
         """Drive the readiness loop to completion and return the Run's outcome.
@@ -904,7 +987,7 @@ class _Scheduler:
             if task.done() and not task.cancelled() and task.exception() is None:
                 self._in_flight.pop(task, None)
                 self._record_finished(node, task.result())
-                self._results.append(replace(task.result(), attempt=self._attempt[node.id]))
+                self._add_result(replace(task.result(), attempt=self._attempt[node.id]))
         for task in list(self._in_flight):
             task.cancel()
         for task in list(self._in_flight):

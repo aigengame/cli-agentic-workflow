@@ -135,13 +135,14 @@ class ClaudePrintAdapter(SubprocessAdapter, Adapter):
                 # The key is present (including an explicit JSON null -> Python None):
                 # pass its value through AS-IS. The kernel re-validates it against the
                 # Output Contract, where the schema is the sole arbiter of whether a
-                # present null satisfies the contract (ADR 0006). This null-vs-absent
-                # distinction holds for Output-Contract validation ONLY: downstream
-                # it is NOT preserved — executor.normalized_output omits
-                # structured_output when it is None, and predicate._evaluate_leaf
-                # treats an absent field as False, so in State and in `when`
-                # predicates a null is represented the same as an absent field. True
-                # end-to-end null-vs-absent round-tripping is tracked in issue #75.
+                # present null satisfies the contract (ADR 0006). The null-vs-absent
+                # distinction holds for Output-Contract validation ONLY: downstream,
+                # caw deliberately does NOT distinguish a produced `null` from
+                # produced-nothing (#75 decision, ADR 0007) — executor.normalized_output
+                # omits structured_output when it is None, predicate._evaluate_leaf
+                # treats an absent field as False, and `equals null` is rejected at
+                # validation, so in State and in `when` predicates a null reads the
+                # same as an absent field.
                 structured_output = wrapper["structured_output"]
         return AgentResult(
             exit_status=exit_status,

@@ -14,6 +14,40 @@ from typing import Any
 
 from caw.model import Predicate
 
+# Sentinel for "the addressed sub-path does not exist", distinct from a JSON
+# ``null`` actually present at that path. An absent sub-path makes the leaf false
+# (like an absent top-level field), never a spurious match.
+_ABSENT = object()
+
+
+def _address_sub_path(value: object, path: tuple[str | int, ...]) -> object:
+    """Descend ``value`` along a structured_output sub-``path``, or ``_ABSENT`` (#75).
+
+    Each step is a dict key (``str``) or a list index (``int``); a step that does
+    not apply — a key missing from a mapping, an index out of range, or a step
+    into a scalar — yields ``_ABSENT`` so the leaf evaluates false rather than
+    raising. This is the addressing mechanism #13's classify-and-act routes on.
+    """
+    current: object = value
+    for step in path:
+        if isinstance(step, bool):
+            # A `path` bool is rejected at config time (PredicateRef validation), so
+            # this is unreachable for a normally-validated Predicate; it stays as a
+            # defense-in-depth guard for a validation-bypassed one (model_construct),
+            # keeping a bool from indexing list element 0/1 via Python's int aliasing.
+            return _ABSENT
+        if isinstance(step, str) and isinstance(current, dict):
+            if step not in current:
+                return _ABSENT
+            current = current[step]
+        elif isinstance(step, int) and isinstance(current, list):
+            if not -len(current) <= step < len(current):
+                return _ABSENT
+            current = current[step]
+        else:
+            return _ABSENT
+    return current
+
 
 def evaluate_predicate(
     predicate: Predicate, output_of: Callable[[str], dict[str, Any] | None]
@@ -26,17 +60,17 @@ def evaluate_predicate(
     leaf over a skipped upstream evaluates false, which folds through all_of /
     any_of / not like any other false leaf, so a `when` referencing a skipped
     dependency is evaluated normally rather than crashing the Run.
+
+    The recursion is a ``Predicate.fold`` (#77): the leaf callback evaluates one
+    comparison and the combinator callbacks AND / OR / negate their already-folded
+    children, so shape dispatch lives once in ``fold`` rather than here.
     """
-    if predicate.ref is not None:
-        return _evaluate_leaf(predicate, output_of)
-    if predicate.all_of is not None:
-        return all(evaluate_predicate(child, output_of) for child in predicate.all_of)
-    if predicate.any_of is not None:
-        return any(evaluate_predicate(child, output_of) for child in predicate.any_of)
-    # The model guarantees exactly one shape, so a non-leaf, non-all/any predicate
-    # is a `not`; mypy needs the explicit None guard.
-    assert predicate.not_ is not None, "a non-leaf predicate is exactly one combinator"
-    return not evaluate_predicate(predicate.not_, output_of)
+    return predicate.fold(
+        leaf=lambda node: _evaluate_leaf(node, output_of),
+        all_of=all,
+        any_of=any,
+        not_=lambda child: not child,
+    )
 
 
 def _evaluate_leaf(
@@ -52,6 +86,14 @@ def _evaluate_leaf(
     if output is None or predicate.ref.field not in output:
         return False
     actual = output.get(predicate.ref.field)
+    # A `structured_output` ref may address a sub-path INTO the parsed object
+    # (#75); descend to the addressed scalar before comparing. An absent sub-path
+    # (a missing key / out-of-range index / a step into a scalar) makes the leaf
+    # false, exactly like an absent top-level field — never a spurious match.
+    if predicate.ref.field == "structured_output" and predicate.ref.path:
+        actual = _address_sub_path(actual, predicate.ref.path)
+        if actual is _ABSENT:
+            return False
     # `echo X` yields stdout "X\n", stored verbatim, so comparing against the
     # trailing newline(s) before the op makes an `equals`/`contains` on stdout
     # match a node that echoes the value (#74). Only the comparison strips; the
