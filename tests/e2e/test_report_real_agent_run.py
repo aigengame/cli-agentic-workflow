@@ -3,10 +3,11 @@
 The Reporter renders from persisted State and Events only; its logic is deterministic
 and fully covered offline by the report-seam suite. What depends on the REAL Agent CLI
 is the SHAPE of what a real agent Node persists — its ``structured_output``, stdout, and
-exit status — so this e2e runs a real structured ``claude -p`` Node through ``execute_run``
-and asserts the report surfaces that real conclusion. Structure, not exact words
-(decision #4); the agent is selected by ``CAW_E2E_AGENT`` (default ``claude``) and the
-suite FAILS (never skips) when the selected CLI is absent.
+exit status — so this e2e runs a real structured agent Node (the adapter the selected
+``CAW_E2E_AGENT`` maps to) through ``execute_run`` and asserts the report surfaces that
+real conclusion. Structure, not exact words (decision #4); the agent is selected by
+``CAW_E2E_AGENT`` (default ``claude``) and the suite FAILS (never skips) when the
+selected CLI is absent.
 """
 
 from __future__ import annotations
@@ -70,12 +71,16 @@ async def test_report_renders_a_real_agent_runs_conclusion_and_trace(
     # the agent node finishing in the trace. Value asserted by structure, not words.
     harness.require_agent_cli(agent)  # FAIL (not skip) when the selected CLI is absent
     schema = tmp_path / "answer.schema.json"
+    # `additionalProperties: false` and a fully-listed `required` keep the schema valid
+    # under codex's strict (OpenAI structured-output) mode and are harmless for claude,
+    # so the same structured workflow runs under either CAW_E2E_AGENT (#11 symmetry).
     schema.write_text(
         json.dumps(
             {
                 "type": "object",
                 "properties": {"answer": {"type": "integer"}},
                 "required": ["answer"],
+                "additionalProperties": False,
             }
         ),
         encoding="utf-8",

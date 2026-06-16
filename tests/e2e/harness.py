@@ -5,8 +5,8 @@ unit-tested OFFLINE (see ``tests/test_e2e_harness.py``, which runs in CI) while 
 real-CLI tests under ``tests/e2e/`` exercise it against a live agent:
 
 * **Agent selection** — exactly ONE agent runs per e2e session, chosen by
-  ``CAW_E2E_AGENT`` (default ``claude``). Only ``claude`` is wired today; ``codex``
-  lands with #11 by adding one entry to :data:`_AGENTS`.
+  ``CAW_E2E_AGENT`` (default ``claude``). Both ``claude`` and ``codex`` are wired,
+  each one entry in :data:`_AGENTS`.
 * **skip = fail** — :func:`require_agent_cli` FAILS (never skips) when the selected
   agent's CLI is absent, so a missing CLI is loud, not silent green.
 * **Transient-only bounded retry** — :func:`run_with_transient_retry` re-runs ONLY
@@ -43,10 +43,11 @@ class AgentSpec:
 
 
 # The single source of truth for which agents the e2e suite can drive. Keyed by the
-# value of CAW_E2E_AGENT. Adding `codex` (#11) is a one-line entry here — the agent
+# value of CAW_E2E_AGENT. Adding an agent is a one-line entry here — the agent
 # selector, CLI presence check, and adapter resolution all read from this map.
 _AGENTS: dict[str, AgentSpec] = {
     "claude": AgentSpec(adapter="claude.print", cli="claude"),
+    "codex": AgentSpec(adapter="codex.exec", cli="codex"),
 }
 
 # The agent exercised when CAW_E2E_AGENT is unset (decision #3).
@@ -105,8 +106,7 @@ def _spec(agent: str) -> AgentSpec:
     except KeyError as exc:
         supported = ", ".join(sorted(_AGENTS))
         raise E2EConfigError(
-            f"unsupported CAW_E2E_AGENT={agent!r}; supported agents: {supported} "
-            "(codex lands with #11)"
+            f"unsupported CAW_E2E_AGENT={agent!r}; supported agents: {supported}"
         ) from exc
 
 

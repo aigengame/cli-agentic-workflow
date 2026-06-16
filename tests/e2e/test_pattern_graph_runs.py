@@ -48,17 +48,22 @@ async def test_pipeline_pattern_agent_step_reaches_the_real_agent_cli(
     agent: str, tmp_path: Path
 ) -> None:
     # A `pattern: pipeline` wrapping a real agent step: the expander compiles it to
-    # plain IR (shell -> agent chain), then the agent Node reaches the real `claude -p`
-    # through execute_run, the kernel validates the real output against the Node's
-    # tightly-constraining Output Contract, and the structured_output is persisted.
+    # plain IR (shell -> agent chain), then the agent Node reaches the real Agent CLI
+    # (the adapter the selected agent maps to) through execute_run, the kernel validates
+    # the real output against the Node's tightly-constraining Output Contract, and the
+    # structured_output is persisted.
     harness.require_agent_cli(agent)  # FAIL (not skip) when the selected CLI is absent
     schema = tmp_path / "answer.schema.json"
+    # `additionalProperties: false` and a fully-listed `required` keep the schema valid
+    # under codex's strict (OpenAI structured-output) mode and are harmless for claude,
+    # so the expanded agent step runs under either CAW_E2E_AGENT (#11 symmetry).
     schema.write_text(
         json.dumps(
             {
                 "type": "object",
                 "properties": {"answer": {"type": "integer"}},
                 "required": ["answer"],
+                "additionalProperties": False,
             }
         ),
         encoding="utf-8",

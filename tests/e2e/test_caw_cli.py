@@ -1,11 +1,11 @@
 """Real ``caw run`` / ``caw resume`` CLI e2e with a real agent node (#86).
 
 These drive the actual user entrypoints — ``caw run`` and ``caw resume`` through
-Typer's ``CliRunner`` — with a real ``claude.print`` agent node, so the
-CLI -> kernel -> real agent -> State path is exercised end to end. (The graph-run
-e2e in ``test_claude_print_graph_runs.py`` call ``execute_run`` directly; this file
-closes the CLI-entrypoint gap.) Part of the living e2e suite, co-weighted with the
-mock suite that covers what a fixture can verify offline.
+Typer's ``CliRunner`` — with a real agent node (the adapter the selected
+``CAW_E2E_AGENT`` maps to), so the CLI -> kernel -> real agent -> State path is
+exercised end to end. (The graph-run e2e in ``test_agent_graph_runs.py`` call
+``execute_run`` directly; this file closes the CLI-entrypoint gap.) Part of the living
+e2e suite, co-weighted with the mock suite that covers what a fixture can verify offline.
 
 The multi-node test gates two downstream nodes on a SUB-FIELD of the agent node's
 ``structured_output`` (``path: ["category"]``, the #75 sub-path addressing) — the real
@@ -43,18 +43,25 @@ def _agent_node(node_id: str, agent: str, *, prompt: str) -> dict[str, Any]:
     """A one-node agent spec targeting the selected agent's adapter.
 
     Declares the ambient env-var NAMES (ADR 0006 allow-list) so the real CLI inherits
-    the developer's auth/config, plus a generous timeout for model latency.
+    the developer's auth/config, plus a generous timeout for model latency. The selected
+    agent's headless-run flags (codex needs ``--skip-git-repo-check --sandbox read-only``
+    to run unattended in a non-git dir; claude needs none) pass through as ordinary node
+    ``args`` (#11) — caw owns no policy engine — so the node SHAPE stays agent-neutral.
     """
+    inputs: dict[str, Any] = {
+        "adapter": harness.adapter_for_agent(agent),
+        "prompt": prompt,
+        "env": list(harness.agent_env_names()),
+    }
+    run_args = harness.agent_run_args(agent)
+    if run_args:
+        inputs["args"] = list(run_args)
     return {
         "id": node_id,
         "kind": "agent",
         "needs": [],
         "timeout": _AGENT_TIMEOUT_S,
-        "inputs": {
-            "adapter": harness.adapter_for_agent(agent),
-            "prompt": prompt,
-            "env": list(harness.agent_env_names()),
-        },
+        "inputs": inputs,
     }
 
 
@@ -74,11 +81,14 @@ def test_caw_run_drives_a_real_agent_graph_with_when_gating(
     harness.require_agent_cli(agent)
     schema = tmp_path / "category.schema.json"
     schema.write_text(
+        # `additionalProperties: false` keeps the schema valid under codex's strict
+        # `--output-schema` mode (claude accepts it too) — agent-neutral.
         json.dumps(
             {
                 "type": "object",
                 "properties": {"category": {"type": "string"}},
                 "required": ["category"],
+                "additionalProperties": False,
             }
         ),
         encoding="utf-8",

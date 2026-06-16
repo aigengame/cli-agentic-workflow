@@ -97,14 +97,25 @@ def test_claude_resolves_the_claude_cli_binary() -> None:
     assert harness.agent_cli_name("claude") == "claude"
 
 
-def test_an_unsupported_agent_is_a_config_error() -> None:
-    # codex is not wired until #11; selecting it (or any unknown agent) is a config
-    # error, distinct from a missing CLI — it names the supported agents.
-    with pytest.raises(harness.E2EConfigError) as excinfo:
-        harness.adapter_for_agent("codex")
+def test_codex_maps_to_the_codex_exec_adapter() -> None:
+    # codex is wired with #11: it maps to the codex.exec Adapter, symmetric with the
+    # claude -> claude.print mapping above.
+    assert harness.adapter_for_agent("codex") == "codex.exec"
 
-    assert "codex" in str(excinfo.value)
+
+def test_codex_resolves_the_codex_cli_binary() -> None:
+    assert harness.agent_cli_name("codex") == "codex"
+
+
+def test_an_unsupported_agent_is_a_config_error() -> None:
+    # Selecting an agent that is not wired is a config error, distinct from a missing
+    # CLI — it names the supported agents. (claude and codex are both wired now.)
+    with pytest.raises(harness.E2EConfigError) as excinfo:
+        harness.adapter_for_agent("gemini")
+
+    assert "gemini" in str(excinfo.value)
     assert "claude" in str(excinfo.value), "the error names the supported agents"
+    assert "codex" in str(excinfo.value), "the error names the supported agents"
 
 
 # --- skip = fail: missing CLI fails, never skips (decision #2) --------------------
