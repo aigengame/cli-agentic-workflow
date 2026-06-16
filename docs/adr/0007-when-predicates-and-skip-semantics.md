@@ -4,7 +4,7 @@ Status: Accepted
 Date: 2026-06-13
 Related: `docs/adr/0002-pattern-iteration-as-run-groups.md`,
 `docs/adr/0003-asyncio-executor-concurrency-model.md`,
-`docs/adr/0006-adapter-interface-contract.md`, `CONTEXT.md`, issue #7
+`docs/adr/0006-adapter-interface-contract.md`, `CONTEXT.md`, issues #7, #75, #77
 
 CONTEXT.md makes a Node's `when` the sole conditional mechanism — Edges express ordering
 and data flow only, and conditional behavior lives in a Node's `when` predicate, never on an
@@ -16,7 +16,8 @@ than as an expression string:
 
 - an atomic **leaf** — a `ref` to one field of an upstream Node's normalized output
   (`stdout`, `exit_status`, or `structured_output`), an `op`, and a `value` (one reference →
-  comparison, the indivisible atom);
+  comparison, the indivisible atom). A `value` is REQUIRED; a `ref` to `structured_output`
+  may carry an optional `path` that addresses a sub-field of the parsed object (below);
 - the combinators `all_of` / `any_of` — a list of sub-predicates combined by AND / OR;
 - `not` — a single negated sub-predicate.
 
@@ -28,7 +29,29 @@ three combinators. Every leaf `ref.node` must appear in the owning Node's `needs
 concrete Run's IR stays acyclic (ADR 0002). The kernel evaluates a `when` by walking the
 validated model directly (`caw.predicate.evaluate_predicate`): there is no parser and no
 `eval`, so the only conditional surface is the typed algebra. A Node whose `when` evaluates
-false is marked `skipped` and never executed.
+false is marked `skipped` and never executed. The model exposes a single fold over the
+predicate shape (`Predicate.fold`) that every consumer — the evaluator, the leaf-ref walk,
+the CLI summary, and the plan serializer — drives, so adding an operator or combinator
+touches the shape dispatch in one place (#77).
+
+**Config-time rejection of a gate that can never behave as authored (#75).** A `when` that
+silently always evaluates false — skipping the gated Node on every run and reporting a
+spurious `succeeded` — is a config error, caught at validation rather than at run time. The
+model rejects: a leaf `value` whose TYPE cannot match its `field` (a string or `bool` against
+the integer `exit_status` — the `bool` is excluded even though Python aliases `True == 1` /
+`False == 0` — or an `int` against the string `stdout`); a leaf with no `value` (a `value` is
+REQUIRED, and `equals null` is NOT a supported comparison, since no normalized field is ever
+JSON null — an absent `structured_output` sub-path is ABSENCE, which evaluates false, not a
+null match); and a `when` reference to a field a dependency's KIND cannot produce — only an
+agent Node emits `structured_output`, so a `structured_output` ref to a shell dependency is a
+config error. **Sub-path addressing:** a `structured_output` `ref` may carry a `path` — an
+ordered sequence of dict keys and list indices — that descends into the parsed object to the
+scalar the leaf compares against (e.g. `path: [category]` addresses
+`structured_output.category`), so a classify-and-act routes on a classifier's label rather
+than comparing a scalar against the whole dict (which could never match). An absent sub-path
+(a missing key, an out-of-range index, a step into a scalar) makes the leaf false, exactly
+like an absent top-level field. A `path` on a scalar field (`stdout` / `exit_status`) is a
+config error.
 
 A leaf whose referenced upstream produced NO output — because that upstream was itself
 SKIPPED — evaluates **false** (#74). This is reachable for a tolerant `join: any` Node whose
@@ -44,9 +67,14 @@ skips the Node if ANY dependency skipped; `any` tolerates skipped upstream branc
 Node runs iff at least one dependency executed and succeeded, and is itself skipped (cause
 `all_branches_skipped`) only if ALL dependencies skipped. The load-bearing invariant: a
 FAILED dependency blocks dependents REGARDLESS of join policy. **Join tolerates skips, never
-failures.** The skip-origin walk consults `join`; the failure-origin walk never does, so a
-failed branch blocks even a `join: any` join — the discriminating case that keeps a tolerant
-join from masking a failure.
+failures.** A single transitive-skip walk (`_propagate_skips`) serves both origins,
+parameterized by cause: from a SKIP origin it is join-aware (a `join: any` dependent skips
+only once every branch has skipped); from a FAILURE origin it ignores `join` and blocks the
+whole transitive cone, so a failed branch blocks even a `join: any` join — the discriminating
+case that keeps a tolerant join from masking a failure. The walk is BFS (no recursion), so a
+long skip chain — a Pattern-Expander-scale pipeline whose head gate closes — never overflows
+the stack, and it decrements a skipped Node's dependents' indegree on BOTH paths so the
+readiness bookkeeping is symmetric (#77).
 
 Each skip carries a named cause so a Reporter renders it distinctly from success and
 failure: `when_false` (a closed gate), `blocked` (a failed or skipped dependency withheld
@@ -75,7 +103,12 @@ JSON plan emits each Node's `when` and `join`; the text plan annotates them.
 
 - The algebra is extensible by design: new operators (`not_equals`, `gt`, `matches`, `in`),
   new ref fields, or new combinators are added by widening the model's `Literal`s or adding a
-  shape, with no restructuring of evaluation, scheduling, or serialization.
+  shape; with the shape dispatch folded into one site (`Predicate.fold`), a new combinator
+  touches one place and every consumer follows, with no restructuring of evaluation,
+  scheduling, or serialization (#77).
+- `structured_output` sub-path addressing (`ref.path`) is the reusable routing mechanism the
+  classify-and-act pattern (#13) builds on: a downstream Node routes on a classifier's
+  `structured_output.<label>` without an intermediate extraction Node.
 - `when` adds no Edges, so the IR stays acyclic and the existing ordering, validation,
   resume, and checksum machinery is unchanged.
 - A `when` evaluates identically in a fresh Run and a resumed one: on resume a dependency
