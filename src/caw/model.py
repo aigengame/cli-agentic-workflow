@@ -242,6 +242,30 @@ PredicateOp = Literal["equals", "contains"]
 _STRING_PREDICATE_FIELDS = frozenset({"stdout"})
 
 
+# The Python types a leaf `value` may take per referenced field, so a `value`
+# whose type can NEVER match the field is rejected at config time rather than
+# silently evaluating false on every run (#75). `exit_status` is an integer, so
+# only an `int` value can match — and a `bool` is EXCLUDED even though Python
+# treats `True == 1` / `False == 0`, because that aliasing is exactly the
+# confusing always-or-never match the leaf evaluator already refuses (#74); a
+# bool against an int field is an authoring mistake, not an intended comparison.
+# `stdout` is a string, so only a `str` value can match. `structured_output` is
+# arbitrary parsed JSON addressed by an optional sub-`path`, so any scalar leaf
+# value (`str` / `int` / `bool`) may legitimately compare against the addressed
+# sub-value; its type is not constrained here.
+#
+# Note that `bool` is a subclass of `int` in Python, so an `exit_status` check
+# must test bool BEFORE int (a bare ``isinstance(value, int)`` would admit a
+# bool); the validator orders its checks accordingly.
+def _value_type_admissible_for_field(field: str, value: object) -> bool:
+    if field == "exit_status":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if field == "stdout":
+        return isinstance(value, str)
+    # structured_output: any scalar value may match the addressed sub-value.
+    return True
+
+
 class PredicateRef(BaseModel):
     """An atomic reference to one field of an upstream Node's normalized output (#7)."""
 
@@ -317,6 +341,34 @@ class Predicate(BaseModel):
             raise ValueError("a leaf predicate must declare both `ref` and `op`")
         if not is_leaf and (self.op is not None or self.value is not None):
             raise ValueError("`op`/`value` belong to a leaf predicate, not a combinator")
+        # A leaf must carry a `value` to compare against (#75): `value` is REQUIRED.
+        # A forgotten `value` defaults to None and would silently become a
+        # near-always-false gate (with `contains` it degrades to `'None' in actual`),
+        # so a missing value is a config error. `equals null` is not a supported
+        # comparison in v0.1: no normalized field is ever JSON null (exit_status is
+        # int, stdout is str; a missing structured_output sub-path is ABSENCE, which
+        # evaluates false, not a null match), so there is nothing a null value could
+        # meaningfully match.
+        if is_leaf and self.value is None:
+            raise ValueError(
+                "a leaf predicate must declare a `value` to compare against "
+                "(`value: null` is not a supported comparison)"
+            )
+        # A leaf `value` whose TYPE can never match its `field` is rejected here, so
+        # a type-mismatched gate (a string or bool against the integer `exit_status`)
+        # fails at config time rather than silently evaluating false on every run
+        # (#75). `structured_output` is type-unconstrained (any scalar may match the
+        # addressed sub-value).
+        if (
+            is_leaf
+            and self.ref is not None
+            and self.value is not None
+            and not _value_type_admissible_for_field(self.ref.field, self.value)
+        ):
+            raise ValueError(
+                f"`value` {self.value!r} (type {type(self.value).__name__}) cannot match "
+                f"the {self.ref.field!r} field; it would always evaluate false"
+            )
         # An empty `all_of`/`any_of` would validate (an empty tuple is not None)
         # and evaluate vacuously (all([]) is true, any([]) is false), silently
         # opening or closing the gate. Reject it: a combinator must combine at

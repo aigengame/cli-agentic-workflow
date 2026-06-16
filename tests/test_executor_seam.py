@@ -825,17 +825,18 @@ async def test_a_node_whose_when_predicate_is_false_is_skipped_and_never_execute
 
 
 @pytest.mark.asyncio
-async def test_an_equals_leaf_does_not_coerce_a_bool_value_to_an_int_exit_status(
+async def test_an_equals_leaf_on_exit_status_matches_a_genuine_int_value(
     tmp_path: Path,
 ) -> None:
-    # FIX 3 (#74): Python evaluates `0 == False` as True, so an `equals` leaf must
-    # NOT coerce bool to int. `probe` exits 0 (succeeds). `match_int` gates on
-    # exit_status == 0 — a genuine int match, so it RUNS — while `match_bool` gates
-    # on exit_status == false, which must be FALSE (bool vs int mismatch) so it is
-    # SKIPPED. Without the guard `0 == False` would wrongly open `match_bool`'s
-    # gate.
+    # An `equals` leaf on `exit_status` against a genuine int value (#7): `probe`
+    # exits 0 (succeeds); `match_int` gates on exit_status == 0 — a real int match —
+    # so its gate opens and it runs. The COMPLEMENTARY bool-vs-exit_status case (a
+    # `value: False` against the integer field) is now rejected at CONFIG time by
+    # #75's value-type validator — it never reaches the scheduler — so it is proven
+    # at the model seam (test_a_bool_value_against_exit_status_is_a_config_error)
+    # rather than here; the eval-level bool/int guard in predicate.py remains as
+    # defense-in-depth for the type-unconstrained structured_output field.
     int_marker = tmp_path / "int.txt"
-    bool_marker = tmp_path / "bool.txt"
     workflow = conditional_workflow(
         shell("probe", "true"),
         shell(
@@ -844,24 +845,13 @@ async def test_an_equals_leaf_does_not_coerce_a_bool_value_to_an_int_exit_status
             needs=["probe"],
             when={"ref": {"node": "probe", "field": "exit_status"}, "op": "equals", "value": 0},
         ),
-        shell(
-            "match_bool",
-            f"touch {bool_marker}",
-            needs=["probe"],
-            when={
-                "ref": {"node": "probe", "field": "exit_status"},
-                "op": "equals",
-                "value": False,
-            },
-        ),
     )
 
     result = await execute_run(workflow, tmp_path / "runs")
 
     assert result.succeeded
     assert int_marker.exists(), "exit_status == 0 is a real int match, so the gate opens"
-    assert not bool_marker.exists(), "exit_status == false must not match via 0 == False coercion"
-    assert result.skipped_causes.get("match_bool") == "when_false"
+    assert result.skipped_node_ids == (), "the gate is open, so nothing is skipped"
 
 
 @pytest.mark.asyncio

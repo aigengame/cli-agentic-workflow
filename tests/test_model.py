@@ -672,6 +672,119 @@ def test_contains_on_a_non_string_field_is_a_config_error() -> None:
     assert "exit_status" in message, "the error names the offending field"
 
 
+def gate_workflow(when: dict[str, Any], *, upstream_kind: str = "shell") -> dict[str, Any]:
+    """A two-node `classify -> gate` workflow whose gate carries the given `when`.
+
+    The upstream `classify` is a shell Node by default; pass ``upstream_kind="agent"``
+    for the kind-aware `structured_output` reference tests (an agent Node is the only
+    kind that can emit `structured_output`). This keeps the value-type and
+    structured-output validation tests free of repeated raw-workflow scaffolding.
+    """
+    if upstream_kind == "agent":
+        classify: dict[str, Any] = {
+            "id": "classify",
+            "kind": "agent",
+            "inputs": {"adapter": "mock", "prompt": "classify the ticket"},
+        }
+    else:
+        classify = {"id": "classify", "kind": "shell", "inputs": {"command": "echo billing"}}
+    return {
+        "name": "sample",
+        "version": 1,
+        "nodes": [
+            classify,
+            {
+                "id": "gate",
+                "kind": "shell",
+                "needs": ["classify"],
+                "when": when,
+                "inputs": {"command": "echo gate"},
+            },
+        ],
+    }
+
+
+def test_a_string_value_against_exit_status_is_a_config_error() -> None:
+    # #75: `exit_status` is an integer field, so a STRING `value` can never match
+    # it — `0 == "0"` is always false, silently skipping the gated node on every
+    # run. Reject the type mismatch at validation time with an actionable message
+    # rather than accepting an always-false gate.
+    raw = gate_workflow(
+        {"ref": {"node": "classify", "field": "exit_status"}, "op": "equals", "value": "0"}
+    )
+
+    with pytest.raises(WorkflowConfigError) as excinfo:
+        normalize_workflow(raw, source="workflow.yaml")
+
+    message = str(excinfo.value)
+    assert "exit_status" in message, "the error names the integer field"
+    assert "value" in message, "the error names the offending value"
+
+
+def test_a_bool_value_against_exit_status_is_a_config_error() -> None:
+    # #75: a `bool` value against `exit_status` is rejected at config time even
+    # though Python aliases `True == 1` / `False == 0`. That aliasing is the
+    # confusing always-or-never match #74 refused at eval time; here it is a config
+    # error, so a bool-vs-exit_status gate never reaches the scheduler (this is the
+    # config-time home of the former executor-seam bool-coercion case).
+    raw = gate_workflow(
+        {"ref": {"node": "classify", "field": "exit_status"}, "op": "equals", "value": False}
+    )
+
+    with pytest.raises(WorkflowConfigError) as excinfo:
+        normalize_workflow(raw, source="workflow.yaml")
+
+    message = str(excinfo.value)
+    assert "exit_status" in message, "the error names the integer field"
+    assert "bool" in message, "the error names the offending bool type"
+
+
+def test_an_int_value_against_stdout_is_a_config_error() -> None:
+    # #75: `stdout` is a string field, so an `int` value can never match it after
+    # the leaf evaluator compares the (string) stdout against the value. Reject the
+    # mismatch at config time rather than accepting an always-false gate.
+    raw = gate_workflow(
+        {"ref": {"node": "classify", "field": "stdout"}, "op": "equals", "value": 1}
+    )
+
+    with pytest.raises(WorkflowConfigError) as excinfo:
+        normalize_workflow(raw, source="workflow.yaml")
+
+    message = str(excinfo.value)
+    assert "stdout" in message, "the error names the string field"
+
+
+def test_a_leaf_missing_value_is_a_config_error() -> None:
+    # #75 DECISION: `value` is REQUIRED for a leaf. A leaf with an `op` but no
+    # `value` defaults `value` to None, which would silently become a
+    # near-always-false gate (with `contains` it degrades to `'None' in actual`).
+    # Reject the missing value at config time rather than accepting the silent gate.
+    raw = gate_workflow({"ref": {"node": "classify", "field": "stdout"}, "op": "equals"})
+
+    with pytest.raises(WorkflowConfigError) as excinfo:
+        normalize_workflow(raw, source="workflow.yaml")
+
+    message = str(excinfo.value)
+    assert "value" in message, "the error names the missing value"
+
+
+def test_an_explicit_equals_null_value_is_a_config_error() -> None:
+    # #75 DECISION: `equals null` is NOT a supported comparison. No normalized
+    # field is ever JSON null (exit_status is int, stdout is str; an absent
+    # structured_output sub-path is ABSENCE, evaluating false, not a null match),
+    # so an explicit `value: null` leaf could never meaningfully match — it is a
+    # config error, indistinguishable in intent from a forgotten value.
+    raw = gate_workflow(
+        {"ref": {"node": "classify", "field": "stdout"}, "op": "equals", "value": None}
+    )
+
+    with pytest.raises(WorkflowConfigError) as excinfo:
+        normalize_workflow(raw, source="workflow.yaml")
+
+    message = str(excinfo.value)
+    assert "value" in message, "the error names the unsupported null value"
+
+
 def test_join_defaults_to_all_and_accepts_any() -> None:
     # The join policy axis (#7): a Node's `join` defaults to `all` (today's
     # behavior — any skipped dependency skips this Node) and may be set to `any`
