@@ -1,40 +1,42 @@
 """The ``codex.exec`` Adapter: invokes ``codex exec`` headless mode (#11).
 
 This is the second real Adapter behind the vendor-neutral interface of ADR 0006,
-capability-symmetric with :mod:`caw.claude_print` (#11): a node switches between
-the two by changing ONLY its adapter name. It spawns Codex's non-interactive
-``codex exec`` and normalizes the process into an :class:`AgentResult`. ALL
-``codex``-specific knowledge — the ``exec`` subcommand, the ``--json`` JSONL event
-stream, ``--output-schema``, the ``agent_message`` item that carries the final
-message, and the ``turn.failed`` event — lives here and nowhere in the kernel, so
-the executor, State, and Events stay vendor-neutral.
+capability-symmetric with :mod:`caw.claude_print` (#11): a node switches between the
+two by changing ONLY its adapter name. It spawns Codex's non-interactive ``codex exec``
+and normalizes the process into an :class:`AgentResult`. ALL ``codex``-specific
+knowledge — the ``exec`` subcommand, the ``--json`` JSONL event stream,
+``--output-schema``, the ``agent_message`` item that carries the final message, and the
+``turn.failed`` event — lives here and nowhere in the kernel, so the executor, State,
+and Events stay vendor-neutral.
+
+The cross-cutting subprocess machinery — locating the CLI, spawning it with the strict
+node env, stdin isolation, the process-group lifecycle, the version probe, and the
+missing-CLI error — is the shared :class:`caw.subprocess_adapter.SubprocessAdapter` base
+(#83), the SAME base ``claude.print`` uses; this module keeps only the codex-specific
+argv construction and JSONL-stream parsing.
 
 Where ``claude -p --output-format json`` prints a single JSON wrapper, ``codex exec
---json`` prints a stream of JSONL events; the adapter folds that stream to the same
+--json`` prints a STREAM of JSONL events; the adapter folds that stream to the same
 vendor-neutral shape claude.print produces (a final message text + an optional
 structured object), so the kernel cannot tell the two apart.
 """
 
-import asyncio
-import contextlib
 import json
-import os
-import shutil
-import signal
 
 from caw.adapter import Adapter, AdapterError, AgentInvocation, AgentResult
+from caw.subprocess_adapter import SubprocessAdapter, node_context
 
-# The CLI entrypoint this Adapter drives. Resolved to an absolute path with
-# shutil.which at invoke / capability-check time (lazily), never at construction,
-# so a shell-only or offline Run never requires `codex`. Locating the binary uses
-# the ambient PATH (infrastructure); it is deliberately NOT part of a node's env
-# allow-list, so the child still receives only invocation.env (see _resolve_cli_path).
+# The CLI entrypoint this Adapter drives. Resolved to an absolute path with shutil.which
+# at invoke / capability-check time (lazily, by the base), never at construction, so a
+# shell-only or offline Run never requires `codex`. Locating the binary uses the ambient
+# PATH (infrastructure); it is deliberately NOT part of a node's env allow-list, so the
+# child still receives only invocation.env.
 CODEX_CLI = "codex"
 
-# The actionable setup message a missing CLI surfaces. ADR 0006 reserves AdapterError
-# for the Adapter being unable to produce a result at all; a CLI that is not installed
-# is exactly that, so the message tells the user how to install or enable it rather
-# than leaking a raw FileNotFoundError.
+# The actionable setup message a missing CLI surfaces. ADR 0006 reserves AdapterError for
+# the Adapter being unable to produce a result at all; a CLI that is not installed is
+# exactly that, so the message tells the user how to install or enable it rather than
+# leaking a raw FileNotFoundError.
 _MISSING_CLI_HINT = (
     "the 'codex' CLI was not found on PATH. Install Codex CLI "
     "(https://developers.openai.com/codex/cli) and ensure 'codex' is on PATH, "
@@ -42,151 +44,86 @@ _MISSING_CLI_HINT = (
 )
 
 
-def _node_context(invocation: AgentInvocation) -> str:
-    """The `node 'id' (adapter 'name')` prefix every AdapterError message carries."""
-    return f"node {invocation.node_id!r} (adapter {invocation.adapter!r})"
-
-
-def _resolve_cli_path(context_label: str) -> str:
-    """Locate the ``codex`` CLI on the ambient PATH and return its absolute path.
-
-    Locating the tool is infrastructure: it uses the ambient environment (via
-    ``shutil.which``), NOT a node's env allow-list — exactly how ``capability_check``
-    already reasons about the ambient env. Returning an absolute path lets the caller
-    spawn it with a strict ``env=`` (the node's allow-list for ``invoke``) without
-    needing ``PATH`` declared in that allow-list and without leaking it into the
-    child. A missing CLI is the Adapter being unable to produce a result at all, so it
-    surfaces the same actionable setup AdapterError BEFORE any spawn (#11).
-    """
-    resolved = shutil.which(CODEX_CLI)
-    if resolved is None:
-        raise AdapterError(f"{context_label}: {_MISSING_CLI_HINT}")
-    return resolved
-
-
-async def _communicate_or_kill(
-    process: "asyncio.subprocess.Process",
-) -> tuple[bytes, bytes]:
-    """``communicate`` on ``process``, killing+reaping its tree on cancellation/timeout.
-
-    The kernel wraps ``invoke`` in ``asyncio.timeout``; when the budget expires the
-    awaited ``communicate`` is cancelled (``CancelledError``) — and a bare
-    ``TimeoutError`` can surface the same way — leaving the spawned ``codex`` (and any
-    grandchild it launched) running. We catch ``BaseException`` (covers both), kill the
-    WHOLE process tree by group and reap it so no orphan is left, then re-raise so the
-    executor still classifies the node correctly.
-
-    The process is spawned with ``start_new_session=True`` so the whole tree shares a
-    process group that ``os.killpg`` signals; a grandchild's inherited stdout pipe would
-    otherwise keep this call blocked for its full lifetime. The leader's ``returncode``
-    being set does NOT mean the process GROUP is dead, so the group is signalled
-    REGARDLESS of the leader's returncode. ``ProcessLookupError`` is suppressed for the
-    case where no group member remains.
-
-    NOTE: this mirrors the executor's private ``_kill_and_reap`` and the identical
-    helper in ``caw.claude_print``; it is duplicated rather than imported because
-    ``caw.executor`` imports this adapter, so importing back would create an import
-    cycle. Consolidating the copies is tracked in #83.
-    """
-    try:
-        return await process.communicate()
-    except BaseException:
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(process.pid, signal.SIGKILL)
-        await process.wait()
-        raise
-
-
-class CodexExecAdapter(Adapter):
+class CodexExecAdapter(SubprocessAdapter, Adapter):
     """Invokes ``codex exec`` (Codex headless mode) and normalizes its result.
 
-    Capability-symmetric with :class:`caw.claude_print.ClaudePrintAdapter`: same
-    locate-then-spawn discipline, same env policy, same cancellation/timeout teardown,
-    and the same vendor-neutral :class:`AgentResult` shape — so a node switches between
-    ``claude.print`` and ``codex.exec`` by changing only its adapter name (#11).
+    Inherits the subprocess lifecycle (locate + spawn + kill/reap + returncode
+    pass-through) and the version probe from :class:`SubprocessAdapter` (#83); supplies
+    the ``codex`` binary name, the missing-CLI hint, and the codex-specific argv and
+    JSONL-stream handling. Capability-symmetric with
+    :class:`caw.claude_print.ClaudePrintAdapter`: a node switches between ``claude.print``
+    and ``codex.exec`` by changing only its adapter name (#11).
     """
+
+    cli_name = CODEX_CLI
+    missing_cli_hint = _MISSING_CLI_HINT
 
     async def invoke(self, invocation: AgentInvocation) -> AgentResult:
         # Locate the CLI on the ambient PATH (infrastructure) and spawn its absolute
         # path, so executable lookup never depends on a PATH inside the node's env
-        # allow-list — the child still receives EXACTLY invocation.env (no PATH leak).
-        # A missing CLI surfaces the actionable setup error here, before any spawn.
-        resolved_cli = _resolve_cli_path(_node_context(invocation))
-        # `--json` is the analogue of claude's `--output-format json`: it makes codex
-        # emit a parseable JSONL event stream the adapter folds to a final message
-        # (+ optional structured object). The node's `args` pass through verbatim —
-        # caw owns no policy engine, so sandbox/approval flags are ordinary passthrough
-        # args (#11 acceptance 3), neither interpreted nor injected here.
+        # allow-list — the child still receives EXACTLY invocation.env (no PATH leak). A
+        # missing CLI surfaces the actionable setup error here (the base), before spawn.
+        resolved_cli = self.resolve_cli_path(node_context(invocation))
+        # `--json` is the analogue of claude's `--output-format json`: it makes codex emit
+        # a parseable JSONL event stream the adapter folds to a final message (+ optional
+        # structured object). The node's `args` pass through verbatim — caw owns no policy
+        # engine, so sandbox/approval flags are ordinary passthrough args (#11 acceptance
+        # 3), neither interpreted nor injected here.
         argv = [resolved_cli, "exec", "--json", *invocation.args]
         wants_structured = invocation.output_schema is not None
         if wants_structured:
             # An Output Contract is declared: hand codex the schema FILE PATH so it can
-            # shape its structured output (`--output-schema <path>`). Unlike claude
-            # (which takes inline schema TEXT), codex reads the schema from a file. The
-            # adapter parses the agent_message; the KERNEL re-validates the schema after
-            # invoke returns (ADR 0006) — the adapter never validates it itself.
-            schema_path = self._schema_path(invocation)
-            argv += ["--output-schema", schema_path]
-        # The `--` separator and the prompt are ALWAYS appended last, so the prompt is
-        # the final token after every flag — a leading-dash prompt (e.g. "--help") can
-        # never be parsed by `codex exec` as a flag.
+            # shape its structured output (`--output-schema <path>`). Unlike claude (which
+            # takes inline schema TEXT), codex reads the schema from a file. The adapter
+            # parses the agent_message; the KERNEL re-validates the schema after invoke
+            # returns (ADR 0006) — the adapter never validates it itself.
+            argv += ["--output-schema", self._schema_path(invocation)]
+        # The `--` separator and the prompt are ALWAYS appended last, so the prompt is the
+        # final token after every flag — a leading-dash prompt (e.g. "--help") can never
+        # be parsed by `codex exec` as a flag.
         argv += ["--", invocation.prompt]
-        # Env policy (ADR 0006, #5): pass EXACTLY the kernel's already-filtered
-        # allow-list, never a merge of os.environ — that would leak the parent
-        # environment. Running real `codex` requires the workflow to declare every env
-        # var the CLI needs (e.g. its auth/config vars) so they appear in invocation.env.
-        try:
-            process = await asyncio.create_subprocess_exec(
-                *argv,
-                # codex exec reads supplementary input from stdin; DEVNULL stops a real
-                # invocation from blocking forever waiting for piped input.
-                stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=dict(invocation.env),
-                # Own session/process group so the whole tree can be killed by group if
-                # the kernel's timeout cancels this invoke (see _communicate_or_kill).
-                start_new_session=True,
-            )
-        except FileNotFoundError as exc:
-            # Defense-in-depth: _resolve_cli_path already gave a clean pre-spawn
-            # missing-CLI error, but a TOCTOU race (the binary vanishing between which
-            # and spawn) must still surface the actionable setup error, never a raw
-            # FileNotFoundError escaping the Adapter.
-            raise AdapterError(f"{_node_context(invocation)}: {_MISSING_CLI_HINT}") from exc
-        stdout_bytes, stderr_bytes = await _communicate_or_kill(process)
-        # backslashreplace (not replace): this output feeds State and downstream `when`
-        # predicates, so an undecodable byte must decode RECOVERABLY (`\xff`) rather than
-        # collapse to an irreversible U+FFFD — matching the executor's shell-node decode.
-        raw_stdout = stdout_bytes.decode("utf-8", errors="backslashreplace")
-        stderr = stderr_bytes.decode("utf-8", errors="backslashreplace")
-        exit_status = process.returncode if process.returncode is not None else -1
+        # Env policy (ADR 0006, #5): the base passes EXACTLY the kernel's already-filtered
+        # allow-list to the child, never a merge of os.environ — that would leak the
+        # parent environment. Running real `codex` requires the workflow to declare every
+        # env var the CLI needs (e.g. its auth/config vars) so they appear in
+        # invocation.env. The base isolates stdin with DEVNULL (codex exec reads
+        # supplementary input from stdin, which would otherwise block) and kills+reaps the
+        # whole tree on a cancellation/timeout.
+        completed = await self.run_cli(
+            argv, context_label=node_context(invocation), env=invocation.env
+        )
+        exit_status = completed.returncode
+        stdout = completed.stdout
+        stderr = completed.stderr
         # A non-zero exit is already a node failure (ADR 0006): the raw stdout is the
-        # process's own output and the JSONL events (if any) are moot, so the failure
-        # is surfaced AS-IS without parsing — the exit code is the primary signal and
-        # must not be masked by an unparseable stream.
+        # process's own output and the JSONL events (if any) are moot, so the failure is
+        # surfaced AS-IS without parsing — the exit code is the primary signal and must
+        # not be masked by an unparseable stream.
         if exit_status != 0:
-            return AgentResult(exit_status=exit_status, stdout=raw_stdout, stderr=stderr)
-        # A zero exit: fold the JSONL event stream to the final agent message and,
-        # when a schema was required, the structured object parsed from it.
-        events = self._parse_events(raw_stdout)
+            return AgentResult(exit_status=exit_status, stdout=stdout, stderr=stderr)
+        # A zero exit: fold the JSONL event stream to the final agent message and, when a
+        # schema was required, the structured object parsed from it.
+        events = self._parse_events(stdout)
         failure = self._turn_failure(events)
         if failure:
-            # Defense-in-depth, symmetric with claude.print's is_error handling: codex
-            # can report a `turn.failed` event even on a ZERO process exit. Normalize to
-            # a FAILED node — force a non-zero exit_status, drop any structured_output (a
-            # failed node carries no trustworthy output, and the kernel skips Output
-            # Contract validation for a non-zero exit per #63), and append an actionable
-            # annotation carrying codex's error message. raw_stdout keeps the full event
-            # stream so the trace stays complete.
+            # Defense-in-depth, symmetric with claude.print's is_error handling: codex can
+            # report a `turn.failed` event even on a ZERO process exit. Normalize to a
+            # FAILED node via the first-class adapter-determined-failure signal (ADR 0006,
+            # #84): raise `adapter_failure` and KEEP the process's real exit_status (here
+            # 0) rather than fabricating a non-zero exit through the exit-code channel. The
+            # kernel honors the flag once, drops any structured_output (a failed node
+            # carries none, and the kernel skips Output Contract validation for an
+            # adapter-determined failure, #63), and an actionable annotation carries
+            # codex's error message. stdout keeps the full event stream so the trace stays
+            # complete.
             return AgentResult(
-                exit_status=1,
-                stdout=raw_stdout,
+                exit_status=exit_status,
+                stdout=stdout,
                 stderr=self._annotate_cli_error(stderr, failure),
+                adapter_failure=True,
             )
         message = self._final_agent_message(events)
         structured_output: object | None = None
-        stdout = raw_stdout
         if message is not None:
             # The agent's final message is the vendor-neutral stdout (symmetric with
             # claude.print's freeform text), even on the structured path where it is a
@@ -194,12 +131,11 @@ class CodexExecAdapter(Adapter):
             stdout = message
         if wants_structured:
             if message is None:
-                # Asked for structured output (via --output-schema) but the stream
-                # carried no agent_message — codex produced none, so the adapter cannot
-                # produce a result (an AdapterError, consistent with the unparseable
-                # case below).
+                # Asked for structured output (via --output-schema) but the stream carried
+                # no agent_message — codex produced none, so the adapter cannot produce a
+                # result (an AdapterError, consistent with the unparseable case below).
                 raise AdapterError(
-                    f"{_node_context(invocation)}: 'codex exec --json' produced no "
+                    f"{node_context(invocation)}: 'codex exec --json' produced no "
                     "agent message but a structured result was required by the node's "
                     "output_schema"
                 )
@@ -210,43 +146,6 @@ class CodexExecAdapter(Adapter):
             stderr=stderr,
             structured_output=structured_output,
         )
-
-    async def capability_check(self) -> str:
-        """Probe the installed ``codex`` CLI and return its version string.
-
-        This is adapter INFRASTRUCTURE, not a node invocation: it locates the CLI on the
-        ambient PATH (via :func:`_resolve_cli_path`, the same locate-and-error path
-        :meth:`invoke` uses) and probes ``codex --version`` in the ambient environment —
-        no node-declared env allow-list applies, unlike :meth:`invoke`, so the spawn
-        passes no ``env=``. The version is returned to the caller and kept adapter-local
-        — it is NOT persisted to State (token/cost/version surfacing is carved out to
-        #79). A missing CLI surfaces the same actionable setup AdapterError as invoke,
-        before any spawn.
-        """
-        resolved_cli = _resolve_cli_path("capability check")
-        try:
-            process = await asyncio.create_subprocess_exec(
-                resolved_cli,
-                "--version",
-                stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                # Own session/process group so a cancelled probe can be killed by group,
-                # leaving no orphan (see _communicate_or_kill).
-                start_new_session=True,
-            )
-        except FileNotFoundError as exc:
-            # Defense-in-depth for the TOCTOU race (see invoke): the binary disappearing
-            # between which and spawn still yields the setup error.
-            raise AdapterError(f"capability check: {_MISSING_CLI_HINT}") from exc
-        stdout_bytes, stderr_bytes = await _communicate_or_kill(process)
-        if process.returncode != 0:
-            stderr = stderr_bytes.decode("utf-8", errors="backslashreplace").strip()
-            raise AdapterError(
-                f"capability check: 'codex --version' exited "
-                f"{process.returncode}: {stderr or '<no stderr>'}"
-            )
-        return stdout_bytes.decode("utf-8", errors="backslashreplace").strip()
 
     @staticmethod
     def _schema_path(invocation: AgentInvocation) -> str:
@@ -272,8 +171,8 @@ class CodexExecAdapter(Adapter):
         so a single malformed line never discards the whole run.
         """
         events: list[dict[str, object]] = []
-        for line in stdout.splitlines():
-            line = line.strip()
+        for raw_line in stdout.splitlines():
+            line = raw_line.strip()
             if not line:
                 continue
             try:
@@ -290,8 +189,8 @@ class CodexExecAdapter(Adapter):
 
         codex emits the agent's final message as an ``item.completed`` event whose
         ``item.type`` is ``agent_message`` and whose ``item.text`` is the message (the
-        structured-output JSON string when an ``--output-schema`` was supplied). The
-        last such item is the final answer.
+        structured-output JSON string when an ``--output-schema`` was supplied). The last
+        such item is the final answer.
         """
         text: str | None = None
         for event in events:
@@ -335,18 +234,19 @@ class CodexExecAdapter(Adapter):
     def _parse_structured_message(message: str, invocation: AgentInvocation) -> object:
         """Parse the agent_message text as the structured object, or fail cleanly.
 
-        On the structured path codex's final agent_message IS the JSON value shaped by
-        the ``--output-schema``. The adapter parses it and passes it through AS-IS; the
-        kernel re-validates it against the Output Contract (ADR 0006), so the schema is
-        the sole arbiter of whether the value satisfies the contract. Unparseable text
-        when structured output was REQUIRED means the adapter cannot produce a result —
-        an AdapterError, per ADR 0006.
+        On the structured path codex's final agent_message IS the JSON value shaped by the
+        ``--output-schema``. The adapter parses it and passes it through AS-IS; the kernel
+        re-validates it against the Output Contract (ADR 0006), so the schema is the sole
+        arbiter of whether the value satisfies the contract. Any JSON value is accepted
+        here (symmetric with claude.print, whose ``structured_output`` need not be an
+        object); unparseable text when structured output was REQUIRED means the adapter
+        cannot produce a result — an AdapterError, per ADR 0006.
         """
         try:
             return json.loads(message)
         except json.JSONDecodeError as exc:
             raise AdapterError(
-                f"{_node_context(invocation)}: expected a JSON structured result from "
+                f"{node_context(invocation)}: expected a JSON structured result from "
                 f"'codex exec --json --output-schema' but could not parse the agent "
                 f"message: {exc}"
             ) from exc
@@ -359,8 +259,9 @@ class CodexExecAdapter(Adapter):
         and PRESERVES any stderr the process already emitted by appending rather than
         clobbering (symmetric with claude.print). The process stderr is rstripped before
         the join so a process whose stderr already ends in a newline does not get a
-        doubled/trailing blank line: the turn-failed path forces exit_status=1, so the
-        executor's exit==0-only `.strip()` never cleans this persisted stderr.
+        doubled/trailing blank line: the turn-failed path raises ``adapter_failure``, so
+        the node is failed and the executor's success-only ``.strip()`` never cleans this
+        persisted stderr.
         """
         annotation = f"codex reported an error: {message}"
         return f"{stderr.rstrip()}\n{annotation}" if stderr.strip() else annotation

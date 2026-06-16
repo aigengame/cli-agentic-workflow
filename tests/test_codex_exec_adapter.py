@@ -105,18 +105,27 @@ FAKE_CODEX_PATH = "/fake/abs/bin/codex"
 
 
 def patch_killpg(monkeypatch: pytest.MonkeyPatch) -> list[tuple[int, int]]:
-    """Patch ``os.killpg`` in the adapter namespace; record (pid, signal) calls."""
+    """Patch ``os.killpg`` in the shared subprocess-adapter namespace (#83).
+
+    The process-group lifecycle moved out of ``codex.exec`` into the shared
+    ``caw.subprocess_adapter`` base, so the kill seam now lives there; the offline
+    suite patches it at its real home. Record (pid, signal) calls.
+    """
     calls: list[tuple[int, int]] = []
 
     def fake_killpg(pid: int, sig: int) -> None:
         calls.append((pid, sig))
 
-    monkeypatch.setattr("caw.codex_exec.os.killpg", fake_killpg)
+    monkeypatch.setattr("caw.subprocess_adapter.os.killpg", fake_killpg)
     return calls
 
 
 def patch_spawn(monkeypatch: pytest.MonkeyPatch, process: FakeProcess) -> dict[str, object]:
-    """Patch ``asyncio.create_subprocess_exec`` to return ``process``; record args/env."""
+    """Patch ``asyncio.create_subprocess_exec`` (in the shared base) to return ``process``.
+
+    Records args/env. The spawn seam lives in ``caw.subprocess_adapter`` since #83
+    consolidated the subprocess machinery there.
+    """
     captured: dict[str, object] = {}
 
     async def fake_exec(*args: object, **kwargs: object) -> FakeProcess:
@@ -125,13 +134,17 @@ def patch_spawn(monkeypatch: pytest.MonkeyPatch, process: FakeProcess) -> dict[s
         captured["kwargs"] = kwargs
         return process
 
-    monkeypatch.setattr("caw.codex_exec.asyncio.create_subprocess_exec", fake_exec)
+    monkeypatch.setattr("caw.subprocess_adapter.asyncio.create_subprocess_exec", fake_exec)
     return captured
 
 
 def patch_which(monkeypatch: pytest.MonkeyPatch, resolved: str | None = FAKE_CODEX_PATH) -> None:
-    """Patch ``shutil.which`` (in the adapter's namespace) to return ``resolved``."""
-    monkeypatch.setattr("caw.codex_exec.shutil.which", lambda _name: resolved)
+    """Patch ``shutil.which`` (in the shared subprocess-adapter namespace) to ``resolved``.
+
+    Locating the CLI moved to the shared base (#83), so it is patched there.
+    ``resolved=None`` models a missing CLI.
+    """
+    monkeypatch.setattr("caw.subprocess_adapter.shutil.which", lambda _name: resolved)
 
 
 @pytest.mark.asyncio
@@ -212,7 +225,7 @@ async def test_missing_cli_raises_an_actionable_setup_error_before_spawning(
     async def fail_if_spawned(*args: object, **kwargs: object) -> object:
         raise AssertionError("a missing CLI must error before create_subprocess_exec")
 
-    monkeypatch.setattr("caw.codex_exec.asyncio.create_subprocess_exec", fail_if_spawned)
+    monkeypatch.setattr("caw.subprocess_adapter.asyncio.create_subprocess_exec", fail_if_spawned)
     adapter = CodexExecAdapter()
 
     with pytest.raises(AdapterError) as excinfo:
@@ -321,7 +334,7 @@ async def test_invoke_cancellation_suppresses_process_lookup_when_group_is_gone(
     def killpg_no_such_group(pid: int, sig: int) -> None:
         raise ProcessLookupError(3, "No such process")
 
-    monkeypatch.setattr("caw.codex_exec.os.killpg", killpg_no_such_group)
+    monkeypatch.setattr("caw.subprocess_adapter.os.killpg", killpg_no_such_group)
     process = FakeProcess(None, communicate_raises=asyncio.CancelledError())
     patch_spawn(monkeypatch, process)
     adapter = CodexExecAdapter()
@@ -358,7 +371,7 @@ async def test_filenotfound_at_spawn_is_translated_as_a_toctou_fallback(
     async def raise_not_found(*args: object, **kwargs: object) -> object:
         raise FileNotFoundError(2, "No such file or directory", FAKE_CODEX_PATH)
 
-    monkeypatch.setattr("caw.codex_exec.asyncio.create_subprocess_exec", raise_not_found)
+    monkeypatch.setattr("caw.subprocess_adapter.asyncio.create_subprocess_exec", raise_not_found)
     adapter = CodexExecAdapter()
 
     with pytest.raises(AdapterError) as excinfo:
@@ -605,9 +618,11 @@ async def test_zero_exit_but_turn_failed_event_normalizes_to_a_failed_node(
     # Defense-in-depth, symmetric with claude.print's is_error handling: `codex` can
     # emit a `turn.failed` event in its JSONL stream even on a ZERO process exit. On the
     # structured path the adapter inspects the events: exit 0 + a turn.failed event is
-    # normalized to a FAILED node — exit_status forced non-zero, structured_output
-    # dropped (a failed node carries no trustworthy output), and an actionable
-    # annotation carrying the codex error message appended to stderr.
+    # normalized to a FAILED node via the FIRST-CLASS `adapter_failure` signal (#84) —
+    # the adapter KEEPS the process's real exit_status (here 0) rather than fabricating a
+    # non-zero exit, raises `adapter_failure`, drops the structured_output (a failed node
+    # carries no trustworthy output), and appends an actionable annotation carrying the
+    # codex error message to stderr.
     schema = write_schema(tmp_path / "s.schema.json", {"type": "object"})
     stdout = codex_jsonl(failed="model overloaded, try again")
     patch_which(monkeypatch)
@@ -618,7 +633,8 @@ async def test_zero_exit_but_turn_failed_event_normalizes_to_a_failed_node(
         AgentInvocation(node_id="n", adapter="codex.exec", prompt="p", output_schema=schema)
     )
 
-    assert result.exit_status != 0
+    assert result.exit_status == 0, "the real process exit_status is preserved, not fabricated"
+    assert result.adapter_failure is True, "the failure rides the first-class signal"
     assert result.structured_output is None
     assert "error" in result.stderr.lower(), "stderr carries an actionable CLI-error annotation"
     assert "overloaded" in result.stderr, "the codex error message is surfaced for diagnosis"
@@ -655,7 +671,7 @@ async def test_capability_check_on_a_missing_cli_is_an_actionable_setup_error(
     async def fail_if_spawned(*args: object, **kwargs: object) -> object:
         raise AssertionError("a missing CLI must error before create_subprocess_exec")
 
-    monkeypatch.setattr("caw.codex_exec.asyncio.create_subprocess_exec", fail_if_spawned)
+    monkeypatch.setattr("caw.subprocess_adapter.asyncio.create_subprocess_exec", fail_if_spawned)
     adapter = CodexExecAdapter()
 
     with pytest.raises(AdapterError) as excinfo:
@@ -682,7 +698,7 @@ def test_default_registry_resolves_codex_exec_with_no_construction_side_effects(
     def fail_if_spawned(*args: object, **kwargs: object) -> object:
         raise AssertionError("constructing/resolving the adapter must not spawn a subprocess")
 
-    monkeypatch.setattr("caw.codex_exec.asyncio.create_subprocess_exec", fail_if_spawned)
+    monkeypatch.setattr("caw.subprocess_adapter.asyncio.create_subprocess_exec", fail_if_spawned)
 
     registry = AdapterRegistry()
     adapter = registry.resolve("codex.exec")
