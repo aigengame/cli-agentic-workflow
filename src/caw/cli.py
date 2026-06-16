@@ -490,8 +490,10 @@ def _report_group_and_exit(result: GroupResult) -> None:
     terminal status (``done`` / ``exhausted`` / ``accepted`` / ``rejected`` /
     ``complete``) is a successful drive (exit 0); a constituent Run that ``failed``
     exits 1, matching ``caw run``'s failed-Run contract. Each iteration's run id is
-    named so a user can drill into one with ``caw report``; the tournament's final
-    winner is named when present.
+    named for provenance; a Run Group is the reporting unit (ADR 0009), so a user
+    inspects the whole group with ``caw <controller> report <group_id>`` (the iteration
+    runs live under ``groups/<id>/iterations/``, not the ``.caw/runs/`` root ``caw
+    report`` resolves). The tournament's final winner is named when present.
     """
     typer.echo(
         f"Run Group {result.group_id}: {result.status} ({len(result.iterations)} iterations)"
