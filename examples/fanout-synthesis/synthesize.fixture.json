@@ -1,0 +1,7 @@
+{
+  "exit_status": 0,
+  "structured_output": {
+    "recommendation": "Parallelize the test run across cores and stop redundant reruns; both branches rank these as the top two contributors to slow CI.",
+    "ranked": ["single-core test run", "redundant test reruns"]
+  }
+}

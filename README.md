@@ -108,26 +108,32 @@ with `summary.fixture.json` next to the workflow file:
 `caw run hello.yaml` now runs the shell and agent nodes together. Swapping `adapter: mock`
 for a real adapter (e.g. `claude.print`) is the only change needed to drive a real agent CLI.
 
-### Fan-out synthesis: the reference end-to-end sample
+### Fan-out synthesis: the end-to-end sample
 
-The first complete end-to-end sample fans the **same task** out to two agent branches in
-parallel and joins their answers in a synthesis node — the fan-out-synthesis shape. Scaffold
-the whole bundle (the workflow plus its branch and synthesis fixtures) and run it offline,
-clone-to-completed in well under ten minutes:
+The first complete end-to-end sample is a **hand-written** workflow that fans the **same
+task** out to two agent branches in parallel and joins both answers in a `synthesize` node —
+the fan-out-synthesis shape. It ships under [`examples/fanout-synthesis/`](examples/fanout-synthesis/)
+in two variants: an **offline mock** variant (every node uses the built-in `mock` adapter, so
+it runs with no real Agent CLI and no tokens) and a **real** variant that fans the same task
+to `claude.print` and `codex.exec` side by side.
+
+Run the offline variant from the repo root — clone-to-completed in well under ten minutes
+(the full walkthrough is in the sample's
+[QUICKSTART.md](examples/fanout-synthesis/QUICKSTART.md)):
 
 ```bash
-caw fanout init                # writes fanout.yaml + the three companion fixtures
-caw graph fanout.yaml          # two branches fan into one synthesis node
-caw run fanout.yaml            # runs offline with the mock adapter — no tokens
-caw report <run-id> --format markdown   # the conclusion, separated from the trace
+caw validate examples/fanout-synthesis/fanout-synthesis.mock.yaml
+caw graph    examples/fanout-synthesis/fanout-synthesis.mock.yaml   # two branches → one synthesize node
+caw run      examples/fanout-synthesis/fanout-synthesis.mock.yaml   # runs offline — no tokens
+caw report <run-id> --format markdown                               # conclusion (## Nodes) vs trace (## Trace)
 ```
 
-The scaffolded sample runs against the `mock` adapter so it completes with no real Agent CLI
-and no tokens. The reference sample fans the same task to `claude.print` and `codex.exec` side
-by side: swap each branch's `adapter: mock` (and its `fixture` for an `output_schema`) for a
-real adapter to drive two real agent CLIs and synthesize their answers. The Markdown report
-keeps the final conclusion (each node's outcome, including the synthesis node's) in its own
-sections, distinct from the `## Trace` of events.
+The real variant ([`fanout-synthesis.real.yaml`](examples/fanout-synthesis/fanout-synthesis.real.yaml))
+points the two branches at `claude.print` and `codex.exec`, requires both CLIs on PATH and
+authenticated, and is exercised end-to-end by the e2e suite
+(`tests/e2e/test_fanout_synthesis_runs.py`). The Markdown report keeps the final conclusion
+(each node's outcome, including the synthesize node's) in its own `## Nodes` section, distinct
+from the `## Trace` of events.
 
 ## Why caw
 
@@ -231,7 +237,6 @@ caw report <run-id> --format markdown
 | `caw loop resume <group-id>` | Resume an interrupted run group at the group level | ✅ now |
 | `caw loop report <group-id>` | Aggregate every iteration of a run group into one report | ✅ now |
 | `caw loop init [path]` | Scaffold a complete runnable loop-until-done example | ✅ now |
-| `caw fanout init [path]` | Scaffold the complete runnable fan-out-synthesis sample | ✅ now |
 
 ## Built-in patterns
 
@@ -247,7 +252,7 @@ example of any shipped pattern with `caw patterns init <name>`.
 | Parallel | Independent branches joined downstream | ✅ now |
 | Classify and act | Classifier routes to one of several `when`-gated branches | 🚧 planned |
 | Generate and filter | N candidate generators, then a scoring/validation filter | 🚧 planned |
-| Fan-out synthesis | Parallel agents, then a synthesis node (the reference sample runs `claude.print` and `codex.exec` side by side) — scaffold it with `caw fanout init` | ✅ now |
+| Fan-out synthesis | Parallel agents, then a synthesis node (the reference sample runs `claude.print` and `codex.exec` side by side) | 🚧 planned |
 | Adversarial verification | Generator + verifiers, with accept / reject / regenerate | 🚧 planned |
 | Tournament | Rounds or brackets with winner promotion and comparison evidence | 🚧 planned |
 | Loop until done | Iterates immutable runs in a Run Group until the done Predicate holds | ✅ now |

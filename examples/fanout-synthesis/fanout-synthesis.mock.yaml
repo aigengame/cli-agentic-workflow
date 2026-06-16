@@ -1,0 +1,43 @@
+# Fan-out synthesis — the offline mock variant (#14).
+#
+# A hand-written fan-out-synthesis workflow: the SAME task is fanned out to two
+# independent agent branches that run in parallel, then a `synthesize` agent node
+# joins BOTH branch outputs into one final answer. This variant drives the built-in
+# `mock` adapter, so it runs to success with no real Agent CLI and no tokens — each
+# node replays a companion fixture file. It is the offline twin of
+# `fanout-synthesis.real.yaml`, which fans the same task to `claude.print` and
+# `codex.exec` side by side.
+#
+# Run it from the repo root, clone-to-completed in well under ten minutes:
+#
+#   caw validate examples/fanout-synthesis/fanout-synthesis.mock.yaml
+#   caw graph    examples/fanout-synthesis/fanout-synthesis.mock.yaml
+#   caw run      examples/fanout-synthesis/fanout-synthesis.mock.yaml
+#   caw report <run-id> --format markdown   # conclusion (## Nodes) vs trace (## Trace)
+#
+# The two branches carry the IDENTICAL `prompt` — the same task fanned out — and the
+# `synthesize` node `needs` BOTH, so a successful run joins both branch answers.
+name: fanout-synthesis-mock
+version: 1
+nodes:
+  - id: claude_branch
+    kind: agent
+    inputs:
+      adapter: mock
+      prompt: List the three largest contributors to slow CI, most impactful first.
+      fixture: claude-branch.fixture.json
+  - id: codex_branch
+    kind: agent
+    inputs:
+      adapter: mock
+      prompt: List the three largest contributors to slow CI, most impactful first.
+      fixture: codex-branch.fixture.json
+  - id: synthesize
+    kind: agent
+    needs: [claude_branch, codex_branch]
+    inputs:
+      adapter: mock
+      prompt: >-
+        Combine the two proposals into one ranked recommendation, keeping only the
+        items both branches agree on first.
+      fixture: synthesize.fixture.json

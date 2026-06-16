@@ -120,48 +120,6 @@ pattern:
 """
 
 
-# A runnable fan-out-synthesis sample (#14): the SAME task fanned out to two agent
-# branches in parallel, joined by a synthesis Node — the reference end-to-end sample.
-# Authored with the `parallel` expander (CONTEXT.md: Parallel), so the offline bundle
-# is a hand-written fan-out-synthesis workflow, not a dedicated expander. The real
-# reference runs `claude.print` and `codex.exec` side by side (the e2e proves that
-# path); this offline variant fans to two `mock` branches that each replay a companion
-# fixture, so it runs to success with no real Agent CLI and no tokens.
-_FANOUT_WORKFLOW = """\
-# A runnable fan-out-synthesis sample: the same task is fanned out to two agent
-# branches that run concurrently, then a `synthesize` node joins their answers into
-# one conclusion. Inspect the expanded graph with `caw graph fanout.yaml` and run it
-# with `caw run fanout.yaml` — the `mock` adapter replays each fixture, so no real
-# Agent CLI is required. The reference sample fans the same task to `claude.print` and
-# `codex.exec`; swap each branch's `adapter: mock` (and its `fixture`) for a real
-# adapter to drive two real Agent CLIs side by side.
-name: fanout-synthesis-sample
-version: 1
-pattern:
-  type: parallel
-  branches:
-    - id: claude_branch
-      kind: agent
-      inputs:
-        adapter: mock
-        prompt: Propose how to speed up the test suite. Be concrete.
-        fixture: claude-branch.fixture.json
-    - id: codex_branch
-      kind: agent
-      inputs:
-        adapter: mock
-        prompt: Propose how to speed up the test suite. Be concrete.
-        fixture: codex-branch.fixture.json
-  join:
-    id: synthesize
-    kind: agent
-    inputs:
-      adapter: mock
-      prompt: Synthesize the two proposals into one ranked recommendation.
-      fixture: synthesize.fixture.json
-"""
-
-
 # A runnable `loop-until-done` Pattern Controller example (#15, ADR 0009): a
 # controller spec drives an iteration workflow until a done-predicate holds. The
 # iteration is a single mock-Adapter agent Node whose fixture reports a verdict in
@@ -228,30 +186,6 @@ LOOP_EXAMPLE = PatternExample(
         "loop-iteration.yaml": _LOOP_ITERATION_WORKFLOW,
         "verdict-1.fixture.json": _loop_fixture(done=False, next_fixture="verdict-2.fixture.json"),
         "verdict-2.fixture.json": _loop_fixture(done=True),
-    },
-)
-
-
-# The fan-out-synthesis sample bundle (#14): the `parallel` workflow plus the two
-# branch fixtures and the synthesis fixture. Reuses the PatternExample bundle shape
-# (a workflow file + companion files); `caw fanout init` writes the whole bundle, so
-# the reference end-to-end sample runs to success offline as scaffolded. A standalone
-# constant (not a PATTERN_EXAMPLES entry) so the sample stays decoupled from the
-# expander-keyed scaffold map.
-FANOUT_EXAMPLE = PatternExample(
-    workflow_filename="fanout.yaml",
-    files={
-        "fanout.yaml": _FANOUT_WORKFLOW,
-        "claude-branch.fixture.json": _fixture(
-            '{"proposal": "Parallelize the suite across CPU cores with pytest-xdist."}'
-        ),
-        "codex-branch.fixture.json": _fixture(
-            '{"proposal": "Cache fixtures and skip redundant rebuilds between runs."}'
-        ),
-        "synthesize.fixture.json": _fixture(
-            '{"recommendation": "Run pytest-xdist first, then add fixture caching.", '
-            '"ranked": ["pytest-xdist", "fixture caching"]}'
-        ),
     },
 )
 
