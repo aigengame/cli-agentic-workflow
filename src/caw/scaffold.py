@@ -120,6 +120,140 @@ pattern:
 """
 
 
+# A runnable `classify-and-act` example (#13): a classifier agent labels the input,
+# then `when`-gated branches act on the label (the sole conditional mechanism — each
+# branch reads the classifier's `structured_output.category`, ADR 0007 / #75), and a
+# `join: any` report fans in whichever branch ran. The classifier fixture labels this
+# input `bug`, so the bug branch runs, the feature branch skips, and the report runs
+# on the one taken branch — all offline with the mock Adapter.
+_CLASSIFY_AND_ACT_WORKFLOW = """\
+# A runnable `classify-and-act` pattern example: a classifier labels the input, then
+# `when`-gated branches act on the label and a `join: any` report fans in whichever
+# branch ran. Inspect the expanded workflow with `caw graph classify-and-act.yaml`
+# and run it with `caw run classify-and-act.yaml` — the `mock` adapter replays each
+# fixture, so no real Agent CLI is required. The classifier fixture labels this input
+# `bug`, so the bug branch runs and the feature branch skips.
+name: classify-and-act-example
+version: 1
+pattern:
+  type: classify-and-act
+  classifier:
+    id: classify
+    kind: agent
+    inputs:
+      adapter: mock
+      prompt: Classify the issue as a bug or a feature.
+      fixture: classify.fixture.json
+  branches:
+    - id: handle-bug
+      kind: agent
+      when:
+        ref:
+          node: classify
+          field: structured_output
+          path: [category]
+        op: equals
+        value: bug
+      inputs:
+        adapter: mock
+        prompt: Triage and fix the bug.
+        fixture: handle-bug.fixture.json
+    - id: handle-feature
+      kind: agent
+      when:
+        ref:
+          node: classify
+          field: structured_output
+          path: [category]
+        op: equals
+        value: feature
+      inputs:
+        adapter: mock
+        prompt: Scope the feature request.
+        fixture: handle-feature.fixture.json
+  join:
+    id: report
+    kind: agent
+    join: any
+    inputs:
+      adapter: mock
+      prompt: Report the action taken.
+      fixture: report.fixture.json
+"""
+
+
+# A runnable `generate-and-filter` example (#13): two candidate generators run
+# concurrently, then a filter keeps the accepted ones. Every node replays a fixture,
+# so it runs offline with the mock Adapter.
+_GENERATE_AND_FILTER_WORKFLOW = """\
+# A runnable `generate-and-filter` pattern example: two candidate generators run
+# concurrently, then a `filter` agent keeps the accepted candidates. Inspect the
+# expanded workflow with `caw graph generate-and-filter.yaml` and run it with
+# `caw run generate-and-filter.yaml` — the `mock` adapter replays each fixture, so
+# no real Agent CLI is required.
+name: generate-and-filter-example
+version: 1
+pattern:
+  type: generate-and-filter
+  generators:
+    - id: candidate-1
+      kind: agent
+      inputs:
+        adapter: mock
+        prompt: Propose a first candidate solution.
+        fixture: candidate-1.fixture.json
+    - id: candidate-2
+      kind: agent
+      inputs:
+        adapter: mock
+        prompt: Propose a second candidate solution.
+        fixture: candidate-2.fixture.json
+  filter:
+    id: accept
+    kind: agent
+    inputs:
+      adapter: mock
+      prompt: Score the candidates and emit the accepted ones.
+      fixture: accept.fixture.json
+"""
+
+
+# A runnable `fan-out-synthesis` example (#13): two workers research independent
+# angles concurrently, then a synthesize node fans their results into one output.
+# Every node replays a fixture, so it runs offline with the mock Adapter.
+_FAN_OUT_SYNTHESIS_WORKFLOW = """\
+# A runnable `fan-out-synthesis` pattern example: two workers research independent
+# angles concurrently, then a `synthesize` agent fans their results into one output.
+# Inspect the expanded workflow with `caw graph fan-out-synthesis.yaml` and run it
+# with `caw run fan-out-synthesis.yaml` — the `mock` adapter replays each fixture,
+# so no real Agent CLI is required.
+name: fan-out-synthesis-example
+version: 1
+pattern:
+  type: fan-out-synthesis
+  workers:
+    - id: angle-a
+      kind: agent
+      inputs:
+        adapter: mock
+        prompt: Research the problem from angle A.
+        fixture: angle-a.fixture.json
+    - id: angle-b
+      kind: agent
+      inputs:
+        adapter: mock
+        prompt: Research the problem from angle B.
+        fixture: angle-b.fixture.json
+  synthesize:
+    id: synthesize
+    kind: agent
+    inputs:
+      adapter: mock
+      prompt: Synthesize the angles into one recommendation.
+      fixture: synthesize.fixture.json
+"""
+
+
 # A runnable `loop-until-done` Pattern Controller example (#15, ADR 0009): a
 # controller spec drives an iteration workflow until a done-predicate holds. The
 # iteration is a single mock-Adapter agent Node whose fixture reports a verdict in
@@ -209,6 +343,37 @@ PATTERN_EXAMPLES: dict[str, PatternExample] = {
             "research.fixture.json": _fixture('{"approach": "A"}'),
             "critique.fixture.json": _fixture('{"risk": "low"}'),
             "merge.fixture.json": _fixture('{"decision": "proceed"}'),
+        },
+    ),
+    "classify-and-act": PatternExample(
+        workflow_filename="classify-and-act.yaml",
+        files={
+            "classify-and-act.yaml": _CLASSIFY_AND_ACT_WORKFLOW,
+            # The classifier labels this input `bug`, so the bug branch's `when`
+            # holds and the feature branch's skips — the `join: any` report then
+            # runs on the one taken branch.
+            "classify.fixture.json": _fixture('{"category": "bug"}'),
+            "handle-bug.fixture.json": _fixture('{"action": "fix queued"}'),
+            "handle-feature.fixture.json": _fixture('{"action": "scoped"}'),
+            "report.fixture.json": _fixture('{"reported": true}'),
+        },
+    ),
+    "generate-and-filter": PatternExample(
+        workflow_filename="generate-and-filter.yaml",
+        files={
+            "generate-and-filter.yaml": _GENERATE_AND_FILTER_WORKFLOW,
+            "candidate-1.fixture.json": _fixture('{"idea": "approach one"}'),
+            "candidate-2.fixture.json": _fixture('{"idea": "approach two"}'),
+            "accept.fixture.json": _fixture('{"accepted": ["approach one"]}'),
+        },
+    ),
+    "fan-out-synthesis": PatternExample(
+        workflow_filename="fan-out-synthesis.yaml",
+        files={
+            "fan-out-synthesis.yaml": _FAN_OUT_SYNTHESIS_WORKFLOW,
+            "angle-a.fixture.json": _fixture('{"finding": "from A"}'),
+            "angle-b.fixture.json": _fixture('{"finding": "from B"}'),
+            "synthesize.fixture.json": _fixture('{"recommendation": "combine A and B"}'),
         },
     ),
 }

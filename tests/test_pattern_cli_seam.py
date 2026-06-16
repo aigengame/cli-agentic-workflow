@@ -127,7 +127,14 @@ def test_patterns_list_lists_the_registered_built_in_patterns() -> None:
 
 
 @pytest.mark.parametrize(
-    ("pattern", "filename"), [("pipeline", "pipeline.yaml"), ("parallel", "parallel.yaml")]
+    ("pattern", "filename"),
+    [
+        ("pipeline", "pipeline.yaml"),
+        ("parallel", "parallel.yaml"),
+        ("classify-and-act", "classify-and-act.yaml"),
+        ("generate-and-filter", "generate-and-filter.yaml"),
+        ("fan-out-synthesis", "fan-out-synthesis.yaml"),
+    ],
 )
 def test_patterns_init_scaffolds_an_example_that_validates_and_runs_to_success(
     pattern: str, filename: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

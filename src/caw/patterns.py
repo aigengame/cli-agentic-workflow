@@ -34,6 +34,29 @@ NodeDict = dict[str, Any]
 ExpandFn = Callable[[Any], list[NodeDict]]
 
 
+def _reject_declared_needs(node: NodeDict | None, role: str, reason: str) -> NodeDict | None:
+    """Reject a node dict that declares its own ``needs`` — the expander owns it.
+
+    Every expander injects the ``needs`` edges that define its shape (the chaining,
+    the fan-in, the classifier dependency), so an authored ``needs`` would fight the
+    expansion. Sharing this guard keeps the one-line error message uniform across
+    expanders (it always contains "must not declare `needs`", which the seam tests
+    assert), while ``role`` names which slot is at fault and ``reason`` says why.
+    """
+    if isinstance(node, dict) and "needs" in node:
+        raise ValueError(f"a {role} must not declare `needs`; {reason}")
+    return node
+
+
+def _reject_declared_needs_each(
+    nodes: list[NodeDict], role: str, reason: str
+) -> list[NodeDict]:
+    """Apply :func:`_reject_declared_needs` to each node in a list, returning it."""
+    for node in nodes:
+        _reject_declared_needs(node, role, reason)
+    return nodes
+
+
 class PatternExpander:
     """One registered expander: its params model, expand function, and one-line shape.
 
@@ -157,6 +180,155 @@ def _expand_parallel(params: _ParallelParams) -> list[NodeDict]:
     return nodes
 
 
+def _fan_in(branch_nodes: list[NodeDict], join: NodeDict) -> NodeDict:
+    """A join node copy that ``needs`` every branch — the shared fan-in injection.
+
+    classify-and-act, generate-and-filter, and fan-out-synthesis all fan a set of
+    branch nodes into one downstream node; this owns that single injected ``needs``
+    (every branch id) so the three expanders express only their distinct framing.
+    """
+    join_node = dict(join)
+    join_node["needs"] = [branch.get("id") for branch in branch_nodes]
+    return join_node
+
+
+class _ClassifyAndActParams(BaseModel):
+    """Params of the ``classify-and-act`` expander: classify, then act on the label.
+
+    A ``classifier`` agent Node runs first and emits a label in its normalized
+    output; each ``branches`` entry is a branch the run acts on, gated by its own
+    ``when`` Predicate reading the classifier's output (``path`` addresses into
+    ``structured_output`` — the sole conditional mechanism, ADR 0007). The optional
+    ``join`` fans the branches in; because only the matching branch runs and the
+    rest skip, the join typically carries ``join: any`` (ADR 0007) so it runs on the
+    one taken branch. The expander injects each branch's ``needs`` (the classifier)
+    and the join's ``needs`` (every branch); the classifier, branch, and join entries
+    must not declare their own ``needs`` — only the ``when`` gating is the author's.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    classifier: NodeDict
+    branches: list[NodeDict] = Field(min_length=1)
+    join: NodeDict | None = None
+
+    @field_validator("classifier")
+    @classmethod
+    def _classifier_must_not_declare_needs(cls, classifier: NodeDict) -> NodeDict:
+        return _reject_declared_needs(
+            classifier, "classify-and-act classifier", "the classifier is the entry node"
+        )  # type: ignore[return-value]
+
+    @field_validator("branches")
+    @classmethod
+    def _branches_must_not_declare_needs(cls, branches: list[NodeDict]) -> list[NodeDict]:
+        return _reject_declared_needs_each(
+            branches,
+            "classify-and-act branch",
+            "the expander needs each branch on the classifier",
+        )
+
+    @field_validator("join")
+    @classmethod
+    def _join_must_not_declare_needs(cls, join: NodeDict | None) -> NodeDict | None:
+        return _reject_declared_needs(
+            join, "classify-and-act join", "the join fans in every branch"
+        )
+
+
+def _expand_classify_and_act(params: _ClassifyAndActParams) -> list[NodeDict]:
+    """Emit the classifier, branches each needing it, and an optional fan-in join."""
+    classifier = dict(params.classifier)
+    classifier_id = classifier.get("id")
+    nodes: list[NodeDict] = [classifier]
+    branch_nodes: list[NodeDict] = []
+    for branch in params.branches:
+        node = dict(branch)
+        node["needs"] = [classifier_id]
+        branch_nodes.append(node)
+    nodes.extend(branch_nodes)
+    if params.join is not None:
+        nodes.append(_fan_in(branch_nodes, params.join))
+    return nodes
+
+
+class _GenerateAndFilterParams(BaseModel):
+    """Params of the ``generate-and-filter`` expander: generate N, then keep the good.
+
+    Each ``generators`` entry is an independent candidate generator (no ``needs``, so
+    they run concurrently); the ``filter`` Node fans every generator in and emits the
+    accepted candidates. The expander injects the filter's ``needs`` (every
+    generator); a generator or the filter declaring its own ``needs`` is rejected.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    generators: list[NodeDict] = Field(min_length=1)
+    filter: NodeDict
+
+    @field_validator("generators")
+    @classmethod
+    def _generators_must_not_declare_needs(cls, generators: list[NodeDict]) -> list[NodeDict]:
+        return _reject_declared_needs_each(
+            generators,
+            "generate-and-filter generator",
+            "generators are independent and run concurrently",
+        )
+
+    @field_validator("filter")
+    @classmethod
+    def _filter_must_not_declare_needs(cls, filter_: NodeDict) -> NodeDict:
+        return _reject_declared_needs(
+            filter_, "generate-and-filter filter", "the filter fans in every generator"
+        )  # type: ignore[return-value]
+
+
+def _expand_generate_and_filter(params: _GenerateAndFilterParams) -> list[NodeDict]:
+    """Emit independent generators and a filter that needs every generator."""
+    nodes: list[NodeDict] = [dict(generator) for generator in params.generators]
+    nodes.append(_fan_in(nodes, params.filter))
+    return nodes
+
+
+class _FanOutSynthesisParams(BaseModel):
+    """Params of the ``fan-out-synthesis`` expander: fan out, then synthesize.
+
+    Each ``workers`` entry is an independent agent Node (no ``needs``, so they run
+    concurrently); the ``synthesize`` Node fans every worker in and synthesizes their
+    results into one output. The expander injects the synthesize node's ``needs``
+    (every worker); a worker or the synthesize node declaring its own ``needs`` is
+    rejected. The synthesize node may carry its own ``join`` policy (ADR 0007).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    workers: list[NodeDict] = Field(min_length=1)
+    synthesize: NodeDict
+
+    @field_validator("workers")
+    @classmethod
+    def _workers_must_not_declare_needs(cls, workers: list[NodeDict]) -> list[NodeDict]:
+        return _reject_declared_needs_each(
+            workers,
+            "fan-out-synthesis worker",
+            "workers are independent and run concurrently",
+        )
+
+    @field_validator("synthesize")
+    @classmethod
+    def _synthesize_must_not_declare_needs(cls, synthesize: NodeDict) -> NodeDict:
+        return _reject_declared_needs(
+            synthesize, "fan-out-synthesis synthesize", "the synthesize node fans in every worker"
+        )  # type: ignore[return-value]
+
+
+def _expand_fan_out_synthesis(params: _FanOutSynthesisParams) -> list[NodeDict]:
+    """Emit independent workers and a synthesize node that needs every worker."""
+    nodes: list[NodeDict] = [dict(worker) for worker in params.workers]
+    nodes.append(_fan_in(nodes, params.synthesize))
+    return nodes
+
+
 def expand_pattern(raw: dict[str, Any], source: str) -> dict[str, Any]:
     """Expand a ``pattern:`` block into a plain ``nodes:`` workflow, or pass through.
 
@@ -217,4 +389,22 @@ register_expander(
     _ParallelParams,
     _expand_parallel,
     "independent branches run concurrently, optionally joined downstream",
+)
+register_expander(
+    "classify-and-act",
+    _ClassifyAndActParams,
+    _expand_classify_and_act,
+    "a classifier gates `when`-conditioned branches, optionally joined downstream",
+)
+register_expander(
+    "generate-and-filter",
+    _GenerateAndFilterParams,
+    _expand_generate_and_filter,
+    "parallel generators feed a filter that emits the accepted candidates",
+)
+register_expander(
+    "fan-out-synthesis",
+    _FanOutSynthesisParams,
+    _expand_fan_out_synthesis,
+    "parallel workers fan out, a synthesize node joins their results",
 )

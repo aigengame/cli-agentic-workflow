@@ -286,3 +286,374 @@ def test_a_pipeline_step_declaring_its_own_needs_is_a_config_error() -> None:
         normalize_workflow(raw, source="needs.yaml")
 
     assert "must not declare `needs`" in str(excinfo.value)
+
+
+# --- classify-and-act (#13) --------------------------------------------------
+
+
+def _classify_and_act_raw() -> dict[str, Any]:
+    # A classifier emits a category in its structured_output; each branch entry
+    # carries a `when` that gates on the classifier's output (the sole conditional
+    # mechanism — `path` addresses into structured_output, ADR 0007 / #75); the join
+    # carries an explicit `join: any` policy so it runs when the one taken branch
+    # succeeds and the others skip.
+    return {
+        "name": "triage",
+        "version": 1,
+        "pattern": {
+            "type": "classify-and-act",
+            "classifier": {
+                "id": "classify",
+                "kind": "agent",
+                "inputs": {"adapter": "mock", "prompt": "Classify it", "fixture": "c.json"},
+            },
+            "branches": [
+                {
+                    "id": "handle-bug",
+                    "kind": "shell",
+                    "when": {
+                        "ref": {"node": "classify", "field": "structured_output", "path": ["category"]},
+                        "op": "equals",
+                        "value": "bug",
+                    },
+                    "inputs": {"command": "echo bug"},
+                },
+                {
+                    "id": "handle-feature",
+                    "kind": "shell",
+                    "when": {
+                        "ref": {"node": "classify", "field": "structured_output", "path": ["category"]},
+                        "op": "equals",
+                        "value": "feature",
+                    },
+                    "inputs": {"command": "echo feature"},
+                },
+            ],
+            "join": {
+                "id": "report",
+                "kind": "shell",
+                "join": "any",
+                "inputs": {"command": "echo report"},
+            },
+        },
+    }
+
+
+def test_classify_and_act_expands_into_classifier_gated_branches_and_a_join() -> None:
+    # AC: classify-and-act expands into a classifier node, when-gated branch entry
+    # nodes (each `needs` the classifier so its `when` reads the classifier output),
+    # and a join that `needs` every branch and carries its explicit join policy.
+    workflow = normalize_workflow(_classify_and_act_raw(), source="triage.yaml")
+
+    needs = {node.id: node.needs for node in workflow.nodes}
+    assert needs == {
+        "classify": (),
+        "handle-bug": ("classify",),
+        "handle-feature": ("classify",),
+        "report": ("handle-bug", "handle-feature"),
+    }
+    # The branch `when` gates survived the expansion (the gating is the author's; the
+    # expander only injects `needs`), and the join carries its explicit policy.
+    handle_bug = next(node for node in workflow.nodes if node.id == "handle-bug")
+    assert handle_bug.when is not None
+    report = next(node for node in workflow.nodes if node.id == "report")
+    assert report.join == "any"
+
+
+def test_expanded_classify_and_act_is_identical_to_the_handwritten_equivalent() -> None:
+    # AC: the expanded workflow is the SAME IR as the hand-authored classify -> gated
+    # branches -> join — same snapshot, same checksum, so graph / resume / execution
+    # all operate on it unchanged.
+    pattern_workflow = normalize_workflow(_classify_and_act_raw(), source="pattern.yaml")
+    handwritten = normalize_workflow(
+        {
+            "name": "triage",
+            "version": 1,
+            "nodes": [
+                {
+                    "id": "classify",
+                    "kind": "agent",
+                    "inputs": {"adapter": "mock", "prompt": "Classify it", "fixture": "c.json"},
+                },
+                {
+                    "id": "handle-bug",
+                    "kind": "shell",
+                    "needs": ["classify"],
+                    "when": {
+                        "ref": {"node": "classify", "field": "structured_output", "path": ["category"]},
+                        "op": "equals",
+                        "value": "bug",
+                    },
+                    "inputs": {"command": "echo bug"},
+                },
+                {
+                    "id": "handle-feature",
+                    "kind": "shell",
+                    "needs": ["classify"],
+                    "when": {
+                        "ref": {"node": "classify", "field": "structured_output", "path": ["category"]},
+                        "op": "equals",
+                        "value": "feature",
+                    },
+                    "inputs": {"command": "echo feature"},
+                },
+                {
+                    "id": "report",
+                    "kind": "shell",
+                    "needs": ["handle-bug", "handle-feature"],
+                    "join": "any",
+                    "inputs": {"command": "echo report"},
+                },
+            ],
+        },
+        source="handwritten.yaml",
+    )
+
+    assert workflow_snapshot(pattern_workflow) == workflow_snapshot(handwritten)
+    assert definition_checksum(pattern_workflow) == definition_checksum(handwritten)
+
+
+def test_classify_and_act_without_a_join_expands_classifier_and_gated_branches() -> None:
+    # The join is optional: a classify-and-act with no join is a classifier plus its
+    # gated branches with nothing fanning them in downstream.
+    raw = _classify_and_act_raw()
+    del raw["pattern"]["join"]
+
+    workflow = normalize_workflow(raw, source="triage.yaml")
+
+    needs = {node.id: node.needs for node in workflow.nodes}
+    assert needs == {
+        "classify": (),
+        "handle-bug": ("classify",),
+        "handle-feature": ("classify",),
+    }
+
+
+def test_a_classify_and_act_branch_declaring_its_own_needs_is_a_config_error() -> None:
+    # The expander owns the `needs: [classifier]` injection; a branch declaring its
+    # own `needs` is rejected so the authored shape cannot fight the expansion.
+    raw = _classify_and_act_raw()
+    raw["pattern"]["branches"][0]["needs"] = ["classify"]
+
+    with pytest.raises(WorkflowConfigError) as excinfo:
+        normalize_workflow(raw, source="needs.yaml")
+
+    assert "must not declare `needs`" in str(excinfo.value)
+
+
+def test_a_classify_and_act_classifier_declaring_needs_is_a_config_error() -> None:
+    # The classifier is the entry node; it must not declare `needs`.
+    raw = _classify_and_act_raw()
+    raw["pattern"]["classifier"]["needs"] = ["nope"]
+
+    with pytest.raises(WorkflowConfigError) as excinfo:
+        normalize_workflow(raw, source="needs.yaml")
+
+    assert "must not declare `needs`" in str(excinfo.value)
+
+
+# --- generate-and-filter (#13) -----------------------------------------------
+
+
+def _generate_and_filter_raw() -> dict[str, Any]:
+    # N candidate generators run in parallel (independent, no `needs`); a filter node
+    # `needs` every generator and emits the accepted candidates.
+    return {
+        "name": "brainstorm",
+        "version": 1,
+        "pattern": {
+            "type": "generate-and-filter",
+            "generators": [
+                {
+                    "id": "candidate-1",
+                    "kind": "agent",
+                    "inputs": {"adapter": "mock", "prompt": "Idea 1", "fixture": "g1.json"},
+                },
+                {
+                    "id": "candidate-2",
+                    "kind": "agent",
+                    "inputs": {"adapter": "mock", "prompt": "Idea 2", "fixture": "g2.json"},
+                },
+            ],
+            "filter": {
+                "id": "accept",
+                "kind": "agent",
+                "inputs": {"adapter": "mock", "prompt": "Keep the strong ideas", "fixture": "f.json"},
+            },
+        },
+    }
+
+
+def test_generate_and_filter_expands_into_parallel_generators_and_a_filter() -> None:
+    # AC: generate-and-filter expands into parallel generators (independent, no
+    # `needs`) plus a filter node that `needs` every generator.
+    workflow = normalize_workflow(_generate_and_filter_raw(), source="brainstorm.yaml")
+
+    needs = {node.id: node.needs for node in workflow.nodes}
+    assert needs == {
+        "candidate-1": (),
+        "candidate-2": (),
+        "accept": ("candidate-1", "candidate-2"),
+    }
+
+
+def test_expanded_generate_and_filter_is_identical_to_the_handwritten_equivalent() -> None:
+    pattern_workflow = normalize_workflow(_generate_and_filter_raw(), source="pattern.yaml")
+    handwritten = normalize_workflow(
+        {
+            "name": "brainstorm",
+            "version": 1,
+            "nodes": [
+                {
+                    "id": "candidate-1",
+                    "kind": "agent",
+                    "inputs": {"adapter": "mock", "prompt": "Idea 1", "fixture": "g1.json"},
+                },
+                {
+                    "id": "candidate-2",
+                    "kind": "agent",
+                    "inputs": {"adapter": "mock", "prompt": "Idea 2", "fixture": "g2.json"},
+                },
+                {
+                    "id": "accept",
+                    "kind": "agent",
+                    "needs": ["candidate-1", "candidate-2"],
+                    "inputs": {"adapter": "mock", "prompt": "Keep the strong ideas", "fixture": "f.json"},
+                },
+            ],
+        },
+        source="handwritten.yaml",
+    )
+
+    assert workflow_snapshot(pattern_workflow) == workflow_snapshot(handwritten)
+    assert definition_checksum(pattern_workflow) == definition_checksum(handwritten)
+
+
+def test_a_generate_and_filter_generator_declaring_needs_is_a_config_error() -> None:
+    raw = _generate_and_filter_raw()
+    raw["pattern"]["generators"][0]["needs"] = ["candidate-2"]
+
+    with pytest.raises(WorkflowConfigError) as excinfo:
+        normalize_workflow(raw, source="needs.yaml")
+
+    assert "must not declare `needs`" in str(excinfo.value)
+
+
+def test_a_generate_and_filter_filter_declaring_needs_is_a_config_error() -> None:
+    raw = _generate_and_filter_raw()
+    raw["pattern"]["filter"]["needs"] = ["candidate-1"]
+
+    with pytest.raises(WorkflowConfigError) as excinfo:
+        normalize_workflow(raw, source="needs.yaml")
+
+    assert "must not declare `needs`" in str(excinfo.value)
+
+
+# --- fan-out-synthesis (#13) -------------------------------------------------
+
+
+def _fan_out_synthesis_raw() -> dict[str, Any]:
+    # Parallel agent workers run independently; a synthesize node `needs` every
+    # worker and fans their results into one synthesized output.
+    return {
+        "name": "research",
+        "version": 1,
+        "pattern": {
+            "type": "fan-out-synthesis",
+            "workers": [
+                {
+                    "id": "angle-a",
+                    "kind": "agent",
+                    "inputs": {"adapter": "mock", "prompt": "Angle A", "fixture": "a.json"},
+                },
+                {
+                    "id": "angle-b",
+                    "kind": "agent",
+                    "inputs": {"adapter": "mock", "prompt": "Angle B", "fixture": "b.json"},
+                },
+            ],
+            "synthesize": {
+                "id": "synthesize",
+                "kind": "agent",
+                "inputs": {"adapter": "mock", "prompt": "Synthesize the angles", "fixture": "s.json"},
+            },
+        },
+    }
+
+
+def test_fan_out_synthesis_expands_into_parallel_workers_and_a_synthesize_join() -> None:
+    # AC: fan-out-synthesis expands into parallel agent nodes (independent, no
+    # `needs`) and a synthesize join that `needs` every worker.
+    workflow = normalize_workflow(_fan_out_synthesis_raw(), source="research.yaml")
+
+    needs = {node.id: node.needs for node in workflow.nodes}
+    assert needs == {
+        "angle-a": (),
+        "angle-b": (),
+        "synthesize": ("angle-a", "angle-b"),
+    }
+
+
+def test_expanded_fan_out_synthesis_is_identical_to_the_handwritten_equivalent() -> None:
+    pattern_workflow = normalize_workflow(_fan_out_synthesis_raw(), source="pattern.yaml")
+    handwritten = normalize_workflow(
+        {
+            "name": "research",
+            "version": 1,
+            "nodes": [
+                {
+                    "id": "angle-a",
+                    "kind": "agent",
+                    "inputs": {"adapter": "mock", "prompt": "Angle A", "fixture": "a.json"},
+                },
+                {
+                    "id": "angle-b",
+                    "kind": "agent",
+                    "inputs": {"adapter": "mock", "prompt": "Angle B", "fixture": "b.json"},
+                },
+                {
+                    "id": "synthesize",
+                    "kind": "agent",
+                    "needs": ["angle-a", "angle-b"],
+                    "inputs": {"adapter": "mock", "prompt": "Synthesize the angles", "fixture": "s.json"},
+                },
+            ],
+        },
+        source="handwritten.yaml",
+    )
+
+    assert workflow_snapshot(pattern_workflow) == workflow_snapshot(handwritten)
+    assert definition_checksum(pattern_workflow) == definition_checksum(handwritten)
+
+
+def test_fan_out_synthesis_synthesize_may_carry_a_join_policy() -> None:
+    # The synthesize node carries the same node fields a hand-authored node has, so a
+    # `join: any` policy (tolerate a skipped worker, ADR 0007) reaches it unchanged.
+    raw = _fan_out_synthesis_raw()
+    raw["pattern"]["synthesize"]["join"] = "any"
+
+    workflow = normalize_workflow(raw, source="research.yaml")
+
+    synthesize = next(node for node in workflow.nodes if node.id == "synthesize")
+    assert synthesize.join == "any"
+    assert synthesize.needs == ("angle-a", "angle-b")
+
+
+def test_a_fan_out_synthesis_worker_declaring_needs_is_a_config_error() -> None:
+    raw = _fan_out_synthesis_raw()
+    raw["pattern"]["workers"][0]["needs"] = ["angle-b"]
+
+    with pytest.raises(WorkflowConfigError) as excinfo:
+        normalize_workflow(raw, source="needs.yaml")
+
+    assert "must not declare `needs`" in str(excinfo.value)
+
+
+def test_a_fan_out_synthesis_synthesize_declaring_needs_is_a_config_error() -> None:
+    raw = _fan_out_synthesis_raw()
+    raw["pattern"]["synthesize"]["needs"] = ["angle-a"]
+
+    with pytest.raises(WorkflowConfigError) as excinfo:
+        normalize_workflow(raw, source="needs.yaml")
+
+    assert "must not declare `needs`" in str(excinfo.value)
