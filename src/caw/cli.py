@@ -34,6 +34,13 @@ from typing import Annotated, Any
 import typer
 
 from caw.config import WorkflowConfigError, load_workflow_file
+from caw.controller import (
+    ControllerError,
+    GroupResult,
+    load_controller_spec,
+    resume_loop_until_done,
+    run_loop_until_done,
+)
 from caw.executor import (
     SKIP_ALL_BRANCHES_SKIPPED,
     SKIP_BLOCKED,
@@ -46,7 +53,7 @@ from caw.executor import (
 )
 from caw.model import Node, Predicate, Workflow, execution_order, normalize_workflow
 from caw.patterns import expander_names, get_expander
-from caw.report import ReportFormat, render_report
+from caw.report import GroupReportError, ReportFormat, render_group_report, render_report
 from caw.runlayout import run_dir, runs_root
 from caw.scaffold import PATTERN_EXAMPLES, STARTER_WORKFLOW
 
@@ -436,3 +443,101 @@ def report(
         )
         raise typer.Exit(code=2)
     typer.echo(render_report(directory, format))
+
+
+loop_app = typer.Typer(
+    name="loop",
+    help="Run, resume, and report a loop-until-done Run Group (a Pattern Controller).",
+    no_args_is_help=True,
+)
+app.add_typer(loop_app)
+
+
+def _report_group_and_exit(result: GroupResult) -> None:
+    """Print a Run Group's outcome and exit on its stop reason (ADR 0009).
+
+    Mirrors the single-run exit contract: the loop reaching ``done`` or stopping at
+    ``exhausted`` (max iterations) is a successful drive (exit 0); a constituent Run
+    that ``failed`` exits 1, matching ``caw run``'s failed-Run contract. Each
+    iteration's run id is named so a user can drill into one with ``caw report``.
+    """
+    typer.echo(
+        f"run group {result.group_id}: {result.status} ({len(result.iterations)} iterations)"
+    )
+    for iteration in result.iterations:
+        outcome = "succeeded" if iteration.succeeded else "failed"
+        typer.echo(f"  iteration {iteration.iteration_index} ({iteration.run_id}): {outcome}")
+    if result.status == "failed":
+        raise typer.Exit(code=1)
+
+
+@loop_app.command("run")
+def loop_run(spec_file: Path) -> None:
+    """Run a loop-until-done Run Group from a controller spec file.
+
+    Materializes each iteration as a separate immutable Run, feeding the prior
+    iteration's output forward, until the done-predicate holds, an iteration fails,
+    or ``max_iterations`` is reached. Exit codes mirror ``caw run``: 0 (group done
+    or exhausted), 1 (a constituent Run failed), 2 (an invalid spec), 3 (infra).
+    """
+    try:
+        spec = load_controller_spec(spec_file)
+    except WorkflowConfigError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    try:
+        result = asyncio.run(run_loop_until_done(spec, base=Path.cwd()))
+    except ControllerError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    except WorkflowConfigError as exc:
+        # An iteration workflow that fails to normalize is a config-class refusal.
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    except (OSError, sqlite3.Error) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=3) from exc
+    _report_group_and_exit(result)
+
+
+@loop_app.command("resume")
+def loop_resume(group_id: str) -> None:
+    """Resume an interrupted Run Group, continuing without re-running completed iterations.
+
+    The Run Group is the resumption unit (ADR 0002): a succeeded iteration is never
+    re-run. An unknown or already-finished group is refused as a config-class error
+    (exit 2). Otherwise the exit contract mirrors ``caw loop run``.
+    """
+    try:
+        result = asyncio.run(resume_loop_until_done(group_id, base=Path.cwd()))
+    except ControllerError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    except WorkflowConfigError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    except (OSError, sqlite3.Error) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=3) from exc
+    _report_group_and_exit(result)
+
+
+@loop_app.command("report")
+def loop_report(
+    group_id: str,
+    format: Annotated[
+        ReportFormat,
+        typer.Option(help="Render the aggregate report as JSON, JSONL, text, or markdown."),
+    ] = ReportFormat.json,
+) -> None:
+    """Render an aggregate report of a Run Group from persisted State and Events.
+
+    Aggregates every iteration into one result (AC6), never re-executing. An unknown
+    group id is refused as a config-class error (exit 2) with one ``error:`` line.
+    """
+    try:
+        rendered = render_group_report(group_id, Path.cwd(), format)
+    except GroupReportError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    typer.echo(rendered)
