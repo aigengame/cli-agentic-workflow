@@ -261,11 +261,13 @@ example of any shipped pattern with `caw patterns init <name>`.
 | Classify and act | Classifier routes to one of several `when`-gated branches | ✅ now |
 | Generate and filter | N candidate generators, then a scoring/validation filter | ✅ now |
 | Fan-out synthesis | Parallel agents, then a synthesis node (the reference sample runs `claude.print` and `codex.exec` side by side) | ✅ now |
-| Adversarial verification | Generator + verifiers, with accept / reject / regenerate | ✅ now |
-| Tournament | Rounds or brackets with winner promotion and comparison evidence | ✅ now |
-| Loop until done | Iterates immutable runs in a Run Group until the done Predicate holds | ✅ now |
 
-### Run Groups and the loop-until-done controller
+These are pattern **expanders** (`pattern:` blocks scaffolded by `caw patterns init`). The
+iterative **pattern controllers** — loop-until-done, adversarial verification, and
+tournament — are a distinct axis ([ADR 0009](docs/adr/0009-pattern-controller-infrastructure.md))
+and live in the next section, not the `caw patterns init` registry.
+
+### Run Groups and pattern controllers
 
 Iterative patterns are realized by a **pattern controller**, a distinct axis from pattern
 expanders ([ADR 0009](docs/adr/0009-pattern-controller-infrastructure.md)): an expander
@@ -301,6 +303,16 @@ input (not string templating). Drive and inspect a Run Group with:
 - `caw loop resume <group-id>` — resume an interrupted group without re-running completed
   iterations (the Run Group is the resumption unit; a succeeded iteration is never re-run).
 - `caw loop report <group-id>` — aggregate every iteration into one report.
+
+Two further controllers ship on the same Run Group infrastructure, each driven from its own
+controller spec file and exposing the same `init` / `run` / `resume` / `report` commands as
+`caw loop`:
+
+- **Adversarial verification** (`caw verify`) — runs a generator, then verifier nodes, and
+  **accepts**, **rejects**, or feeds verifier feedback into a regeneration run, until an
+  accept (or optional reject) Predicate holds or the round cap is reached.
+- **Tournament** (`caw tournament`) — runs candidates in rounds, promotes each round's
+  winner into the next, and reports the final winner with per-round comparison evidence.
 
 ## Positioning
 
