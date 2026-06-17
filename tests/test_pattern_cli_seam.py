@@ -127,7 +127,14 @@ def test_patterns_list_lists_the_registered_built_in_patterns() -> None:
 
 
 @pytest.mark.parametrize(
-    ("pattern", "filename"), [("pipeline", "pipeline.yaml"), ("parallel", "parallel.yaml")]
+    ("pattern", "filename"),
+    [
+        ("pipeline", "pipeline.yaml"),
+        ("parallel", "parallel.yaml"),
+        ("classify-and-act", "classify-and-act.yaml"),
+        ("generate-and-filter", "generate-and-filter.yaml"),
+        ("fan-out-synthesis", "fan-out-synthesis.yaml"),
+    ],
 )
 def test_patterns_init_scaffolds_an_example_that_validates_and_runs_to_success(
     pattern: str, filename: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -150,6 +157,45 @@ def test_patterns_init_scaffolds_an_example_that_validates_and_runs_to_success(
     ran = runner.invoke(app, ["run", str(example)])
     assert ran.exit_code == 0, ran.output
     assert "succeeded" in ran.output
+
+
+def test_generate_and_filter_example_filter_emits_accepted_candidates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # AC: generate-and-filter expands into parallel generators plus a FILTER NODE
+    # EMITTING ACCEPTED CANDIDATES. Asserting the run merely "succeeded" is too weak —
+    # a fixture regressed to `{}` would still succeed. So scaffold and run the example
+    # offline, then read the persisted State through `caw report --format json` and
+    # assert the `accept` filter node actually emitted the accepted candidates in its
+    # structured_output. This fails if the filter stops emitting them.
+    monkeypatch.chdir(tmp_path)
+
+    scaffolded = runner.invoke(app, ["patterns", "init", "generate-and-filter"])
+    assert scaffolded.exit_code == 0, scaffolded.output
+
+    ran = runner.invoke(app, ["run", "generate-and-filter.yaml"])
+    assert ran.exit_code == 0, ran.output
+    assert "succeeded" in ran.output
+
+    # The run-level line is `run <run_id> succeeded`; pull the run id from it so the
+    # report reads the same persisted Run.
+    run_line = next(
+        line for line in ran.output.splitlines() if line.startswith("run ") and "succeeded" in line
+    )
+    run_id = run_line.split()[1]
+
+    report = runner.invoke(app, ["report", run_id, "--format", "json"])
+    assert report.exit_code == 0, report.output
+    conclusion = json.loads(report.output)
+
+    accept = next(node for node in conclusion["nodes"] if node["id"] == "accept")
+    assert accept["status"] == "succeeded", "the filter node ran to success"
+    structured = accept["structured_output"]
+    assert structured is not None, "the filter persisted a structured_output"
+    assert "accepted" in structured, "the filter emits an `accepted` field of candidates"
+    assert structured["accepted"] == ["approach one"], (
+        "the filter emits the accepted candidates, not an empty/degenerate output"
+    )
 
 
 def test_patterns_init_to_an_explicit_path_writes_there(
