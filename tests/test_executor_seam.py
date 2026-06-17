@@ -105,6 +105,111 @@ async def test_a_parked_run_is_not_reported_succeeded(tmp_path: Path) -> None:
     )
 
 
+@pytest.mark.asyncio
+async def test_approving_a_parked_gate_resumes_and_runs_downstream(tmp_path: Path) -> None:
+    # `caw resume --approve <gate>` flips the awaiting gate to succeeded and resumes
+    # through the existing seed-satisfied path (#10, ADR 0010): the gate's downstream
+    # now runs, the Run succeeds, and the approval is recorded as a gate_approved
+    # Event and an `{"approved": true}` node output.
+    runs_root = tmp_path / "runs"
+    parked = await execute_run(gated_workflow(), runs_root)
+    assert parked.status == "parked"
+
+    resumed = await resume_run(parked.run_id, runs_root, approvals=("gate",))
+
+    assert resumed.status == "succeeded"
+    assert "deploy" in {node.node_id for node in resumed.node_results}, (
+        "the approved gate's downstream runs"
+    )
+    run_dir = single_run_dir(runs_root)
+    statuses = {
+        row["node_id"]: row["status"]
+        for row in state_rows(run_dir, "SELECT node_id, status FROM node")
+    }
+    assert statuses["gate"] == "succeeded"
+    assert statuses["deploy"] == "succeeded"
+    events = read_events(run_dir)
+    assert any(
+        event["type"] == "gate_approved" and event["data"]["node_id"] == "gate" for event in events
+    )
+
+
+@pytest.mark.asyncio
+async def test_rejecting_a_parked_gate_ends_the_run(tmp_path: Path) -> None:
+    # `caw resume --reject <gate>` ends the Run via deliberate termination (#10,
+    # ADR 0010): the gate and Run go `rejected`, downstream never runs, the Run is
+    # not resumable, and a gate_rejected Event is recorded.
+    runs_root = tmp_path / "runs"
+    parked = await execute_run(gated_workflow(), runs_root)
+    assert parked.status == "parked"
+
+    rejected = await resume_run(parked.run_id, runs_root, rejections=("gate",))
+
+    assert rejected.status == "rejected"
+    assert rejected.succeeded is False
+    assert "deploy" not in {node.node_id for node in rejected.node_results}, (
+        "a rejected run never runs the gated downstream"
+    )
+    run_dir = single_run_dir(runs_root)
+    statuses = {
+        row["node_id"]: row["status"]
+        for row in state_rows(run_dir, "SELECT node_id, status FROM node")
+    }
+    assert statuses["gate"] == "rejected"
+    assert "deploy" not in statuses, "an unreached node has no row"
+    assert state_rows(run_dir, "SELECT status FROM run")[0]["status"] == "rejected"
+
+    with pytest.raises(ResumeError):
+        await resume_run(parked.run_id, runs_root)
+
+    events = read_events(run_dir)
+    assert any(
+        event["type"] == "gate_rejected" and event["data"]["node_id"] == "gate" for event in events
+    )
+
+
+@pytest.mark.asyncio
+async def test_duplicate_approve_is_idempotent(tmp_path: Path) -> None:
+    # A repeated --approve for the same gate must not crash on the attempt PK or
+    # partially mutate State: duplicate decision ids are de-duplicated before any
+    # write (#10 review).
+    runs_root = tmp_path / "runs"
+    parked = await execute_run(gated_workflow(), runs_root)
+
+    resumed = await resume_run(parked.run_id, runs_root, approvals=("gate", "gate"))
+
+    assert resumed.status == "succeeded"
+    assert "deploy" in {node.node_id for node in resumed.node_results}
+
+
+@pytest.mark.asyncio
+async def test_duplicate_reject_is_idempotent(tmp_path: Path) -> None:
+    # A repeated --reject collapses to a single rejection: one gate_rejected Event
+    # and one entry in rejected_node_ids, no duplication (#10 review).
+    runs_root = tmp_path / "runs"
+    parked = await execute_run(gated_workflow(), runs_root)
+
+    result = await resume_run(parked.run_id, runs_root, rejections=("gate", "gate"))
+
+    assert result.status == "rejected"
+    assert result.rejected_node_ids == ("gate",), "duplicate rejects collapse to one"
+    events = read_events(single_run_dir(runs_root))
+    assert len([e for e in events if e["type"] == "gate_rejected"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_reject_dominates_a_co_named_approve(tmp_path: Path) -> None:
+    # Any --reject ends the run, so a co-named --approve for the same gate does not
+    # save it (#10, ADR 0010): the run is rejected and the downstream never runs.
+    runs_root = tmp_path / "runs"
+    parked = await execute_run(gated_workflow(), runs_root)
+
+    result = await resume_run(parked.run_id, runs_root, approvals=("gate",), rejections=("gate",))
+
+    assert result.status == "rejected"
+    assert "deploy" not in {node.node_id for node in result.node_results}
+
+
 def test_rejected_and_succeeded_runs_are_not_resumable() -> None:
     # ADR 0010 Resume Eligibility: a `rejected` Run is refused like `succeeded`; a
     # `parked` Run, by contrast, is resumable (advanced by approve/reject), and the

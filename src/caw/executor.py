@@ -31,6 +31,7 @@ from caw.model import (
 from caw.predicate import evaluate_predicate
 from caw.state import StateStore
 from caw.status import (
+    AWAITING,
     ERRORED,
     FAILED,
     PARKED,
@@ -173,6 +174,10 @@ class RunResult:
     non-empty set means the Run did not finish — it parked at the scheduler
     fixpoint awaiting approval — and its ``status`` is ``parked`` regardless of how
     the already-run Nodes fared.
+
+    ``rejected_node_ids`` names the human_gate Nodes a human declined (#10): a
+    non-empty set means the Run was ENDED by a rejection — a decided ``rejected``
+    terminal, distinct from a failure — and its ``status`` is ``rejected``.
     """
 
     run_id: str
@@ -181,6 +186,7 @@ class RunResult:
     skipped_blockers: Mapping[str, str] = field(default_factory=dict)
     skipped_causes: Mapping[str, str] = field(default_factory=dict)
     awaiting_node_ids: tuple[str, ...] = ()
+    rejected_node_ids: tuple[str, ...] = ()
 
     @property
     def parked(self) -> bool:
@@ -188,12 +194,17 @@ class RunResult:
         return bool(self.awaiting_node_ids)
 
     @property
+    def rejected(self) -> bool:
+        """Whether a human declined a gate and ended the Run as `rejected` (#10)."""
+        return bool(self.rejected_node_ids)
+
+    @property
     def succeeded(self) -> bool:
-        # A parked Run is NOT a successful terminal — it awaits approval (#10) — so
-        # it is never `succeeded` even though its already-run Nodes all succeeded.
-        # This keeps consumers that branch on `succeeded` (e.g. Pattern Controllers)
-        # from treating a parked iteration as a finished success.
-        if self.parked:
+        # Neither a parked Run (awaiting approval) nor a rejected Run (a decided
+        # human "no") is a successful terminal (#10), even though a parked run's
+        # already-run Nodes all succeeded. This keeps consumers that branch on
+        # `succeeded` (e.g. Pattern Controllers) from misclassifying either.
+        if self.parked or self.rejected:
             return False
         # A Run fails iff an ATTEMPTED Node failed. A failure-driven (`blocked`)
         # skip always coincides with a failed Node already in `node_results`, so
@@ -204,8 +215,10 @@ class RunResult:
 
     @property
     def status(self) -> RunStatus:
-        # A parked Run is neither succeeded nor failed — it is awaiting approval, so
-        # `parked` takes precedence over the run-down node outcomes (#10).
+        # A rejected Run ended on a human "no"; a parked Run awaits approval. Both
+        # take precedence over the run-down node outcomes (#10, ADR 0010).
+        if self.rejected:
+            return REJECTED
         if self.parked:
             return PARKED
         return SUCCEEDED if self.succeeded else FAILED
@@ -1228,9 +1241,27 @@ def _load_resume_workflow(run_dir: Path, registry: AdapterRegistry) -> Workflow:
 
 
 async def resume_run(
-    run_id: str, runs_root: Path, registry: AdapterRegistry | None = None
+    run_id: str,
+    runs_root: Path,
+    registry: AdapterRegistry | None = None,
+    *,
+    approvals: tuple[str, ...] = (),
+    rejections: tuple[str, ...] = (),
 ) -> RunResult:
-    """Resume an interrupted or failed Run, re-running only its incomplete Nodes (#6).
+    """Resume a Run: re-run an interrupted/failed Run's incomplete Nodes, or advance a
+    parked Run by approving or declining its awaiting Human Gates (#6, #10).
+
+    A ``parked`` Run is resumable even though nothing failed — its Await is advanced
+    by ``approvals``/``rejections``, not by re-running completed work; a ``succeeded``
+    or ``rejected`` Run is a decided terminal and is refused (Resume Eligibility).
+
+    ``approvals`` names human_gate Nodes to approve (#10, ADR 0010): each must be an
+    awaiting gate, and is flipped ``awaiting`` -> ``succeeded`` before classification
+    so the existing seed-satisfied path unlocks its dependents. A gate left awaiting
+    re-parks. ``rejections`` names gates to decline: any rejection ENDS the Run as
+    ``rejected`` (a decided terminal, not resumable), so a co-named approval does not
+    save it and the gated downstream never runs. Approving or rejecting a Node that
+    is not an awaiting gate is a ``ResumeError``.
 
     Reopens the EXISTING run directory ``runs_root/<run_id>`` (a ``ResumeError`` if
     absent or if the Run already succeeded), reconstructs the Workflow from the
@@ -1275,6 +1306,53 @@ async def resume_run(
                 f"not forward-compatible with this version"
             )
         node_statuses = state.node_statuses(run_id)
+        # Duplicate decision ids collapse to one, order-preserving, so a repeated
+        # --approve/--reject for a gate is idempotent rather than crashing on the
+        # attempt PK or double-recording the rejection (#10 review).
+        approvals = tuple(dict.fromkeys(approvals))
+        rejections = tuple(dict.fromkeys(rejections))
+        # Human Gate decisions (#10, ADR 0010): validate every named Node is an
+        # awaiting gate BEFORE any State mutation (all-or-nothing).
+        for node_id in (*approvals, *rejections):
+            if node_statuses.get(node_id) != AWAITING:
+                raise ResumeError(
+                    f"cannot approve or reject node {node_id!r}: it is not an awaiting human "
+                    f"gate (status: {node_statuses.get(node_id) or 'unknown'})"
+                )
+        # A rejection ENDS the Run: any --reject drives its gate(s) and the Run to
+        # `rejected` and terminates here, so a co-named --approve does not save it.
+        # This is the narrow exception to the shared finalization seam: a rejected
+        # parked Run has no Nodes to execute and none in flight to tear down, so it
+        # finalizes DIRECTLY to `rejected` rather than routing through `_drive_scheduler`
+        # (which runs the scheduler) or `_finalize_crashed_run` (which records
+        # `errored`). It is ADR 0010's deliberate-termination realized as a clean direct
+        # finalize; the gated downstream never executes, and `rejected` is a decided
+        # terminal refused by Resume Eligibility (is_resumable).
+        if rejections:
+            now = _now()
+            for node_id in rejections:
+                state.record_node_finished(run_id=run_id, node_id=node_id, status=REJECTED)
+                events.append("gate_rejected", {"node_id": node_id})
+            state.record_run_finished(run_id=run_id, status=REJECTED, finished_at=now)
+            events.append("run_finished", {"status": REJECTED})
+            return RunResult(run_id=run_id, node_results=(), rejected_node_ids=tuple(rejections))
+        # Approvals flip `awaiting` -> `succeeded` with an `{"approved": true}` output
+        # and a gate_approved Event, so the seed-satisfied classification below
+        # unlocks their dependents. A gate left unnamed stays `awaiting` and re-parks.
+        for node_id in approvals:
+            now = _now()
+            state.record_attempt(
+                run_id=run_id,
+                node_id=node_id,
+                attempt=1,
+                started_at=now,
+                finished_at=now,
+                exit_status=0,
+                output={"approved": True},
+            )
+            state.record_node_finished(run_id=run_id, node_id=node_id, status=SUCCEEDED)
+            events.append("gate_approved", {"node_id": node_id})
+            node_statuses[node_id] = SUCCEEDED
         max_attempts = state.max_attempt_per_node(run_id)
         # A `succeeded` Node is done; every other recorded Node is re-run. A re-run
         # Node continues numbering past its recorded Attempts so the attempt PK

@@ -432,6 +432,13 @@ def _report_and_exit(result: RunResult, workflow_label: str) -> None:
             typer.echo(_failure_line(workflow_label, node_result))
             if node_result.stderr:
                 _echo_stderr_excerpt(node_result)
+    if result.rejected:
+        # A human declined a gate, ending the run as `rejected` — a decided "no",
+        # distinct from a failure (#10, ADR 0010). Exit 1: not a successful terminal.
+        for node_id in result.rejected_node_ids:
+            typer.echo(f"node {node_id} rejected")
+        typer.echo(f"run {result.run_id} rejected")
+        raise typer.Exit(code=1)
     if result.parked:
         # A parked Run is neither succeeded nor failed: it awaits approval at one or
         # more human gates (#10, ADR 0010). Name the awaiting gates and exit 0 — a
@@ -461,16 +468,47 @@ def run(workflow_file: Path) -> None:
 
 
 @app.command()
-def resume(run_id: str) -> None:
-    """Resume an interrupted or failed run, re-running only its incomplete nodes.
+def resume(
+    run_id: str,
+    approve: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--approve",
+            help="Approve an awaiting human gate by node id (repeatable).",
+        ),
+    ] = None,
+    reject: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--reject",
+            help="Reject an awaiting human gate by node id, ending the run (repeatable).",
+        ),
+    ] = None,
+) -> None:
+    """Resume a run: re-run an interrupted/failed run's incomplete nodes, or advance a
+    parked run by approving or declining its awaiting human gates.
 
-    Mirrors ``run``'s output and exit-code contract: 0 on success, 1 on a failed
-    node, 3 on an infrastructure error. An unknown run id or a run that already
-    succeeded is not resumable and is refused as a config-class error (exit 2)
-    with a single ``error:`` line, never re-executing it.
+    Mirrors ``run``'s output and exit-code contract: 0 on success (or a clean park),
+    1 on a failed node or a rejected run, 3 on an infrastructure error. An unknown
+    run id or a run that already succeeded or was rejected is not resumable and is
+    refused as a config-class error (exit 2) with a single ``error:`` line, never
+    re-executing it.
+
+    ``--approve <node-id>`` advances a parked run by approving an awaiting human
+    gate (#10); a gate left unnamed re-parks. ``--reject <node-id>`` ends the run
+    as rejected (exit 1); any rejection ends it, so a co-named approval does not
+    save it. Approving or rejecting a node that is not an awaiting gate is the same
+    config-class refusal (exit 2).
     """
     try:
-        result = asyncio.run(resume_run(run_id, runs_root()))
+        result = asyncio.run(
+            resume_run(
+                run_id,
+                runs_root(),
+                approvals=tuple(approve or ()),
+                rejections=tuple(reject or ()),
+            )
+        )
     except ResumeError as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=2) from exc

@@ -1450,3 +1450,68 @@ def test_run_parking_at_a_human_gate_exits_zero_and_reports_parked(
     assert "parked" in result.output
     assert "gate" in result.output
     assert "succeeded" not in result.output, "a parked run is not reported succeeded"
+
+
+def _gated_workflow_data() -> dict[str, Any]:
+    """A build -> human_gate -> deploy workflow for the CLI gate tests."""
+    return {
+        "name": "gated",
+        "version": 1,
+        "nodes": [
+            {"id": "build", "kind": "shell", "inputs": {"command": "echo built"}},
+            {
+                "id": "gate",
+                "kind": "human_gate",
+                "needs": ["build"],
+                "inputs": {"prompt": "Approve?"},
+            },
+            {
+                "id": "deploy",
+                "kind": "shell",
+                "needs": ["gate"],
+                "inputs": {"command": "echo deployed"},
+            },
+        ],
+    }
+
+
+def test_resume_approve_runs_the_gated_downstream(
+    write_workflow_data: Callable[[dict[str, Any]], Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # `caw resume <run-id> --approve <gate>` advances a parked run: the gate's
+    # downstream runs and the run succeeds (#10, ADR 0010).
+    workflow_file = write_workflow_data(_gated_workflow_data())
+    monkeypatch.chdir(tmp_path)
+    parked = runner.invoke(app, ["run", str(workflow_file)])
+    assert parked.exit_code == 0, parked.output
+    run_id = next((tmp_path / ".caw" / "runs").iterdir()).name
+
+    resumed = runner.invoke(app, ["resume", run_id, "--approve", "gate"])
+
+    assert resumed.exit_code == 0, resumed.output
+    assert "succeeded" in resumed.output
+    assert "node deploy attempt 1 exited 0" in resumed.output
+
+
+def test_resume_reject_ends_the_run(
+    write_workflow_data: Callable[[dict[str, Any]], Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # `caw resume <run-id> --reject <gate>` ends a parked run as rejected: exit 1
+    # (a non-success terminal), the rejection is reported, and the gated downstream
+    # never runs (#10, ADR 0010).
+    workflow_file = write_workflow_data(_gated_workflow_data())
+    monkeypatch.chdir(tmp_path)
+    parked = runner.invoke(app, ["run", str(workflow_file)])
+    assert parked.exit_code == 0, parked.output
+    run_id = next((tmp_path / ".caw" / "runs").iterdir()).name
+
+    rejected = runner.invoke(app, ["resume", run_id, "--reject", "gate"])
+
+    assert rejected.exit_code == 1, rejected.output
+    assert "rejected" in rejected.output
+    assert "deploy" not in rejected.output, "a rejected run never runs the gated downstream"
+    assert "succeeded" not in rejected.output
