@@ -584,6 +584,7 @@ class _Scheduler:
         satisfied_seed: Mapping[str, str] | None = None,
         attempt_seed: Mapping[str, int] | None = None,
         started_seed: set[str] | None = None,
+        awaiting_seed: set[str] | None = None,
     ) -> None:
         self._state = state
         self._events = events
@@ -619,6 +620,11 @@ class _Scheduler:
         # so the Run reaches a fixpoint and parks rather than running past the gate
         # (#10, ADR 0010).
         self._awaiting: set[str] = set()
+        # Gates already `awaiting` from a prior parked Run (seeded on resume): a gate
+        # in this set that re-parks is a CONTINUATION, not a new park, so it re-records
+        # `awaiting` silently and does NOT re-emit gate_awaiting — the trace marks the
+        # entry into awaiting once, not on every resume (#10).
+        self._awaiting_already: set[str] = set(awaiting_seed or ())
         # Per-Node Attempt bookkeeping for the in-run retry loop (#6). ``_attempt``
         # is the Attempt NUMBER the next launch of a Node uses, so re-launched
         # Nodes write distinct ``attempt`` rows ((run_id, node_id, attempt) is the
@@ -753,7 +759,11 @@ class _Scheduler:
             return
         self._state.record_node_awaiting(run_id=self._run_id, node_id=node.id)
         self._awaiting.add(node.id)
-        self._events.append("gate_awaiting", {"node_id": node.id})
+        # Emit gate_awaiting only on the FIRST park — a fresh run, or a gate newly
+        # reached during this resume. A gate already awaiting from a prior parked Run
+        # re-parks silently: it never left awaiting, so the trace marks the entry once.
+        if node.id not in self._awaiting_already:
+            self._events.append("gate_awaiting", {"node_id": node.id})
 
     def _record_attempt(self, node: Node, result: NodeResult) -> None:
         """Record one Attempt's outcome in State and the Event trace.
@@ -1306,6 +1316,9 @@ async def resume_run(
                 f"not forward-compatible with this version"
             )
         node_statuses = state.node_statuses(run_id)
+        # Gates already awaiting before this resume: an unapproved one re-parks as a
+        # CONTINUATION, so the scheduler must not re-emit gate_awaiting for it (#10).
+        awaiting_before = {nid for nid, status in node_statuses.items() if status == AWAITING}
         # Duplicate decision ids collapse to one, order-preserving, so a repeated
         # --approve/--reject for a gate is idempotent rather than crashing on the
         # attempt PK or double-recording the rejection (#10 review).
@@ -1380,5 +1393,6 @@ async def resume_run(
             satisfied_seed=satisfied,
             attempt_seed=attempt_seed,
             started_seed=started_seed,
+            awaiting_seed=awaiting_before,
         )
         return await _drive_scheduler(scheduler, state, events, run_id)
