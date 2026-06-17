@@ -94,9 +94,9 @@ def _echo_stderr_excerpt(node_result: NodeResult) -> None:
 def _version_callback(value: bool) -> None:
     """Print the caw version and exit before any subcommand runs.
 
-    Eager so `caw --version` short-circuits parsing: it reports the version
-    resolved from the installed dist metadata (`caw.__version__`, derived from
-    pyproject.toml) and exits 0 without requiring a subcommand (#113).
+    Eager so `caw --version` short-circuits parsing: it reads `caw.__version__`
+    (the release-please-maintained version literal, ADR 0005 -- it does not compute
+    a version) and exits 0 without requiring a subcommand (#113).
     """
     if value:
         typer.echo(f"caw {__version__}")
