@@ -1515,3 +1515,39 @@ def test_resume_reject_ends_the_run(
     assert "rejected" in rejected.output
     assert "deploy" not in rejected.output, "a rejected run never runs the gated downstream"
     assert "succeeded" not in rejected.output
+
+
+def test_run_in_a_tty_prompts_and_approves_inline(
+    write_workflow_data: Callable[[dict[str, Any]], Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # In an attended (TTY) session, `caw run` prompts at the gate inline; answering
+    # yes approves it and the run continues to success without a separate
+    # `caw resume` (#10, ADR 0010).
+    workflow_file = write_workflow_data(_gated_workflow_data())
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("caw.cli._is_attended", lambda: True)
+
+    result = runner.invoke(app, ["run", str(workflow_file)], input="y\n")
+
+    assert result.exit_code == 0, result.output
+    assert "succeeded" in result.output
+    assert "node deploy attempt 1 exited 0" in result.output
+
+
+def test_run_in_a_tty_declines_and_rejects_inline(
+    write_workflow_data: Callable[[dict[str, Any]], Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Declining at the inline prompt rejects the gate and ends the run (exit 1).
+    workflow_file = write_workflow_data(_gated_workflow_data())
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("caw.cli._is_attended", lambda: True)
+
+    result = runner.invoke(app, ["run", str(workflow_file)], input="n\n")
+
+    assert result.exit_code == 1, result.output
+    assert "rejected" in result.output
+    assert "deploy" not in result.output

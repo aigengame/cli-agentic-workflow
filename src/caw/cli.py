@@ -27,6 +27,7 @@ id, State, and Events trace.
 import asyncio
 import json
 import sqlite3
+import sys
 from collections.abc import Coroutine
 from enum import StrEnum
 from pathlib import Path
@@ -60,7 +61,14 @@ from caw.executor import (
     execute_run,
     resume_run,
 )
-from caw.model import Node, Predicate, Workflow, execution_order, normalize_workflow
+from caw.model import (
+    HumanGateNodeInputs,
+    Node,
+    Predicate,
+    Workflow,
+    execution_order,
+    normalize_workflow,
+)
 from caw.patterns import expander_names, get_expander
 from caw.report import GroupReportError, ReportFormat, render_group_report, render_report
 from caw.runlayout import run_dir, runs_root
@@ -455,12 +463,53 @@ def _report_and_exit(result: RunResult, workflow_label: str) -> None:
     typer.echo(f"run {result.run_id} succeeded")
 
 
+def _is_attended() -> bool:
+    """Whether this is an interactive (TTY) session that can prompt at a human gate (#10)."""
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def _drive_tty_gates(result: RunResult, gate_prompts: dict[str, str | None]) -> RunResult:
+    """In an attended session, prompt at each awaiting gate and advance the run (#10).
+
+    A parked run in a TTY prompts inline for every awaiting gate — yes approves it, no
+    rejects it (and any rejection ends the run, ADR 0010) — then resumes with the
+    decisions, looping until the run reaches a terminal (or a rejection ends it). In a
+    non-TTY session the run stays parked for `caw resume`, so this is a no-op.
+    """
+    while result.parked and _is_attended():
+        approvals: list[str] = []
+        rejections: list[str] = []
+        for node_id in result.awaiting_node_ids:
+            prompt = gate_prompts.get(node_id) or f"Approve gate {node_id!r}?"
+            (approvals if typer.confirm(prompt) else rejections).append(node_id)
+        result = asyncio.run(
+            resume_run(
+                result.run_id,
+                runs_root(),
+                approvals=tuple(approvals),
+                rejections=tuple(rejections),
+            )
+        )
+    return result
+
+
 @app.command()
 def run(workflow_file: Path) -> None:
-    """Run a workflow file and print a plain-text result."""
+    """Run a workflow file and print a plain-text result.
+
+    In an attended (TTY) session a human_gate prompts inline (#10): yes approves it and
+    the run continues, no rejects it and ends the run. In a non-TTY session the run
+    parks for `caw resume`.
+    """
     workflow = _load_normalized_workflow(workflow_file)
+    gate_prompts: dict[str, str | None] = {
+        node.id: node.inputs.prompt
+        for node in workflow.nodes
+        if isinstance(node.inputs, HumanGateNodeInputs)
+    }
     try:
         result = asyncio.run(execute_run(workflow, runs_root()))
+        result = _drive_tty_gates(result, gate_prompts)
     except (OSError, sqlite3.Error) as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=3) from exc
