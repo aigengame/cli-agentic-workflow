@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import typer
 from typer.testing import CliRunner
 
 from caw.cli import app
@@ -140,11 +141,17 @@ def test_version_short_circuits_before_subcommand_dispatch() -> None:
     assert "Usage" not in result.output
 
 
-def test_version_help_lists_the_version_option() -> None:
-    result = runner.invoke(app, ["--help"])
+def test_version_option_is_registered_on_the_cli() -> None:
+    # Introspect the command definition rather than scraping rendered --help text:
+    # Rich colorizes option names and, when the terminal is colored (as on CI),
+    # splits "--version" across ANSI escape codes, so a substring assertion on the
+    # rendered output is environment-dependent. Registration is what "--help lists
+    # the option" actually means, and it also confirms the -V alias.
+    command = typer.main.get_command(app)
+    registered = {opt for param in command.params for opt in param.opts}
 
-    assert result.exit_code == 0
-    assert "--version" in result.output
+    assert "--version" in registered
+    assert "-V" in registered
 
 
 def test_version_via_installed_console_script() -> None:
