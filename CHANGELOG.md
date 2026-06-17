@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.16.0](https://github.com/aigengame/cli-agentic-workflow/compare/v0.15.0...v0.16.0) (2026-06-17)
+
+
+### Features
+
+* **#10:** Wave A — human_gate node kind + await parking ([#120](https://github.com/aigengame/cli-agentic-workflow/issues/120)) ([1270774](https://github.com/aigengame/cli-agentic-workflow/commit/12707742079a95f515b3c51747830978578c223f))
+* **#10:** Wave B — approve / reject a parked gate via caw resume ([#122](https://github.com/aigengame/cli-agentic-workflow/issues/122)) ([5c8e9fe](https://github.com/aigengame/cli-agentic-workflow/commit/5c8e9febd0dea759f62141f3c814db4e1bffa8eb))
+* **#10:** Wave C — multi-gate resume, TTY inline confirm, parked-run e2e ([#123](https://github.com/aigengame/cli-agentic-workflow/issues/123)) ([f079945](https://github.com/aigengame/cli-agentic-workflow/commit/f0799457ac0a80e72a7552bf2d3e199374b6097e))
+
 ## [0.15.0](https://github.com/aigengame/cli-agentic-workflow/compare/v0.14.0...v0.15.0) (2026-06-17)
 
 
