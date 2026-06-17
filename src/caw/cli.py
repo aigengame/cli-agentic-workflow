@@ -55,7 +55,12 @@ from caw.model import Node, Predicate, Workflow, execution_order, normalize_work
 from caw.patterns import expander_names, get_expander
 from caw.report import GroupReportError, ReportFormat, render_group_report, render_report
 from caw.runlayout import run_dir, runs_root
-from caw.scaffold import LOOP_EXAMPLE, PATTERN_EXAMPLES, STARTER_WORKFLOW, PatternExample
+from caw.scaffold import (
+    LOOP_EXAMPLE,
+    PATTERN_EXAMPLES,
+    STARTER_WORKFLOW,
+    PatternExample,
+)
 
 app = typer.Typer(
     name="caw",

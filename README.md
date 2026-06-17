@@ -108,6 +108,33 @@ with `summary.fixture.json` next to the workflow file:
 `caw run hello.yaml` now runs the shell and agent nodes together. Swapping `adapter: mock`
 for a real adapter (e.g. `claude.print`) is the only change needed to drive a real agent CLI.
 
+### Fan-out synthesis: the end-to-end sample
+
+The first complete end-to-end sample is a **hand-written** workflow that fans the **same
+task** out to two agent branches in parallel and joins both answers in a `synthesize` node —
+the fan-out-synthesis shape. It ships under [`examples/fanout-synthesis/`](examples/fanout-synthesis/)
+in two variants: an **offline mock** variant (every node uses the built-in `mock` adapter, so
+it runs with no real Agent CLI and no tokens) and a **real** variant that fans the same task
+to `claude.print` and `codex.exec` side by side.
+
+Run the offline variant from the repo root — clone-to-completed in well under ten minutes
+(the full walkthrough is in the sample's
+[QUICKSTART.md](examples/fanout-synthesis/QUICKSTART.md)):
+
+```bash
+caw validate examples/fanout-synthesis/fanout-synthesis.mock.yaml
+caw graph    examples/fanout-synthesis/fanout-synthesis.mock.yaml   # two branches → one synthesize node
+caw run      examples/fanout-synthesis/fanout-synthesis.mock.yaml   # runs offline — no tokens
+caw report <run-id> --format markdown                               # conclusion (## Nodes) vs trace (## Trace)
+```
+
+The real variant ([`fanout-synthesis.real.yaml`](examples/fanout-synthesis/fanout-synthesis.real.yaml))
+points the two branches at `claude.print` and `codex.exec`, requires both CLIs on PATH and
+authenticated, and is exercised end-to-end by the e2e suite
+(`tests/e2e/test_fanout_synthesis_runs.py`). The Markdown report keeps the final conclusion
+(each node's outcome, including the synthesize node's) in its own `## Nodes` section, distinct
+from the `## Trace` of events.
+
 ## Why caw
 
 - **Validate before you spend tokens.** `caw validate` catches schema errors, broken

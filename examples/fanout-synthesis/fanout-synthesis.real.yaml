@@ -1,0 +1,54 @@
+# Fan-out synthesis — the real dual-adapter variant (#14).
+#
+# A hand-written fan-out-synthesis workflow that fans the SAME task out to a
+# `claude.print` branch and a `codex.exec` branch in PARALLEL, then joins BOTH branch
+# outputs in a `synthesize` agent node. This is the offline `fanout-synthesis.mock.yaml`
+# with each branch pointed at a real Agent CLI instead of the mock adapter — the same
+# graph shape, the same single prompt fanned to both adapters.
+#
+# This variant spends real tokens and requires BOTH the `claude` and `codex` CLIs on
+# PATH and authenticated. Each agent node declares an Output Contract via
+# `output_schema`; the schemas use `additionalProperties: false` so they are valid
+# under codex's strict structured-output mode and harmless for claude.
+#
+# Two runtime-only concerns are NOT baked into this file because they depend on your
+# machine and working directory, so a reader can see the graph clearly:
+#
+#   * env — an agent node receives ONLY the env-var NAMES it declares (the values stay
+#     out of State/Events; ADR 0006). A real CLI needs your ambient auth/config (HOME,
+#     PATH, the provider's API/session vars). List the names your CLIs need under each
+#     node's `inputs.env`, or drive the workflow from the e2e
+#     (tests/e2e/test_fanout_synthesis_runs.py), which injects the ambient allow-list.
+#   * codex `args` — `codex exec` needs `--skip-git-repo-check` and a non-interactive
+#     `--sandbox` to run unattended from an arbitrary directory. Add them under
+#     `codex_branch.inputs.args` (the e2e supplies them per adapter).
+#
+# The two branches carry the IDENTICAL `prompt` — the same task fanned out — and the
+# `synthesize` node `needs` BOTH, so a successful run synthesizes both real answers.
+name: fanout-synthesis-real
+version: 1
+nodes:
+  - id: claude_branch
+    kind: agent
+    timeout: 300
+    inputs:
+      adapter: claude.print
+      prompt: List the three largest contributors to slow CI, most impactful first.
+      output_schema: answer.schema.json
+  - id: codex_branch
+    kind: agent
+    timeout: 300
+    inputs:
+      adapter: codex.exec
+      prompt: List the three largest contributors to slow CI, most impactful first.
+      output_schema: answer.schema.json
+  - id: synthesize
+    kind: agent
+    timeout: 300
+    needs: [claude_branch, codex_branch]
+    inputs:
+      adapter: claude.print
+      prompt: >-
+        Combine the two proposals into one ranked recommendation, keeping only the
+        items both branches agree on first.
+      output_schema: synthesis.schema.json

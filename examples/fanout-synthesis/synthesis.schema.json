@@ -1,0 +1,12 @@
+{
+  "type": "object",
+  "properties": {
+    "recommendation": { "type": "string" },
+    "ranked": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  },
+  "required": ["recommendation", "ranked"],
+  "additionalProperties": false
+}

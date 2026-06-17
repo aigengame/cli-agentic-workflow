@@ -1,0 +1,6 @@
+{
+  "exit_status": 0,
+  "structured_output": {
+    "ranked": ["single-core test run", "redundant test reruns", "slow container pulls"]
+  }
+}

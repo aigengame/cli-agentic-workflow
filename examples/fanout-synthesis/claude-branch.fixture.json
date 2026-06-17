@@ -1,0 +1,6 @@
+{
+  "exit_status": 0,
+  "structured_output": {
+    "ranked": ["redundant test reruns", "no fixture caching", "single-core test run"]
+  }
+}
