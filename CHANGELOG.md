@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.15.0](https://github.com/aigengame/cli-agentic-workflow/compare/v0.14.0...v0.15.0) (2026-06-17)
+
+
+### Features
+
+* **cli:** add `caw --version` flag ([#115](https://github.com/aigengame/cli-agentic-workflow/issues/115)) ([418d782](https://github.com/aigengame/cli-agentic-workflow/commit/418d7829f652742393d8363162c1afbc028d3af7))
+
 ## [0.14.0](https://github.com/aigengame/cli-agentic-workflow/compare/v0.13.0...v0.14.0) (2026-06-17)
 
 
