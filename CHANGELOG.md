@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.14.0](https://github.com/aigengame/cli-agentic-workflow/compare/v0.13.0...v0.14.0) (2026-06-17)
+
+
+### Features
+
+* **controller:** adversarial verification and tournament Pattern Controllers ([#17](https://github.com/aigengame/cli-agentic-workflow/issues/17)) ([#109](https://github.com/aigengame/cli-agentic-workflow/issues/109)) ([c8cac0c](https://github.com/aigengame/cli-agentic-workflow/commit/c8cac0cdb1f526e4953851ab95aaa9cdfe94dadc))
+* **examples:** fan-out synthesis end-to-end sample and quickstart ([#14](https://github.com/aigengame/cli-agentic-workflow/issues/14)) ([#108](https://github.com/aigengame/cli-agentic-workflow/issues/108)) ([868e51b](https://github.com/aigengame/cli-agentic-workflow/commit/868e51b6ac7e6cdebc99f67bd6bd201bcf61001f))
+* **patterns:** classify-and-act, generate-and-filter, fan-out-synthesis expanders ([#13](https://github.com/aigengame/cli-agentic-workflow/issues/13)) ([#107](https://github.com/aigengame/cli-agentic-workflow/issues/107)) ([a3b3cdf](https://github.com/aigengame/cli-agentic-workflow/commit/a3b3cdf6d5a2bec462a281a9b295ac8f2c535c8b))
+
 ## [0.13.0](https://github.com/aigengame/cli-agentic-workflow/compare/v0.12.0...v0.13.0) (2026-06-16)
 
 

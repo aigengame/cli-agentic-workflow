@@ -1,3 +1,3 @@
 """caw: a local-first workflow kernel and CLI for composing agent CLI entrypoints."""
 
-__version__ = "0.13.0"
+__version__ = "0.14.0"
