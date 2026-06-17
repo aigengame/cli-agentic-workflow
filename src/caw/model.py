@@ -148,14 +148,36 @@ class AgentNodeInputs(BaseModel):
         return adapter
 
 
+class HumanGateNodeInputs(BaseModel):
+    """Inputs of a human_gate Node: it parks the Run for approval (#10, ADR 0010).
+
+    A human_gate spawns no process — it records itself ``awaiting`` and the Run
+    parks at the scheduler fixpoint until approved or rejected. Its only input is an
+    optional ``prompt`` shown at the interactive TTY confirmation; it carries none
+    of the shell/agent subprocess fields (``timeout``/``retries``/``env``/``cwd``/
+    ``output_schema``), which do not apply to a node that runs nothing. On approval
+    the gate emits ``{"approved": true}`` as its normalized output, but that field
+    is intentionally NOT ``when``-producible in v0.1 (declining ends the Run, so a
+    downstream branch-on-decision has no meaning yet).
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    kind: Literal["human_gate"] = "human_gate"
+    prompt: str | None = None
+
+
 # The node-level `kind` is the single source of truth (#62): it selects which
 # inputs model is built, so the top-level kind, the `caw graph` plan, and the
 # executor dispatch can never disagree. Because the concrete model is chosen by
 # kind (not by a discriminated union), validation errors name the authored field
 # directly (`inputs.command`) with no injected discriminator tag to strip.
-_INPUTS_MODEL_FOR_KIND: dict[str, type[ShellNodeInputs | AgentNodeInputs]] = {
+_INPUTS_MODEL_FOR_KIND: dict[
+    str, type[ShellNodeInputs | AgentNodeInputs | HumanGateNodeInputs]
+] = {
     "shell": ShellNodeInputs,
     "agent": AgentNodeInputs,
+    "human_gate": HumanGateNodeInputs,
 }
 
 
@@ -187,10 +209,10 @@ def _resolve_inputs_paths(inputs: dict[str, Any], context: Any) -> dict[str, Any
 
 
 def _build_inputs(
-    model: type[ShellNodeInputs | AgentNodeInputs],
+    model: type[ShellNodeInputs | AgentNodeInputs | HumanGateNodeInputs],
     inputs: dict[str, Any],
     context: Any,
-) -> ShellNodeInputs | AgentNodeInputs:
+) -> ShellNodeInputs | AgentNodeInputs | HumanGateNodeInputs:
     """Build the kind's inputs model, re-raising any failure under the `inputs` field.
 
     Validating the inputs model here (rather than via a discriminated union on the
@@ -254,6 +276,10 @@ _STRING_PREDICATE_FIELDS = frozenset({"stdout"})
 _PRODUCIBLE_FIELDS_FOR_KIND: dict[str, frozenset[str]] = {
     "shell": frozenset({"stdout", "exit_status"}),
     "agent": frozenset({"stdout", "exit_status", "structured_output"}),
+    # A human_gate runs no process, so it emits no stdout/exit_status; its
+    # approval output (`approved`) is deliberately not `when`-referenceable in
+    # v0.1 (ADR 0010). An empty set makes any `when` ref to a gate a config error.
+    "human_gate": frozenset(),
 }
 
 
@@ -541,13 +567,13 @@ class Predicate(BaseModel):
 
 
 class Node(BaseModel):
-    """A unit of work in a Workflow; v0.1 supports shell and agent Nodes."""
+    """A unit of work in a Workflow; v0.1 supports shell, agent, and human_gate Nodes."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     id: str
-    kind: Literal["shell", "agent"]
-    inputs: ShellNodeInputs | AgentNodeInputs
+    kind: Literal["shell", "agent", "human_gate"]
+    inputs: ShellNodeInputs | AgentNodeInputs | HumanGateNodeInputs
     needs: tuple[str, ...] = ()
     # A node-level `when` predicate gates whether the Node runs (#7): a false
     # predicate marks the Node `skipped` without executing it. `when` is the ONLY
@@ -634,6 +660,27 @@ class Node(BaseModel):
                 raise ValueError(
                     f"node {self.id!r} `when` references {ref.node!r}, which is not in its needs"
                 )
+        return self
+
+    @model_validator(mode="after")
+    def _human_gate_rejects_subprocess_fields(self) -> "Node":
+        # A human_gate spawns no process, so the subprocess-shaped Node fields do
+        # not apply (ADR 0010). The inputs-level ones (env/cwd/artifacts/
+        # output_schema) are already forbidden by HumanGateNodeInputs; retries and
+        # timeout are node-level, so reject a non-default value here rather than
+        # silently ignoring an authored control that cannot affect a parked gate.
+        if self.kind != "human_gate":
+            return self
+        if self.retries != 0:
+            raise ValueError(
+                f"node {self.id!r} is a human_gate, which runs no process, so `retries` "
+                f"does not apply"
+            )
+        if self.timeout is not None:
+            raise ValueError(
+                f"node {self.id!r} is a human_gate, which runs no process, so `timeout` "
+                f"does not apply"
+            )
         return self
 
 

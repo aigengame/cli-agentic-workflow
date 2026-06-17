@@ -6,13 +6,94 @@ from typing import Any
 import pytest
 
 from caw.config import WorkflowConfigError
-from caw.model import Node, ShellNodeInputs, Workflow, execution_order, normalize_workflow
+from caw.model import (
+    HumanGateNodeInputs,
+    Node,
+    ShellNodeInputs,
+    Workflow,
+    execution_order,
+    normalize_workflow,
+)
 
 
 def shell_node(node_id: str, *needs: str) -> Node:
     return Node(
         id=node_id, kind="shell", inputs=ShellNodeInputs(command="echo hi"), needs=tuple(needs)
     )
+
+
+def test_human_gate_node_normalizes_with_an_optional_prompt() -> None:
+    # A human_gate Node is a recognized kind (#10, ADR 0010): it parks the run for
+    # approval. Its only input is an optional prompt shown at the TTY confirmation;
+    # it spawns no process, so it carries none of the shell/agent subprocess fields.
+    raw: dict[str, Any] = {
+        "name": "sample",
+        "version": 1,
+        "nodes": [
+            {"id": "build", "kind": "shell", "inputs": {"command": "echo hi"}},
+            {
+                "id": "gate",
+                "kind": "human_gate",
+                "needs": ["build"],
+                "inputs": {"prompt": "Approve deploy?"},
+            },
+        ],
+    }
+
+    workflow = normalize_workflow(raw, source="workflow.yaml")
+
+    gate = next(node for node in workflow.nodes if node.id == "gate")
+    assert gate.kind == "human_gate"
+    assert isinstance(gate.inputs, HumanGateNodeInputs)
+    assert gate.inputs.prompt == "Approve deploy?"
+
+
+def test_when_cannot_reference_a_human_gate_output() -> None:
+    # A human_gate emits no `when`-producible field (ADR 0010): its approval is not
+    # a branch source in v0.1, so any `when` ref to a gate is a config error — like
+    # a ref to a field a node's kind never emits (#75).
+    raw: dict[str, Any] = {
+        "name": "sample",
+        "version": 1,
+        "nodes": [
+            {"id": "gate", "kind": "human_gate", "inputs": {"prompt": "ok?"}},
+            {
+                "id": "after",
+                "kind": "shell",
+                "needs": ["gate"],
+                "inputs": {"command": "echo hi"},
+                "when": {
+                    "ref": {"node": "gate", "field": "exit_status"},
+                    "op": "equals",
+                    "value": 0,
+                },
+            },
+        ],
+    }
+
+    with pytest.raises(WorkflowConfigError) as excinfo:
+        normalize_workflow(raw, source="workflow.yaml")
+
+    assert "gate" in str(excinfo.value)
+
+
+@pytest.mark.parametrize(("field", "value"), [("retries", 3), ("timeout", 1.0)])
+def test_human_gate_rejects_subprocess_node_fields(field: str, value: object) -> None:
+    # A human_gate spawns no process, so the subprocess-shaped Node fields do not
+    # apply (ADR 0010): authoring `retries`/`timeout` on a gate is a config error,
+    # not a silently-ignored value.
+    raw: dict[str, Any] = {
+        "name": "sample",
+        "version": 1,
+        "nodes": [
+            {"id": "gate", "kind": "human_gate", "inputs": {"prompt": "ok?"}, field: value},
+        ],
+    }
+
+    with pytest.raises(WorkflowConfigError) as excinfo:
+        normalize_workflow(raw, source="workflow.yaml")
+
+    assert field in str(excinfo.value)
 
 
 def test_cycle_error_names_only_the_cycle_members_not_downstream_nodes() -> None:

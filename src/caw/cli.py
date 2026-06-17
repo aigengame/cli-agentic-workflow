@@ -432,6 +432,14 @@ def _report_and_exit(result: RunResult, workflow_label: str) -> None:
             typer.echo(_failure_line(workflow_label, node_result))
             if node_result.stderr:
                 _echo_stderr_excerpt(node_result)
+    if result.parked:
+        # A parked Run is neither succeeded nor failed: it awaits approval at one or
+        # more human gates (#10, ADR 0010). Name the awaiting gates and exit 0 — a
+        # park is not a failure; the run is advanced later via `caw resume`.
+        for node_id in result.awaiting_node_ids:
+            typer.echo(f"node {node_id} awaiting approval")
+        typer.echo(f"run {result.run_id} parked at a human gate")
+        return
     for node_id in result.skipped_node_ids:
         typer.echo(f"node {node_id} skipped {_skip_reason(result, node_id)}")
     if not result.succeeded:

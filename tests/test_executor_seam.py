@@ -39,6 +39,85 @@ def shell_workflow(*nodes: ShellNodeSpec) -> Workflow:
     return normalize_workflow(raw, source="<test>")
 
 
+def gated_workflow() -> Workflow:
+    """A build -> human_gate -> deploy Workflow: deploy is gated behind approval."""
+    raw: dict[str, Any] = {
+        "name": "gated",
+        "version": 1,
+        "nodes": [
+            {"id": "build", "kind": "shell", "inputs": {"command": "echo built"}},
+            {"id": "gate", "kind": "human_gate", "needs": ["build"], "inputs": {"prompt": "ok?"}},
+            {
+                "id": "deploy",
+                "kind": "shell",
+                "needs": ["gate"],
+                "inputs": {"command": "echo deployed"},
+            },
+        ],
+    }
+    return normalize_workflow(raw, source="<test>")
+
+
+@pytest.mark.asyncio
+async def test_a_run_reaching_a_human_gate_parks(tmp_path: Path) -> None:
+    # A human_gate parks the Run at the fixpoint (ADR 0010): the gate goes `awaiting`,
+    # the Run goes `parked`, State is persisted, downstream never runs, and the park
+    # is recorded as a gate_awaiting Event — all offline, with no TTY.
+    runs_root = tmp_path / "runs"
+
+    result = await execute_run(gated_workflow(), runs_root)
+
+    assert result.status == "parked"
+    assert result.awaiting_node_ids == ("gate",)
+    ran = {node.node_id for node in result.node_results}
+    assert "build" in ran and "deploy" not in ran, "downstream of the gate never runs"
+
+    run_dir = single_run_dir(runs_root)
+    statuses = {
+        row["node_id"]: row["status"]
+        for row in state_rows(run_dir, "SELECT node_id, status FROM node")
+    }
+    assert statuses["build"] == "succeeded"
+    assert statuses["gate"] == "awaiting"
+    assert "deploy" not in statuses, "an unreached node has no row"
+    assert state_rows(run_dir, "SELECT status FROM run")[0]["status"] == "parked"
+
+    events = read_events(run_dir)
+    assert any(
+        event["type"] == "gate_awaiting" and event["data"]["node_id"] == "gate" for event in events
+    )
+    assert not any(event["type"] == "run_finished" for event in events), (
+        "a parked Run is not finished"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_parked_run_is_not_reported_succeeded(tmp_path: Path) -> None:
+    # A parked Run is not a successful terminal — it awaits approval (#10) — so
+    # RunResult.succeeded is False even though its already-run Nodes all succeeded,
+    # keeping controllers that branch on `succeeded` from misclassifying it.
+    result = await execute_run(gated_workflow(), tmp_path / "runs")
+
+    assert result.status == "parked"
+    assert result.succeeded is False
+    assert all(node.succeeded for node in result.node_results), (
+        "the run-down nodes still succeeded"
+    )
+
+
+def test_rejected_and_succeeded_runs_are_not_resumable() -> None:
+    # ADR 0010 Resume Eligibility: a `rejected` Run is refused like `succeeded`; a
+    # `parked` Run, by contrast, is resumable (advanced by approve/reject), and the
+    # other interrupted terminals stay resumable (#6).
+    from caw.executor import is_resumable
+
+    assert is_resumable("succeeded") is False
+    assert is_resumable("rejected") is False
+    assert is_resumable("parked") is True
+    assert is_resumable("failed") is True
+    assert is_resumable(None) is False
+
+
 def conditional_workflow(*nodes: dict[str, Any]) -> Workflow:
     """Build a shell Workflow from raw node dicts carrying `when` / `join` (#7).
 

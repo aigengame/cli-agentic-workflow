@@ -34,15 +34,25 @@ TIMED_OUT: Final = "timed_out"
 ERRORED: Final = "errored"
 CANCELLED: Final = "cancelled"
 SKIPPED: Final = "skipped"
+# Human Gate statuses (#10, ADR 0010): a ``parked`` Run waits at a gate; an ``awaiting``
+# Node is the gate holding the Run; ``rejected`` is a human "no" that ended the Run, applied
+# to both the declined gate Node and the Run.
+PARKED: Final = "parked"
+AWAITING: Final = "awaiting"
+REJECTED: Final = "rejected"
 
 # A Run is in flight (``running``), finished cleanly (``succeeded``), finished with a failed
 # Node (``failed``), was prevented from producing a result by an Adapter/internal fault
-# (``errored``), or was cancelled (``cancelled``).
-RunStatus = Literal["running", "succeeded", "failed", "errored", "cancelled"]
+# (``errored``), was cancelled (``cancelled``), is ``parked`` at a Human Gate awaiting
+# approval, or was ``rejected`` by a human (#10).
+RunStatus = Literal["running", "succeeded", "failed", "errored", "cancelled", "parked", "rejected"]
 
 # A Node is in flight (``running``) or reached a terminal outcome: ``succeeded``, one of the
-# failure kinds (``failed`` / ``timed_out`` / ``errored``), or ``skipped`` (never attempted).
-NodeStatus = Literal["running", "succeeded", "failed", "timed_out", "errored", "skipped"]
+# failure kinds (``failed`` / ``timed_out`` / ``errored``), ``skipped`` (never attempted),
+# ``awaiting`` (a Human Gate holding the Run), or ``rejected`` (a declined gate; #10).
+NodeStatus = Literal[
+    "running", "succeeded", "failed", "timed_out", "errored", "skipped", "awaiting", "rejected"
+]
 
 # The Error Classification failure kinds a failed Node Attempt carries (a subset of
 # NodeStatus); ``None`` on a NodeResult means the Attempt succeeded.
