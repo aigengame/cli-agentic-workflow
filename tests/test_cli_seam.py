@@ -1,13 +1,18 @@
 """CLI-seam tests: invoke the caw CLI and assert exit codes and stdout."""
 
 import json
+import re
+import shutil
+import subprocess
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import pytest
+import typer
 from typer.testing import CliRunner
 
+from caw import __version__
 from caw.cli import app
 
 runner = CliRunner()
@@ -109,6 +114,70 @@ def test_help_exits_zero_and_names_the_cli() -> None:
 
     assert result.exit_code == 0
     assert "caw" in result.output
+
+
+def test_version_flag_prints_the_installed_version_and_exits_zero() -> None:
+    result = runner.invoke(app, ["--version"])
+
+    assert result.exit_code == 0, result.output
+    # The flag reads caw.__version__ (the release-please-maintained literal, ADR 0005)
+    # and prints it; it does not compute a version (#113).
+    assert __version__ in result.output
+
+
+def test_version_short_flag_matches_the_long_flag() -> None:
+    long = runner.invoke(app, ["--version"])
+    short = runner.invoke(app, ["-V"])
+
+    assert short.exit_code == 0, short.output
+    assert short.output == long.output
+
+
+def test_version_short_circuits_before_subcommand_dispatch() -> None:
+    # --version is eager: it prints and exits without requiring a subcommand
+    # and without falling through to the no_args_is_help screen.
+    result = runner.invoke(app, ["--version"])
+
+    assert result.exit_code == 0, result.output
+    assert "Usage" not in result.output
+
+
+def test_version_option_is_registered_on_the_cli() -> None:
+    # Introspect the command definition rather than scraping rendered --help text:
+    # Rich colorizes option names and, when the terminal is colored (as on CI),
+    # splits "--version" across ANSI escape codes, so a substring assertion on the
+    # rendered output is environment-dependent. Registration is what "--help lists
+    # the option" actually means, and it also confirms the -V alias.
+    command = typer.main.get_command(app)
+    registered = {opt for param in command.params for opt in param.opts}
+
+    assert "--version" in registered
+    assert "-V" in registered
+
+
+def test_version_listed_in_rendered_help() -> None:
+    # #113 asks that `caw --help` surface the option to users. Rich colorizes option
+    # names and, when the terminal is colored (as on CI), splits "--version" across
+    # ANSI escape codes -- so force color to mirror CI and strip control sequences
+    # before asserting on the user-visible text, rather than scraping raw output.
+    result = runner.invoke(app, ["--help"], env={"FORCE_COLOR": "1"})
+    plain = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
+
+    assert result.exit_code == 0
+    assert "--version" in plain
+
+
+def test_version_via_installed_console_script() -> None:
+    # Stronger than the in-process CliRunner checks: exercises the real installed
+    # `caw` entry point. It must never silently skip -- a missing console script in
+    # the test environment is a real failure of the installed-entrypoint guard (#113).
+    caw_bin = shutil.which("caw")
+    assert caw_bin is not None, "the `caw` console script must be installed (run `uv sync`)"
+
+    proc = subprocess.run([caw_bin, "--version"], capture_output=True, text=True)
+
+    assert proc.returncode == 0, proc.stderr
+    assert __version__ in proc.stdout
 
 
 def test_graph_renders_a_text_plan_in_execution_order_with_needs(

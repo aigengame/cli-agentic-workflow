@@ -34,6 +34,7 @@ from typing import Annotated, Any
 
 import typer
 
+from caw import __version__
 from caw.config import WorkflowConfigError, load_workflow_file
 from caw.controller import (
     AdversarialSpec,
@@ -90,8 +91,31 @@ def _echo_stderr_excerpt(node_result: NodeResult) -> None:
         typer.echo(f"  {line}", err=True)
 
 
+def _version_callback(value: bool) -> None:
+    """Print the caw version and exit before any subcommand runs.
+
+    Eager so `caw --version` short-circuits parsing: it reads `caw.__version__`
+    (the release-please-maintained version literal, ADR 0005 -- it does not compute
+    a version) and exits 0 without requiring a subcommand (#113).
+    """
+    if value:
+        typer.echo(f"caw {__version__}")
+        raise typer.Exit()
+
+
 @app.callback()
-def main() -> None:
+def main(
+    version: Annotated[
+        bool,
+        typer.Option(
+            "--version",
+            "-V",
+            help="Show the caw version and exit.",
+            is_eager=True,
+            callback=_version_callback,
+        ),
+    ] = False,
+) -> None:
     """caw: run explicit, inspectable, repeatable workflows over agent CLIs."""
 
 
