@@ -24,7 +24,8 @@ from e2e import harness
 from typer.testing import CliRunner, Result
 
 from caw.cli import app
-from caw.executor import FAILED, NodeResult, RunResult
+from caw.executor import NodeResult, RunResult
+from caw.status import FAILED
 
 RunFactory = Callable[[], Awaitable[RunResult]]
 REPO_ROOT = Path(__file__).resolve().parent.parent

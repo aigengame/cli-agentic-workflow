@@ -3,7 +3,28 @@
 import json
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, get_args
+
+# The Event-type vocabulary (#30): the single owned set of `type` strings an Event
+# record may carry. Typed as a Literal so a typo is a static error at every
+# `append` call site (mypy --strict checks src and tests), and mirrored into a
+# frozenset derived from the SAME Literal so an unknown type is also rejected at
+# runtime — the event sequence is the machine-readable trace of a run, so an
+# unrecognized type must never slip in. New patterns extend this Literal in one
+# place (e.g. the Human Gate's gate_* events, #10) rather than passing raw
+# strings at call sites.
+EventType = Literal[
+    "run_started",
+    "run_finished",
+    "run_resumed",
+    "run_errored",
+    "node_started",
+    "node_finished",
+    "node_skipped",
+    "node_retrying",
+]
+
+EVENT_TYPES: frozenset[str] = frozenset(get_args(EventType))
 
 
 def _last_seq(path: Path) -> int:
@@ -47,8 +68,15 @@ class EventLog:
         self._seq = _last_seq(path)
         path.touch()
 
-    def append(self, event_type: str, data: dict[str, Any]) -> None:
-        """Append one Event record as a JSON line."""
+    def append(self, event_type: EventType, data: dict[str, Any]) -> None:
+        """Append one Event record as a JSON line.
+
+        The ``event_type`` is drawn from the owned :data:`EventType` vocabulary;
+        an unrecognized type is refused so a typo can never write an unknown
+        record into the trace (#30).
+        """
+        if event_type not in EVENT_TYPES:
+            raise ValueError(f"unknown event type {event_type!r}")
         self._seq += 1
         record = {
             "seq": self._seq,

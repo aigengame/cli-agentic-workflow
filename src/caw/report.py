@@ -15,6 +15,7 @@ from typing import Any
 
 from caw.runlayout import group_iterations_root, group_state_path
 from caw.state import StateStore
+from caw.status import SKIPPED, SUCCEEDED
 
 
 class ReportFormat(StrEnum):
@@ -66,7 +67,7 @@ def _conclusion_nodes(run_dir: Path) -> tuple[str | None, list[dict[str, Any]]]:
         node_status = node_statuses[node_id]
         output = outputs[node_id] or {}
         stderr = output.get("stderr") or ""
-        failed = node_status not in {"succeeded", "skipped"}
+        failed = node_status not in {SUCCEEDED, SKIPPED}
         nodes.append(
             {
                 "id": node_id,

@@ -19,6 +19,8 @@ from pathlib import Path
 from types import TracebackType
 from typing import Any
 
+from caw.status import ERRORED, RUNNING, SKIPPED, NodeStatus, RunStatus
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS run (
     run_id TEXT PRIMARY KEY,
@@ -94,11 +96,11 @@ class StateStore:
     ) -> None:
         self._execute(
             "INSERT INTO run (run_id, workflow_name, definition_checksum, status, created_at)"
-            " VALUES (?, ?, ?, 'running', ?)",
-            (run_id, workflow_name, definition_checksum, created_at),
+            " VALUES (?, ?, ?, ?, ?)",
+            (run_id, workflow_name, definition_checksum, RUNNING, created_at),
         )
 
-    def record_run_finished(self, run_id: str, status: str, finished_at: str) -> None:
+    def record_run_finished(self, run_id: str, status: RunStatus, finished_at: str) -> None:
         self._execute(
             "UPDATE run SET status = ?, finished_at = ? WHERE run_id = ?",
             (status, finished_at, run_id),
@@ -113,20 +115,20 @@ class StateStore:
         stale mix of the interrupted run's terminal fields.
         """
         self._execute(
-            "UPDATE run SET status = 'running', finished_at = NULL, error = NULL WHERE run_id = ?",
-            (run_id,),
+            "UPDATE run SET status = ?, finished_at = NULL, error = NULL WHERE run_id = ?",
+            (RUNNING, run_id),
         )
 
     def record_run_errored(self, run_id: str, error: str, finished_at: str) -> None:
         self._execute(
-            "UPDATE run SET status = 'errored', error = ?, finished_at = ? WHERE run_id = ?",
-            (error, finished_at, run_id),
+            "UPDATE run SET status = ?, error = ?, finished_at = ? WHERE run_id = ?",
+            (ERRORED, error, finished_at, run_id),
         )
 
     def record_node_started(self, run_id: str, node_id: str) -> None:
         self._execute(
-            "INSERT INTO node (run_id, node_id, status) VALUES (?, ?, 'running')",
-            (run_id, node_id),
+            "INSERT INTO node (run_id, node_id, status) VALUES (?, ?, ?)",
+            (run_id, node_id, RUNNING),
         )
 
     def record_node_running(self, run_id: str, node_id: str) -> None:
@@ -138,12 +140,12 @@ class StateStore:
         PK). The first launch of a Node still goes through ``record_node_started``.
         """
         self._execute(
-            "UPDATE node SET status = 'running' WHERE run_id = ? AND node_id = ?",
-            (run_id, node_id),
+            "UPDATE node SET status = ? WHERE run_id = ? AND node_id = ?",
+            (RUNNING, run_id, node_id),
         )
 
     def record_node_finished(
-        self, run_id: str, node_id: str, status: str, cause: str | None = None
+        self, run_id: str, node_id: str, status: NodeStatus, cause: str | None = None
     ) -> None:
         """Drive an existing Node row to a terminal status, with an optional cause.
 
@@ -167,8 +169,8 @@ class StateStore:
         branch (``all_branches_skipped``), so a Reporter can distinguish them.
         """
         self._execute(
-            "INSERT INTO node (run_id, node_id, status, cause) VALUES (?, ?, 'skipped', ?)",
-            (run_id, node_id, cause),
+            "INSERT INTO node (run_id, node_id, status, cause) VALUES (?, ?, ?, ?)",
+            (run_id, node_id, SKIPPED, cause),
         )
 
     def record_attempt(

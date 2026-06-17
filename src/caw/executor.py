@@ -29,6 +29,16 @@ from caw.model import (
 )
 from caw.predicate import evaluate_predicate
 from caw.state import StateStore
+from caw.status import (
+    ERRORED,
+    FAILED,
+    SKIPPED,
+    SUCCEEDED,
+    TIMED_OUT,
+    FailureKind,
+    NodeStatus,
+    RunStatus,
+)
 
 # The named reasons a Node was skipped (#7), recorded as the skip's `cause` in
 # State and surfaced in the RunResult so a Reporter renders a closed `when` gate
@@ -42,19 +52,17 @@ SKIP_BLOCKED = "blocked"
 SKIP_WHEN_FALSE = "when_false"
 SKIP_ALL_BRANCHES_SKIPPED = "all_branches_skipped"
 
-# Error classification (#6): the terminal status of a failed Node Attempt names
-# WHY it failed, so a timeout is diagnosable as a timeout and an adapter/internal
-# error is distinguishable from a node that ran and exited non-zero. The kinds:
+# Error classification (#6): a failed Node Attempt's terminal status names WHY it
+# failed, so a timeout is diagnosable as a timeout and an adapter/internal error is
+# distinguishable from a node that ran and exited non-zero. The kinds FAILED /
+# TIMED_OUT / ERRORED are part of the status vocabulary owned by ``caw.status`` (#30)
+# and imported above:
 #   "failed"    — the runner ran and reported a non-zero exit status
 #   "timed_out" — the Attempt exceeded the Node's wall-clock `timeout` budget and
 #                 was terminated (subprocess killed)
 #   "errored"   — an Adapter or internal exception prevented the runner from
 #                 producing a result at all
-# ``failure_kind is None`` is the single source of truth for success, so the
-# status taxonomy stays in one place rather than scattered across call sites.
-FAILED = "failed"
-TIMED_OUT = "timed_out"
-ERRORED = "errored"
+# ``failure_kind is None`` is the single source of truth for success.
 
 # The failure kinds the executor RE-ATTEMPTS when a Node has retries remaining
 # (#6). A non-zero exit and a timeout are commonly transient (a flaky command, a
@@ -90,7 +98,7 @@ class NodeResult:
     finished_at: str
     structured_output: object | None = None
     artifacts: tuple[Path, ...] = ()
-    failure_kind: str | None = None
+    failure_kind: FailureKind | None = None
     # The Adapter that ran an agent Node, threaded so a failure message can name
     # it (#6.5); ``None`` for a shell Node, which has no Adapter.
     adapter: str | None = None
@@ -106,11 +114,11 @@ class NodeResult:
         return self.failure_kind is None
 
     @property
-    def status(self) -> str:
+    def status(self) -> NodeStatus:
         # succeeded ⇔ failure_kind is None, so a non-success always carries a
-        # concrete kind string; assert keeps the return type str for mypy.
+        # concrete FailureKind (itself a NodeStatus member).
         if self.failure_kind is None:
-            return "succeeded"
+            return SUCCEEDED
         return self.failure_kind
 
     @property
@@ -175,8 +183,8 @@ class RunResult:
         return all(result.succeeded for result in self.node_results)
 
     @property
-    def status(self) -> str:
-        return "succeeded" if self.succeeded else "failed"
+    def status(self) -> RunStatus:
+        return SUCCEEDED if self.succeeded else FAILED
 
 
 def _new_run_id() -> str:
@@ -498,7 +506,7 @@ def _finalize_crashed_run(
     """
     for node_id in in_flight_node_ids:
         with contextlib.suppress(BaseException):
-            state.record_node_finished(run_id=run_id, node_id=node_id, status="errored")
+            state.record_node_finished(run_id=run_id, node_id=node_id, status=ERRORED)
     with contextlib.suppress(BaseException):
         state.record_run_errored(run_id=run_id, error=error, finished_at=_now())
     with contextlib.suppress(BaseException):
@@ -800,7 +808,7 @@ class _Scheduler:
             self._skipped_blockers[node_id] = blocker
         if node_id in self._started:
             self._state.record_node_finished(
-                run_id=self._run_id, node_id=node_id, status="skipped", cause=cause
+                run_id=self._run_id, node_id=node_id, status=SKIPPED, cause=cause
             )
         else:
             self._state.record_node_skipped(run_id=self._run_id, node_id=node_id, cause=cause)
@@ -1067,7 +1075,7 @@ class ResumeError(Exception):
 # run, even a run still marked ``running`` because it was killed mid-flight — has
 # incomplete work and IS resumable. Eligibility lives here so the entry point and
 # the CLI share one rule.
-_NON_RESUMABLE_RUN_STATUSES = frozenset({"succeeded"})
+_NON_RESUMABLE_RUN_STATUSES = frozenset({SUCCEEDED})
 
 
 def is_resumable(run_status: str | None) -> bool:
@@ -1195,7 +1203,7 @@ async def resume_run(
         # to running rather than re-INSERT. A Node with no row at all (never
         # started) starts fresh at Attempt 1 and INSERTs its row normally.
         satisfied = {
-            node_id: status for node_id, status in node_statuses.items() if status == "succeeded"
+            node_id: status for node_id, status in node_statuses.items() if status == SUCCEEDED
         }
         attempt_seed = {
             node_id: max_attempts.get(node_id, 0) + 1
