@@ -29,9 +29,10 @@ import pytest
 from caw.adapter import Adapter, AdapterRegistry
 from caw.claude_print import ClaudePrintAdapter
 from caw.codex_exec import CodexExecAdapter
-from caw.executor import FAILED, RunResult, execute_run
+from caw.executor import RunResult, execute_run
 from caw.model import Workflow, normalize_workflow
 from caw.state import StateStore
+from caw.status import FAILED
 from e2e import harness
 
 # A generous per-Node wall-clock budget so ordinary model latency never trips the

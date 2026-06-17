@@ -72,6 +72,7 @@ from caw.scaffold import (
     TOURNAMENT_EXAMPLE,
     PatternExample,
 )
+from caw.status import FAILED, SUCCEEDED
 
 app = typer.Typer(
     name="caw",
@@ -523,7 +524,7 @@ def _report_group_and_exit(result: GroupResult) -> None:
         f"Run Group {result.group_id}: {result.status} ({len(result.iterations)} iterations)"
     )
     for iteration in result.iterations:
-        outcome = "succeeded" if iteration.succeeded else "failed"
+        outcome = SUCCEEDED if iteration.succeeded else FAILED
         typer.echo(f"  iteration {iteration.iteration_index} ({iteration.run_id}): {outcome}")
     if result.winner is not None:
         typer.echo(f"winner: {result.winner}")
