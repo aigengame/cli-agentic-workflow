@@ -2,13 +2,16 @@
 
 Exit code contract:
 
-- 0: success (`caw run` / `caw resume`: the Run succeeded; `caw validate`:
-  the workflow is valid; `caw graph`: the plan was rendered)
-- 1: the Run finished with a failed Node (`caw run`, `caw resume`)
+- 0: success (`caw run` / `caw resume`: the Run succeeded, or parked at a
+  human gate awaiting approval; `caw validate`: the workflow is valid;
+  `caw graph`: the plan was rendered)
+- 1: the Run finished with a failed Node, or a human gate rejected the Run
+  (`caw run`, `caw resume`)
 - 2: config error (unreadable file or invalid workflow definition);
   config errors print exactly one `error:` line. `caw resume` also exits 2
   when the run id is unknown or the Run is not resume-eligible (it already
-  succeeded) — a refusal, with one `error:` line and no re-execution.
+  succeeded or was rejected) — a refusal, with one `error:` line and no
+  re-execution.
 - 3: infrastructure error (e.g. unwritable runs root, State database
   failure) — the Run could not be executed or completed (`caw run`,
   `caw resume`)
@@ -27,6 +30,7 @@ id, State, and Events trace.
 import asyncio
 import json
 import sqlite3
+import sys
 from collections.abc import Coroutine
 from enum import StrEnum
 from pathlib import Path
@@ -60,7 +64,14 @@ from caw.executor import (
     execute_run,
     resume_run,
 )
-from caw.model import Node, Predicate, Workflow, execution_order, normalize_workflow
+from caw.model import (
+    HumanGateNodeInputs,
+    Node,
+    Predicate,
+    Workflow,
+    execution_order,
+    normalize_workflow,
+)
 from caw.patterns import expander_names, get_expander
 from caw.report import GroupReportError, ReportFormat, render_group_report, render_report
 from caw.runlayout import run_dir, runs_root
@@ -455,12 +466,55 @@ def _report_and_exit(result: RunResult, workflow_label: str) -> None:
     typer.echo(f"run {result.run_id} succeeded")
 
 
+def _is_attended() -> bool:
+    """Whether this is an interactive (TTY) session that can prompt at a human gate (#10)."""
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def _drive_tty_gates(result: RunResult, gate_prompts: dict[str, str | None]) -> RunResult:
+    """In an attended session, prompt at each awaiting gate and advance the run (#10).
+
+    A parked run in a TTY prompts inline for the awaiting gates — yes approves, no
+    rejects. Because ANY rejection ends the run (ADR 0010), the FIRST decline commits
+    immediately and stops prompting: the later gates' decisions can no longer matter,
+    so a subsequent prompt (or an abort/EOF at one) can never drop a recorded decline.
+    Approvals are committed once the pass approves every awaiting gate, looping until
+    the run reaches a terminal. In a non-TTY session the run stays parked for
+    `caw resume`, so this is a no-op.
+    """
+    while result.parked and _is_attended():
+        approvals: list[str] = []
+        declined: str | None = None
+        for node_id in result.awaiting_node_ids:
+            prompt = gate_prompts.get(node_id) or f"Approve gate {node_id!r}?"
+            if typer.confirm(prompt):
+                approvals.append(node_id)
+            else:
+                declined = node_id
+                break
+        if declined is not None:
+            return asyncio.run(resume_run(result.run_id, runs_root(), rejections=(declined,)))
+        result = asyncio.run(resume_run(result.run_id, runs_root(), approvals=tuple(approvals)))
+    return result
+
+
 @app.command()
 def run(workflow_file: Path) -> None:
-    """Run a workflow file and print a plain-text result."""
+    """Run a workflow file and print a plain-text result.
+
+    In an attended (TTY) session a human_gate prompts inline (#10): yes approves it and
+    the run continues, no rejects it and ends the run. In a non-TTY session the run
+    parks for `caw resume`.
+    """
     workflow = _load_normalized_workflow(workflow_file)
+    gate_prompts: dict[str, str | None] = {
+        node.id: node.inputs.prompt
+        for node in workflow.nodes
+        if isinstance(node.inputs, HumanGateNodeInputs)
+    }
     try:
         result = asyncio.run(execute_run(workflow, runs_root()))
+        result = _drive_tty_gates(result, gate_prompts)
     except (OSError, sqlite3.Error) as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=3) from exc

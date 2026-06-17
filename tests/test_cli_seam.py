@@ -1515,3 +1515,93 @@ def test_resume_reject_ends_the_run(
     assert "rejected" in rejected.output
     assert "deploy" not in rejected.output, "a rejected run never runs the gated downstream"
     assert "succeeded" not in rejected.output
+
+
+def test_run_in_a_tty_prompts_and_approves_inline(
+    write_workflow_data: Callable[[dict[str, Any]], Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # In an attended (TTY) session, `caw run` prompts at the gate inline; answering
+    # yes approves it and the run continues to success without a separate
+    # `caw resume` (#10, ADR 0010).
+    workflow_file = write_workflow_data(_gated_workflow_data())
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("caw.cli._is_attended", lambda: True)
+
+    result = runner.invoke(app, ["run", str(workflow_file)], input="y\n")
+
+    assert result.exit_code == 0, result.output
+    assert "succeeded" in result.output
+    assert "node deploy attempt 1 exited 0" in result.output
+
+
+def test_run_in_a_tty_declines_and_rejects_inline(
+    write_workflow_data: Callable[[dict[str, Any]], Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Declining at the inline prompt rejects the gate and ends the run (exit 1).
+    workflow_file = write_workflow_data(_gated_workflow_data())
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("caw.cli._is_attended", lambda: True)
+
+    result = runner.invoke(app, ["run", str(workflow_file)], input="n\n")
+
+    assert result.exit_code == 1, result.output
+    assert "rejected" in result.output
+    assert "deploy" not in result.output
+
+
+def _multi_gated_workflow_data() -> dict[str, Any]:
+    """Two parallel gated branches: build -> gate{A,B} -> deploy{A,B}."""
+    return {
+        "name": "multi-gated",
+        "version": 1,
+        "nodes": [
+            {"id": "build", "kind": "shell", "inputs": {"command": "echo built"}},
+            {"id": "gateA", "kind": "human_gate", "needs": ["build"], "inputs": {"prompt": "A?"}},
+            {"id": "gateB", "kind": "human_gate", "needs": ["build"], "inputs": {"prompt": "B?"}},
+            {
+                "id": "deployA",
+                "kind": "shell",
+                "needs": ["gateA"],
+                "inputs": {"command": "echo a"},
+            },
+            {
+                "id": "deployB",
+                "kind": "shell",
+                "needs": ["gateB"],
+                "inputs": {"command": "echo b"},
+            },
+        ],
+    }
+
+
+def test_run_in_a_tty_declines_the_first_of_two_gates_and_ends_the_run(
+    write_workflow_data: Callable[[dict[str, Any]], Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # With two parallel TTY gates, declining the FIRST ends the run immediately — the
+    # decline is committed before the second gate is ever prompted, so no later prompt
+    # or abort can drop it (#10, ADR 0010 review). Only ONE answer is supplied: if the
+    # CLI prompted both gates first, the second prompt would EOF/abort instead.
+    workflow_file = write_workflow_data(_multi_gated_workflow_data())
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("caw.cli._is_attended", lambda: True)
+
+    result = runner.invoke(app, ["run", str(workflow_file)], input="n\n")
+
+    assert result.exit_code == 1, result.output
+    assert "rejected" in result.output
+    assert "parked" not in result.output, "the decline ended the run, not re-parked it"
+
+    run_dir = next((tmp_path / ".caw" / "runs").iterdir())
+    events = [
+        json.loads(line)
+        for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert any(event["type"] == "gate_rejected" for event in events), (
+        "the decline was persisted as a gate_rejected event"
+    )

@@ -58,6 +58,81 @@ def gated_workflow() -> Workflow:
     return normalize_workflow(raw, source="<test>")
 
 
+def multi_gated_workflow() -> Workflow:
+    """Two parallel gated branches: build -> gate{A,B} -> deploy{A,B}."""
+    raw: dict[str, Any] = {
+        "name": "multi-gated",
+        "version": 1,
+        "nodes": [
+            {"id": "build", "kind": "shell", "inputs": {"command": "echo built"}},
+            {"id": "gateA", "kind": "human_gate", "needs": ["build"], "inputs": {"prompt": "A?"}},
+            {"id": "gateB", "kind": "human_gate", "needs": ["build"], "inputs": {"prompt": "B?"}},
+            {
+                "id": "deployA",
+                "kind": "shell",
+                "needs": ["gateA"],
+                "inputs": {"command": "echo a"},
+            },
+            {
+                "id": "deployB",
+                "kind": "shell",
+                "needs": ["gateB"],
+                "inputs": {"command": "echo b"},
+            },
+        ],
+    }
+    return normalize_workflow(raw, source="<test>")
+
+
+@pytest.mark.asyncio
+async def test_multi_gate_approve_one_reparks_then_approve_rest_completes(tmp_path: Path) -> None:
+    # Two parallel gates both park at the fixpoint; approving one advances its branch
+    # and re-parks on the rest, and approving the rest completes the run (#10, ADR 0010).
+    runs_root = tmp_path / "runs"
+    parked = await execute_run(multi_gated_workflow(), runs_root)
+    assert parked.status == "parked"
+    assert set(parked.awaiting_node_ids) == {"gateA", "gateB"}
+
+    def node_statuses() -> dict[str, str]:
+        return {
+            row["node_id"]: row["status"]
+            for row in state_rows(single_run_dir(runs_root), "SELECT node_id, status FROM node")
+        }
+
+    first = await resume_run(parked.run_id, runs_root, approvals=("gateA",))
+    assert first.status == "parked", "the unapproved gate re-parks the run"
+    assert set(first.awaiting_node_ids) == {"gateB"}
+    statuses = node_statuses()
+    assert statuses["gateA"] == "succeeded"
+    assert statuses["deployA"] == "succeeded"
+    assert statuses["gateB"] == "awaiting"
+    assert "deployB" not in statuses, "the still-gated branch never ran"
+
+    second = await resume_run(parked.run_id, runs_root, approvals=("gateB",))
+    assert second.status == "succeeded"
+    statuses = node_statuses()
+    assert statuses["gateB"] == "succeeded"
+    assert statuses["deployB"] == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_a_re_parked_gate_does_not_re_emit_gate_awaiting(tmp_path: Path) -> None:
+    # A gate that stays awaiting across a resume (it was not approved) is not a NEW
+    # park: gate_awaiting fires once when it first parks, not again on every re-park,
+    # so the trace does not accumulate phantom parks for a continuously-awaiting gate.
+    runs_root = tmp_path / "runs"
+    parked = await execute_run(multi_gated_workflow(), runs_root)
+    await resume_run(parked.run_id, runs_root, approvals=("gateA",))  # gateB re-parks
+
+    events = read_events(single_run_dir(runs_root))
+    gate_b_awaiting = [
+        event
+        for event in events
+        if event["type"] == "gate_awaiting" and event["data"]["node_id"] == "gateB"
+    ]
+    assert len(gate_b_awaiting) == 1, "gateB parked once; a re-park does not re-emit"
+
+
 @pytest.mark.asyncio
 async def test_a_run_reaching_a_human_gate_parks(tmp_path: Path) -> None:
     # A human_gate parks the Run at the fixpoint (ADR 0010): the gate goes `awaiting`,
