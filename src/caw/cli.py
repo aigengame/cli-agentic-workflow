@@ -2,13 +2,16 @@
 
 Exit code contract:
 
-- 0: success (`caw run` / `caw resume`: the Run succeeded; `caw validate`:
-  the workflow is valid; `caw graph`: the plan was rendered)
-- 1: the Run finished with a failed Node (`caw run`, `caw resume`)
+- 0: success (`caw run` / `caw resume`: the Run succeeded, or parked at a
+  human gate awaiting approval; `caw validate`: the workflow is valid;
+  `caw graph`: the plan was rendered)
+- 1: the Run finished with a failed Node, or a human gate rejected the Run
+  (`caw run`, `caw resume`)
 - 2: config error (unreadable file or invalid workflow definition);
   config errors print exactly one `error:` line. `caw resume` also exits 2
   when the run id is unknown or the Run is not resume-eligible (it already
-  succeeded) — a refusal, with one `error:` line and no re-execution.
+  succeeded or was rejected) — a refusal, with one `error:` line and no
+  re-execution.
 - 3: infrastructure error (e.g. unwritable runs root, State database
   failure) — the Run could not be executed or completed (`caw run`,
   `caw resume`)
@@ -471,25 +474,27 @@ def _is_attended() -> bool:
 def _drive_tty_gates(result: RunResult, gate_prompts: dict[str, str | None]) -> RunResult:
     """In an attended session, prompt at each awaiting gate and advance the run (#10).
 
-    A parked run in a TTY prompts inline for every awaiting gate — yes approves it, no
-    rejects it (and any rejection ends the run, ADR 0010) — then resumes with the
-    decisions, looping until the run reaches a terminal (or a rejection ends it). In a
-    non-TTY session the run stays parked for `caw resume`, so this is a no-op.
+    A parked run in a TTY prompts inline for the awaiting gates — yes approves, no
+    rejects. Because ANY rejection ends the run (ADR 0010), the FIRST decline commits
+    immediately and stops prompting: the later gates' decisions can no longer matter,
+    so a subsequent prompt (or an abort/EOF at one) can never drop a recorded decline.
+    Approvals are committed once the pass approves every awaiting gate, looping until
+    the run reaches a terminal. In a non-TTY session the run stays parked for
+    `caw resume`, so this is a no-op.
     """
     while result.parked and _is_attended():
         approvals: list[str] = []
-        rejections: list[str] = []
+        declined: str | None = None
         for node_id in result.awaiting_node_ids:
             prompt = gate_prompts.get(node_id) or f"Approve gate {node_id!r}?"
-            (approvals if typer.confirm(prompt) else rejections).append(node_id)
-        result = asyncio.run(
-            resume_run(
-                result.run_id,
-                runs_root(),
-                approvals=tuple(approvals),
-                rejections=tuple(rejections),
-            )
-        )
+            if typer.confirm(prompt):
+                approvals.append(node_id)
+            else:
+                declined = node_id
+                break
+        if declined is not None:
+            return asyncio.run(resume_run(result.run_id, runs_root(), rejections=(declined,)))
+        result = asyncio.run(resume_run(result.run_id, runs_root(), approvals=tuple(approvals)))
     return result
 
 
