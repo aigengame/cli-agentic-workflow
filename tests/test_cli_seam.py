@@ -1,6 +1,9 @@
 """CLI-seam tests: invoke the caw CLI and assert exit codes and stdout."""
 
+import importlib.metadata
 import json
+import shutil
+import subprocess
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -109,6 +112,52 @@ def test_help_exits_zero_and_names_the_cli() -> None:
 
     assert result.exit_code == 0
     assert "caw" in result.output
+
+
+def test_version_flag_prints_the_installed_version_and_exits_zero() -> None:
+    result = runner.invoke(app, ["--version"])
+
+    assert result.exit_code == 0, result.output
+    # The flag reports the version resolved from the installed dist metadata
+    # (built from pyproject.toml) -- never a hardcoded copy (#113).
+    assert importlib.metadata.version("caw") in result.output
+
+
+def test_version_short_flag_matches_the_long_flag() -> None:
+    long = runner.invoke(app, ["--version"])
+    short = runner.invoke(app, ["-V"])
+
+    assert short.exit_code == 0, short.output
+    assert short.output == long.output
+
+
+def test_version_short_circuits_before_subcommand_dispatch() -> None:
+    # --version is eager: it prints and exits without requiring a subcommand
+    # and without falling through to the no_args_is_help screen.
+    result = runner.invoke(app, ["--version"])
+
+    assert result.exit_code == 0, result.output
+    assert "Usage" not in result.output
+
+
+def test_version_help_lists_the_version_option() -> None:
+    result = runner.invoke(app, ["--help"])
+
+    assert result.exit_code == 0
+    assert "--version" in result.output
+
+
+def test_version_via_installed_console_script() -> None:
+    # Stronger than the in-process CliRunner checks: exercises the real installed
+    # `caw` entry point so importlib.metadata resolution is confirmed end to end.
+    caw_bin = shutil.which("caw")
+    if caw_bin is None:
+        pytest.skip("caw console script is not on PATH in this environment")
+
+    proc = subprocess.run([caw_bin, "--version"], capture_output=True, text=True)
+
+    assert proc.returncode == 0, proc.stderr
+    assert importlib.metadata.version("caw") in proc.stdout
 
 
 def test_graph_renders_a_text_plan_in_execution_order_with_needs(
