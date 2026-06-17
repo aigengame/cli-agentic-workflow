@@ -1,7 +1,7 @@
 """CLI-seam tests: invoke the caw CLI and assert exit codes and stdout."""
 
-import importlib.metadata
 import json
+import re
 import shutil
 import subprocess
 from collections.abc import Callable
@@ -12,6 +12,7 @@ import pytest
 import typer
 from typer.testing import CliRunner
 
+from caw import __version__
 from caw.cli import app
 
 runner = CliRunner()
@@ -119,9 +120,9 @@ def test_version_flag_prints_the_installed_version_and_exits_zero() -> None:
     result = runner.invoke(app, ["--version"])
 
     assert result.exit_code == 0, result.output
-    # The flag reports the version resolved from the installed dist metadata
-    # (built from pyproject.toml) -- never a hardcoded copy (#113).
-    assert importlib.metadata.version("caw") in result.output
+    # The flag reads caw.__version__ (the release-please-maintained literal, ADR 0005)
+    # and prints it; it does not compute a version (#113).
+    assert __version__ in result.output
 
 
 def test_version_short_flag_matches_the_long_flag() -> None:
@@ -154,17 +155,29 @@ def test_version_option_is_registered_on_the_cli() -> None:
     assert "-V" in registered
 
 
+def test_version_listed_in_rendered_help() -> None:
+    # #113 asks that `caw --help` surface the option to users. Rich colorizes option
+    # names and, when the terminal is colored (as on CI), splits "--version" across
+    # ANSI escape codes -- so force color to mirror CI and strip control sequences
+    # before asserting on the user-visible text, rather than scraping raw output.
+    result = runner.invoke(app, ["--help"], env={"FORCE_COLOR": "1"})
+    plain = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
+
+    assert result.exit_code == 0
+    assert "--version" in plain
+
+
 def test_version_via_installed_console_script() -> None:
     # Stronger than the in-process CliRunner checks: exercises the real installed
-    # `caw` entry point so importlib.metadata resolution is confirmed end to end.
+    # `caw` entry point. It must never silently skip -- a missing console script in
+    # the test environment is a real failure of the installed-entrypoint guard (#113).
     caw_bin = shutil.which("caw")
-    if caw_bin is None:
-        pytest.skip("caw console script is not on PATH in this environment")
+    assert caw_bin is not None, "the `caw` console script must be installed (run `uv sync`)"
 
     proc = subprocess.run([caw_bin, "--version"], capture_output=True, text=True)
 
     assert proc.returncode == 0, proc.stderr
-    assert importlib.metadata.version("caw") in proc.stdout
+    assert __version__ in proc.stdout
 
 
 def test_graph_renders_a_text_plan_in_execution_order_with_needs(
