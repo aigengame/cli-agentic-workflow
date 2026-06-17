@@ -324,6 +324,163 @@ LOOP_EXAMPLE = PatternExample(
 )
 
 
+# A runnable adversarial-verification Pattern Controller example (#17, ADR 0009):
+# a controller spec drives a verification round until the `accept` predicate holds.
+# The round is a single mock-Adapter agent Node whose fixture reports a verdict in
+# `stdout` (REJECT / ACCEPT) and points the next round at its fixture via
+# `structured_output.next_fixture`; the controller substitutes that into the node's
+# `fixture` field as the verifier's feedback. round 1 REJECTs -> round 2 ACCEPTs, so
+# the verification stops accepted at round 2 — all offline, no Agent CLI.
+_ADVERSARIAL_SPEC = """\
+# A runnable adversarial-verification Pattern Controller example. Run it with
+# `caw verify run verify.yaml` — a result is regenerated with the verifier's
+# feedback until the `accept` predicate holds (here: the `verify` node's stdout
+# contains ACCEPT), a round's Run fails, or `max_rounds` is reached. Report the
+# whole Run Group with `caw verify report <group-id>`.
+workflow: verify-round.yaml
+max_rounds: 5
+# The node whose normalized output the accept Predicate and feedback source read.
+verify_node: verify
+# The verifier yields THREE outcomes, decided per round in order: accept -> stop
+# `accepted`; else reject -> stop `rejected`; else regenerate with feedback. Both
+# predicates reuse the `when` Predicate algebra (the sole conditional mechanism).
+# Accepted when the `verify` node's stdout contains ACCEPT.
+accept:
+  ref:
+    node: verify
+    field: stdout
+  op: contains
+  value: ACCEPT
+# OPTIONAL explicit verifier reject: stop `rejected` immediately (distinct from
+# cap-exhaustion) when the verifier hard-rejects. Here a plain REJECT just regenerates;
+# only a HARD_REJECT verdict terminates the group. Omit `reject` for cap-only behavior.
+reject:
+  ref:
+    node: verify
+    field: stdout
+  op: contains
+  value: HARD_REJECT
+# Verifier feedback from round N -> round N+1: the prior round's
+# `structured_output.next_fixture` is substituted into the `verify` node's `fixture`
+# field for the next round (structural substitution, not templating).
+feedback:
+  to_node: verify
+  to_field: fixture
+  from_field: next_fixture
+"""
+
+_ADVERSARIAL_ROUND_WORKFLOW = """\
+# One verification round: a single mock-Adapter agent Node that verifies the result
+# and accepts or rejects it. The controller regenerates with the verifier's feedback
+# until the result is accepted.
+name: adversarial-verification-round
+version: 1
+nodes:
+  - id: verify
+    kind: agent
+    inputs:
+      adapter: mock
+      prompt: Verify the generated result; accept it, or reject it with feedback.
+      fixture: verify-1.fixture.json
+"""
+
+
+def _verify_fixture(*, accept: bool, next_fixture: str | None = None) -> str:
+    """A verification-round fixture: an ACCEPT/REJECT verdict + an optional next-fixture."""
+    structured = f'{{"next_fixture": "{next_fixture}"}}' if next_fixture else "{}"
+    stdout = "ACCEPT" if accept else "REJECT"
+    return f'{{"exit_status": 0, "stdout": "{stdout}", "structured_output": {structured}}}\n'
+
+
+# The adversarial-verification controller bundle: the spec, the round workflow, and
+# the two round fixtures (REJECT -> ACCEPT). `caw verify init` writes the whole bundle.
+ADVERSARIAL_EXAMPLE = PatternExample(
+    workflow_filename="verify.yaml",
+    files={
+        "verify.yaml": _ADVERSARIAL_SPEC,
+        "verify-round.yaml": _ADVERSARIAL_ROUND_WORKFLOW,
+        "verify-1.fixture.json": _verify_fixture(
+            accept=False, next_fixture="verify-2.fixture.json"
+        ),
+        "verify-2.fixture.json": _verify_fixture(accept=True),
+    },
+)
+
+
+# A runnable tournament Pattern Controller example (#17, ADR 0009): a controller spec
+# runs a fixed number of rounds, each comparing candidates and naming a winner; the
+# controller promotes the winner into the next round's `prompt` and feeds the next
+# round's compare fixture forward. round 1 names candidate-a, round 2 names
+# candidate-c — the tournament completes with candidate-c reported, all offline.
+_TOURNAMENT_SPEC = """\
+# A runnable tournament Pattern Controller example. Run it with
+# `caw tournament run tournament.yaml` — each round compares candidates and names a
+# winner, which is promoted into the next round, until every round has run. The
+# final winner is reported; inspect each round's comparison evidence with
+# `caw tournament report <group-id>`.
+workflow: tournament-round.yaml
+rounds: 2
+# The node whose structured_output names the round's winner.
+compare_node: compare
+# The structured_output field carrying the winning candidate.
+winner_field: winner
+# Promote the round's winner into the next round's `compare` prompt (structural
+# substitution, not templating).
+promote:
+  to_node: compare
+  to_field: prompt
+# Feed the next round's compare fixture forward, so each round reads its own fixture.
+feedback:
+  to_node: compare
+  to_field: fixture
+  from_field: next_fixture
+"""
+
+_TOURNAMENT_ROUND_WORKFLOW = """\
+# One tournament round: a single mock-Adapter agent Node that compares the
+# candidates and names the round's winner in its structured_output, with the
+# comparison scores as evidence.
+name: tournament-round
+version: 1
+nodes:
+  - id: compare
+    kind: agent
+    inputs:
+      adapter: mock
+      prompt: Compare the candidates and name the round's winner.
+      fixture: round-1.fixture.json
+"""
+
+
+def _tournament_fixture(*, winner: str, scores: str, next_fixture: str | None = None) -> str:
+    """A tournament-round fixture: the winner + comparison scores + an optional next."""
+    parts = [f'"winner": "{winner}"', f'"scores": {scores}']
+    if next_fixture:
+        parts.append(f'"next_fixture": "{next_fixture}"')
+    structured = "{" + ", ".join(parts) + "}"
+    return f'{{"exit_status": 0, "structured_output": {structured}}}\n'
+
+
+# The tournament controller bundle: the spec, the round workflow, and the two round
+# fixtures (candidate-a promoted into round 2, candidate-c the final winner).
+# `caw tournament init` writes the whole bundle.
+TOURNAMENT_EXAMPLE = PatternExample(
+    workflow_filename="tournament.yaml",
+    files={
+        "tournament.yaml": _TOURNAMENT_SPEC,
+        "tournament-round.yaml": _TOURNAMENT_ROUND_WORKFLOW,
+        "round-1.fixture.json": _tournament_fixture(
+            winner="candidate-a",
+            scores='{"candidate-a": 9, "candidate-b": 4}',
+            next_fixture="round-2.fixture.json",
+        ),
+        "round-2.fixture.json": _tournament_fixture(
+            winner="candidate-c", scores='{"candidate-a": 6, "candidate-c": 8}'
+        ),
+    },
+)
+
+
 # Pattern name -> its runnable scaffold bundle. Keyed by the registry's expander
 # names; #13 extends this map beside its registration.
 PATTERN_EXAMPLES: dict[str, PatternExample] = {

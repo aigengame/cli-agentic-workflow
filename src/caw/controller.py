@@ -117,15 +117,21 @@ class IterationResult:
 
 @dataclass(frozen=True)
 class GroupResult:
-    """The outcome of one ``loop_until_done`` Run Group execution.
+    """The outcome of one Pattern Controller's Run Group execution (#15, #17).
 
-    ``status`` is why the loop stopped (``done`` / ``exhausted`` / ``failed``);
-    ``iterations`` lists every materialized iteration in order.
+    ``status`` is why the controller stopped — its meaning is per-controller:
+    ``loop_until_done`` uses ``done`` / ``exhausted`` / ``failed``; adversarial
+    verification uses ``accepted`` / ``rejected`` / ``failed``; the tournament uses
+    ``complete`` / ``failed``. ``iterations`` lists every materialized iteration
+    (loop iteration / verification round / tournament round) in order. ``winner``
+    is the tournament's final promoted candidate (``None`` for the other
+    controllers, which name no winner).
     """
 
     group_id: str
     status: str
     iterations: tuple[IterationResult, ...]
+    winner: str | None = None
 
 
 class ControllerError(Exception):
@@ -136,23 +142,30 @@ class ControllerError(Exception):
     """
 
 
-def load_controller_spec(spec_file: Path) -> ControllerSpec:
-    """Load and validate a controller spec file, folding failures into a one-liner.
+def load_spec_file[SpecT: BaseModel](spec_file: Path, spec_class: type[SpecT]) -> SpecT:
+    """Load and validate a controller spec file into ``spec_class``, folding failures.
 
-    ``workflow`` is anchored to the SPEC file's directory so the same spec resolves
-    its iteration workflow identically from any cwd (mirroring how agent-Node paths
-    anchor to the workflow file's directory, #64).
+    Shared by every Controller's ``caw <controller> run`` (#15, #17): ``workflow`` is
+    anchored to the SPEC file's directory so the same spec resolves its iteration
+    workflow identically from any cwd (mirroring how agent-Node paths anchor to the
+    workflow file's directory, #64), and any validation failure is folded into a
+    single ``error:``-line ``WorkflowConfigError`` for the CLI's one-line contract.
     """
     raw = load_workflow_file(spec_file)
     workflow_value = raw.get("workflow")
     if isinstance(workflow_value, str) and not Path(workflow_value).is_absolute():
         raw = {**raw, "workflow": str(spec_file.resolve().parent / workflow_value)}
     try:
-        return ControllerSpec.model_validate(raw)
+        return spec_class.model_validate(raw)
     except Exception as exc:  # noqa: BLE001 — fold any validation failure to one line
         raise WorkflowConfigError(
             f"invalid controller spec in {spec_file}: {_first_line(exc)}"
         ) from exc
+
+
+def load_controller_spec(spec_file: Path) -> ControllerSpec:
+    """Load and validate a ``loop_until_done`` controller spec file (#15)."""
+    return load_spec_file(spec_file, ControllerSpec)
 
 
 def _first_line(exc: Exception) -> str:
@@ -168,39 +181,72 @@ def _new_group_id() -> str:
     return f"group-{timestamp}-{secrets.token_hex(4)}"
 
 
-def _materialize_iteration_raw(
-    base_raw: dict[str, Any], spec: ControllerSpec, feedback_value: object | None
-) -> dict[str, Any]:
-    """Build iteration N's raw workflow mapping, substituting feedback structurally.
+# One structural substitution: replace ``to_field`` of node ``to_node``'s inputs
+# with ``value`` BEFORE the iteration is normalized and frozen (ADR 0009). The
+# Controllers compose a list of these — loop/adversarial feed one (feedback), the
+# tournament feeds two (the promoted winner + the next fixture) — so the single
+# substitution primitive serves every Controller rather than each re-implementing it.
+@dataclass(frozen=True)
+class _Substitution:
+    to_node: str
+    to_field: str
+    value: object
 
-    Iteration 1 (``feedback_value is None``) is the base workflow unchanged. A later
-    iteration replaces ``spec.feedback.to_field`` of node ``spec.feedback.to_node``
-    with the fed-forward value, so the materialized run carries the prior iteration's
-    feedback BEFORE it is normalized and frozen (ADR 0009). With no ``feedback`` spec,
-    the workflow is reused unchanged (a pure idempotent loop).
+
+def _feedback_substitution(
+    feedback: "FeedbackSpec | None", value: object | None
+) -> tuple[_Substitution, ...]:
+    """The (at most one) substitution a feedback spec contributes for an iteration.
+
+    Iteration 1 (``value is None``) or a spec with no ``feedback`` contributes none, so
+    the base workflow is reused unchanged (a pure idempotent loop). Otherwise the
+    fed-forward value is substituted into ``feedback.to_field`` of ``feedback.to_node``.
     """
-    if spec.feedback is None or feedback_value is None:
+    if feedback is None or value is None:
+        return ()
+    return (_Substitution(to_node=feedback.to_node, to_field=feedback.to_field, value=value),)
+
+
+def _materialize_iteration_raw(
+    base_raw: dict[str, Any], substitutions: tuple[_Substitution, ...]
+) -> dict[str, Any]:
+    """Build iteration N's raw workflow mapping, applying structural substitutions.
+
+    With no substitutions the base workflow is returned unchanged. Otherwise each
+    substitution replaces a NAMED node's NAMED input field with a fed-forward value
+    BEFORE the run is normalized and frozen, so the materialized run carries the prior
+    iteration's feedback (ADR 0009, structural substitution — never string templating).
+    Feedback requires a ``nodes:`` workflow (a ``pattern:`` workflow cannot carry it in
+    v0.1), and a substitution target absent from the workflow is a controller refusal.
+    """
+    if not substitutions:
         return base_raw
-    feedback = spec.feedback
     nodes = base_raw.get("nodes")
     if not isinstance(nodes, list):
         raise ControllerError(
             "feedback requires a `nodes:` iteration workflow; "
             "a `pattern:` workflow cannot carry feedback in v0.1"
         )
+    by_node: dict[str, list[_Substitution]] = {}
+    for substitution in substitutions:
+        by_node.setdefault(substitution.to_node, []).append(substitution)
     substituted_nodes: list[Any] = []
-    found = False
+    found: set[str] = set()
     for node in nodes:
-        if isinstance(node, dict) and node.get("id") == feedback.to_node:
-            found = True
+        node_id = node.get("id") if isinstance(node, dict) else None
+        applicable = by_node.get(node_id) if isinstance(node_id, str) else None
+        if isinstance(node, dict) and isinstance(node_id, str) and applicable:
+            found.add(node_id)
             inputs = dict(node.get("inputs", {}))
-            inputs[feedback.to_field] = feedback_value
+            for substitution in applicable:
+                inputs[substitution.to_field] = substitution.value
             substituted_nodes.append({**node, "inputs": inputs})
         else:
             substituted_nodes.append(node)
-    if not found:
+    missing = sorted(set(by_node) - found)
+    if missing:
         raise ControllerError(
-            f"feedback target node {feedback.to_node!r} is not in the iteration workflow"
+            f"feedback target node {missing[0]!r} is not in the iteration workflow"
         )
     return {**base_raw, "nodes": substituted_nodes}
 
@@ -266,7 +312,9 @@ async def _drive_loop(
 
     while len(completed) < spec.max_iterations:
         index = len(completed)
-        iteration_raw = _materialize_iteration_raw(base_raw, spec, feedback_value)
+        iteration_raw = _materialize_iteration_raw(
+            base_raw, _feedback_substitution(spec.feedback, feedback_value)
+        )
         workflow = normalize_workflow(
             iteration_raw, source=f"{spec.workflow} (iteration {index})", base_dir=base_dir
         )
@@ -351,14 +399,37 @@ def _persist_group_state(
     iterations: tuple[IterationResult, ...],
     status: str,
 ) -> None:
-    """Persist the Run Group's authoritative controller state to ``group.json``.
+    """Persist a ``loop_until_done`` Run Group's authoritative controller state.
 
     Records the group id, the spec, the ordered iterations (run id + outcome), the
     iteration index, and the group status — the resumable source of truth (ADR 0002).
     """
-    state = {
+    _write_group_state(base, group_id, spec.model_dump(mode="json"), iterations, status)
+
+
+def _write_group_state(
+    base: Path,
+    group_id: str,
+    spec_dump: dict[str, Any],
+    iterations: tuple[IterationResult, ...],
+    status: str,
+    *,
+    extra_iteration_fields: dict[str, dict[str, Any]] | None = None,
+    extra: dict[str, Any] | None = None,
+) -> None:
+    """Write a Run Group's authoritative ``group.json``, shared by every Controller.
+
+    ``spec_dump`` is the serialized controller spec (so a resume reconstructs the
+    loop from it); ``iterations`` is the ordered per-iteration outcomes. A Controller
+    may attach extra per-iteration fields (``extra_iteration_fields`` keyed by run id —
+    e.g. the tournament's promoted winner) and extra top-level fields (``extra`` — e.g.
+    the tournament's final winner), keeping ``group.json`` the single authoritative,
+    queryable source of the group's control flow and result.
+    """
+    per_iteration = extra_iteration_fields or {}
+    state: dict[str, Any] = {
         "group_id": group_id,
-        "spec": spec.model_dump(mode="json"),
+        "spec": spec_dump,
         "iteration_index": len(iterations),
         "status": status,
         "iterations": [
@@ -366,9 +437,11 @@ def _persist_group_state(
                 "iteration_index": it.iteration_index,
                 "run_id": it.run_id,
                 "succeeded": it.succeeded,
+                **per_iteration.get(it.run_id, {}),
             }
             for it in iterations
         ],
+        **(extra or {}),
     }
     group_state_path(group_id, base).write_text(
         json.dumps(state, indent=2) + "\n", encoding="utf-8"
@@ -454,5 +527,571 @@ async def resume_loop_until_done(
         group_id,
         resolved_registry,
         iterations=tuple(completed),
+        feedback_value=feedback_value,
+    )
+
+
+# ======================================================================================
+# Adversarial verification (#17)
+# ======================================================================================
+#
+# Adversarial verification runs a generator, runs verifier nodes against the result,
+# and yields one of THREE outcomes per round (the AC): ACCEPT the result (stops), an
+# explicit REJECT (stops), or REGENERATE via a new Run in the same Run Group with the
+# verifier's feedback fed forward. It is a Pattern Controller on the SAME Run Group
+# infrastructure ``loop_until_done`` uses — immutable per-round Runs, the membership
+# mirror, the ``group.json`` control state, and structural feedback substitution
+# (ADR 0009, NO string templating) — with its own accept/reject verdict vocabulary and
+# stop reasons.
+
+# The adversarial Run Group's status (#17), at parity with the loop-until-done set:
+#   TERMINAL (resume refused — nothing to do):
+#     "accepted" — the accept Predicate held over a round's verifier output
+#     "rejected" — an explicit reject Predicate held over a round's output, OR the round
+#                  index reached max_rounds without an acceptance (cap-exhausted). Both
+#                  are a terminal reject; the explicit reject stops early, the cap is the
+#                  fallback when no reject Predicate is declared.
+#   RESUMABLE (resume continues the verification):
+#     "running"  — an in-progress marker persisted BETWEEN rounds
+#     "failed"   — a round's Run failed (resumable per Resume Eligibility)
+GROUP_ACCEPTED = "accepted"
+GROUP_REJECTED = "rejected"
+
+
+class AdversarialSpec(BaseModel):
+    """The authored definition of an adversarial-verification Run Group (#17).
+
+    ``workflow`` is the round ``Workflow`` file (an ordinary single-iteration graph
+    carrying the generator and the verifier nodes); ``max_rounds`` is the hard cap on
+    regeneration rounds; ``verify_node`` is the id of the node whose normalized output
+    the ``accept`` / ``reject`` Predicates (the ``when`` algebra, ADR 0007) read.
+
+    The verifier yields THREE outcomes (the AC: accept / reject / regenerate), decided
+    per round in order: ``accept`` holds -> terminate ``accepted``; else the OPTIONAL
+    ``reject`` holds -> terminate ``rejected`` (an explicit verifier reject, distinct
+    from cap-exhaustion); else regenerate with the verifier's feedback. Reaching
+    ``max_rounds`` without an acceptance also terminates ``rejected`` (cap-exhausted).
+    ``reject`` is optional: a spec that omits it preserves the cap-only behavior (a
+    non-accepted round always regenerates until the cap). ``feedback`` (optional)
+    carries the verifier's critique into the next round's generation (structural
+    substitution).
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    workflow: Path
+    max_rounds: int = Field(ge=1)
+    # The id of the node whose normalized output the accept/reject Predicates and the
+    # feedback source read — the round's verdict carrier, mirroring a `when` ref's node
+    # and ControllerSpec's `evaluate_node`.
+    verify_node: str
+    accept: Predicate
+    # An OPTIONAL explicit verifier reject (symmetric with `accept`): when it holds the
+    # group terminates `rejected` immediately, distinct from cap-exhaustion. Omitted ->
+    # today's cap-only behavior (a non-accepted round regenerates until max_rounds).
+    reject: Predicate | None = None
+    feedback: FeedbackSpec | None = None
+
+    @model_validator(mode="after")
+    def _verdict_refs_must_target_verify_node(self) -> "AdversarialSpec":
+        # Every leaf ``ref`` in the accept (and optional reject) Predicate must address
+        # ``verify_node``: at evaluation time only that node's output is supplied to the
+        # Predicate, so a ref to a typo or a different node would silently evaluate false
+        # and the loop would misbehave. Reject it at validation (fail fast over fail
+        # silent), mirroring ControllerSpec's done-ref invariant.
+        for verdict_name, predicate in (("accept", self.accept), ("reject", self.reject)):
+            if predicate is None:
+                continue
+            for ref in predicate.leaf_refs():
+                if ref.node != self.verify_node:
+                    raise ValueError(
+                        f"{verdict_name} predicate references node {ref.node!r}, but only "
+                        f"verify_node {self.verify_node!r}'s output is available to it"
+                    )
+        return self
+
+
+async def run_adversarial_verification(
+    spec: AdversarialSpec, base: Path, registry: AdapterRegistry | None = None
+) -> GroupResult:
+    """Drive an adversarial-verification Run Group to completion (#17, ADR 0002 / 0009).
+
+    Materializes each verification round as a separate immutable Run under the group's
+    ``iterations/`` root, feeding the verifier's feedback forward into the next round's
+    generation, and stops when the accept Predicate holds (``accepted``), a round's Run
+    fails (``failed``), or the round index reaches ``max_rounds`` (``rejected``).
+    """
+    group_id = _new_group_id()
+    group_dir(group_id, base).mkdir(parents=True, exist_ok=True)
+    return await _drive_adversarial(
+        spec, base, group_id, registry, iterations=(), feedback_value=None
+    )
+
+
+async def _drive_adversarial(
+    spec: AdversarialSpec,
+    base: Path,
+    group_id: str,
+    registry: AdapterRegistry | None,
+    *,
+    iterations: tuple[IterationResult, ...],
+    feedback_value: object | None,
+) -> GroupResult:
+    """The verification round loop, shared by a fresh run and a group resume."""
+    resolved_registry = registry or AdapterRegistry()
+    iterations_root = group_iterations_root(group_id, base)
+    iterations_root.mkdir(parents=True, exist_ok=True)
+    base_raw = load_workflow_file(spec.workflow)
+    base_dir = spec.workflow.resolve().parent
+    completed = list(iterations)
+
+    while len(completed) < spec.max_rounds:
+        index = len(completed)
+        round_raw = _materialize_iteration_raw(
+            base_raw, _feedback_substitution(spec.feedback, feedback_value)
+        )
+        workflow = normalize_workflow(
+            round_raw, source=f"{spec.workflow} (round {index})", base_dir=base_dir
+        )
+        if not any(node.id == spec.verify_node for node in workflow.nodes):
+            raise ControllerError(f"verify_node {spec.verify_node!r} is not in the round workflow")
+        result = await execute_run(workflow, iterations_root, resolved_registry)
+        run_dir = iterations_root / result.run_id
+        _record_membership(run_dir, result.run_id, group_id, index)
+        completed.append(
+            IterationResult(
+                iteration_index=index, run_id=result.run_id, succeeded=result.succeeded
+            )
+        )
+
+        status = _verification_verdict(spec, run_dir, result)
+        if status is not None:
+            _persist_adversarial_state(spec, base, group_id, tuple(completed), status)
+            return GroupResult(group_id=group_id, status=status, iterations=tuple(completed))
+
+        # Rejected and not the last round: feed the verifier's feedback forward and
+        # persist the in-progress (RUNNING) state before the next round, so an
+        # interruption here reads distinctly from the terminal REJECTED.
+        feedback_value = _adversarial_feedback(spec, run_dir, result.run_id)
+        _persist_adversarial_state(spec, base, group_id, tuple(completed), GROUP_RUNNING)
+
+    # The cap was reached without an acceptance: this REJECTED is terminal.
+    _persist_adversarial_state(spec, base, group_id, tuple(completed), GROUP_REJECTED)
+    return GroupResult(group_id=group_id, status=GROUP_REJECTED, iterations=tuple(completed))
+
+
+def _verification_verdict(spec: AdversarialSpec, run_dir: Path, result: RunResult) -> str | None:
+    """The terminal status if the verification should stop after this round, else None.
+
+    The per-round order realizes the AC's three outcomes (accept / reject / regenerate):
+    a failed Run stops ``failed``; else the accept Predicate holding stops ``accepted``;
+    else the OPTIONAL reject Predicate holding stops ``rejected`` (an explicit verifier
+    reject); else ``None`` to REGENERATE (the caller stops ``rejected`` at max_rounds).
+    Accept is checked before reject, so a round that could satisfy both is accepted.
+    """
+    if not result.succeeded:
+        return GROUP_FAILED
+    output = _evaluate_node_output(run_dir, result.run_id, spec.verify_node)
+
+    def output_of(node_id: str) -> dict[str, Any] | None:
+        return output if node_id == spec.verify_node else None
+
+    if evaluate_predicate(spec.accept, output_of):
+        return GROUP_ACCEPTED
+    if spec.reject is not None and evaluate_predicate(spec.reject, output_of):
+        return GROUP_REJECTED
+    return None
+
+
+def _adversarial_feedback(spec: AdversarialSpec, run_dir: Path, run_id: str) -> object | None:
+    """The verifier feedback to feed into the next round, or ``None`` when not declared."""
+    if spec.feedback is None:
+        return None
+    output = _evaluate_node_output(run_dir, run_id, spec.verify_node)
+    return _feedback_value(output, spec.feedback.from_field)
+
+
+def _persist_adversarial_state(
+    spec: AdversarialSpec,
+    base: Path,
+    group_id: str,
+    iterations: tuple[IterationResult, ...],
+    status: str,
+) -> None:
+    """Persist the adversarial Run Group's authoritative controller state (ADR 0009)."""
+    _write_group_state(base, group_id, spec.model_dump(mode="json"), iterations, status)
+
+
+async def resume_adversarial_verification(
+    group_id: str, base: Path, registry: AdapterRegistry | None = None
+) -> GroupResult:
+    """Resume an interrupted adversarial-verification Run Group (#17, ADR 0002 / 0009).
+
+    Re-reads ``group.json`` and resumes only a NON-TERMINAL group: ``accepted`` (the
+    accept Predicate held) and ``rejected`` (the cap was reached) are terminal and
+    refused; ``running`` (interrupted between rounds) and ``failed`` (the last round's
+    Run is itself resumable per Resume Eligibility) continue. A SUCCEEDED round Run is
+    never re-run; an incomplete last round is ``resume_run``'d in place, then the loop
+    continues feeding the last completed round's feedback forward.
+    """
+    persisted = load_group_state(group_id, base)
+    spec = AdversarialSpec.model_validate(persisted["spec"])
+    resolved_registry = registry or AdapterRegistry()
+    iterations_root = group_iterations_root(group_id, base)
+
+    status = persisted["status"]
+    if status in {GROUP_ACCEPTED, GROUP_REJECTED}:
+        raise ControllerError(
+            f"run group {group_id!r} already finished (status: {status}); nothing to resume"
+        )
+
+    completed = [
+        IterationResult(
+            iteration_index=it["iteration_index"],
+            run_id=it["run_id"],
+            succeeded=it["succeeded"],
+        )
+        for it in persisted["iterations"]
+    ]
+
+    if completed:
+        last = completed[-1]
+        last_run_dir = iterations_root / last.run_id
+        with StateStore(last_run_dir / "state.sqlite", read_only=True) as state:
+            last_status = state.run_status(last.run_id)
+        if is_resumable(last_status):
+            resumed = await resume_run(last.run_id, iterations_root, resolved_registry)
+            completed[-1] = IterationResult(
+                iteration_index=last.iteration_index,
+                run_id=resumed.run_id,
+                succeeded=resumed.succeeded,
+            )
+            _record_membership(last_run_dir, resumed.run_id, group_id, last.iteration_index)
+            verdict = _verification_verdict(spec, last_run_dir, resumed)
+            if verdict is not None:
+                _persist_adversarial_state(spec, base, group_id, tuple(completed), verdict)
+                return GroupResult(group_id=group_id, status=verdict, iterations=tuple(completed))
+
+    feedback_value: object | None = None
+    if completed:
+        last = completed[-1]
+        feedback_value = _adversarial_feedback(spec, iterations_root / last.run_id, last.run_id)
+
+    return await _drive_adversarial(
+        spec,
+        base,
+        group_id,
+        resolved_registry,
+        iterations=tuple(completed),
+        feedback_value=feedback_value,
+    )
+
+
+# ======================================================================================
+# Tournament (#17)
+# ======================================================================================
+#
+# A tournament runs candidates in rounds, compares their outputs, promotes the round's
+# winner into the next round, and reports the final result with each round's comparison
+# evidence. It is a Pattern Controller on the SAME Run Group infrastructure — immutable
+# per-round Runs, the membership mirror, the ``group.json`` control state, structural
+# substitution (ADR 0009). Each round is one Run whose ``compare_node`` names a winner
+# in its ``structured_output``; the Controller promotes that winner (and optionally
+# feeds a next-round fixture forward) into the next round, and runs a fixed number of
+# rounds. The per-round comparison evidence lives in each round's compare-node output,
+# so the aggregate group report (which already carries every node's structured_output)
+# surfaces it with no report change; the final winner is recorded on ``group.json``.
+
+# The tournament Run Group's status (#17):
+#   TERMINAL: "complete" — every round ran and the final winner was promoted
+#   RESUMABLE: "running" (interrupted between rounds), "failed" (a round's Run failed,
+#              OR a succeeded round named no winner so the tournament cannot complete
+#              with a final result — the AC requires promoting winners and reporting
+#              the final result, so a winnerless round is a failure, not a complete)
+GROUP_COMPLETE = "complete"
+
+
+class PromoteSpec(BaseModel):
+    """Where a tournament promotes a round's winner into the next round (#17).
+
+    The winner SOURCE is fixed — ``TournamentSpec.compare_node``'s
+    ``structured_output[winner_field]`` — so a PromoteSpec only names the DESTINATION:
+    the winner is substituted into ``to_field`` of node ``to_node`` BEFORE the next
+    round materializes (structural substitution, ADR 0009).
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    to_node: str
+    to_field: str
+
+
+class TournamentSpec(BaseModel):
+    """The authored definition of a tournament Run Group (#17).
+
+    ``workflow`` is the round ``Workflow`` file (an ordinary single-iteration graph
+    that runs/compares candidates); ``rounds`` is how many rounds to run; ``compare_node``
+    is the id of the node whose ``structured_output`` names the round's winner;
+    ``winner_field`` is the field of that output carrying the winning candidate;
+    ``promote`` (optional) substitutes the winner into the next round's named input;
+    ``feedback`` (optional) feeds a next-round value (e.g. the next compare fixture)
+    forward, exactly as the other Controllers do.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    workflow: Path
+    rounds: int = Field(ge=1)
+    compare_node: str
+    winner_field: str
+    promote: PromoteSpec | None = None
+    feedback: FeedbackSpec | None = None
+
+
+async def run_tournament(
+    spec: TournamentSpec, base: Path, registry: AdapterRegistry | None = None
+) -> GroupResult:
+    """Drive a tournament Run Group to completion (#17, ADR 0002 / 0009).
+
+    Materializes each round as a separate immutable Run, promoting the round's winner
+    into the next round, until every round has run (``complete``) or a round's Run
+    fails (``failed``). The final round's winner is the tournament's reported result.
+    """
+    group_id = _new_group_id()
+    group_dir(group_id, base).mkdir(parents=True, exist_ok=True)
+    return await _drive_tournament(
+        spec, base, group_id, registry, iterations=(), promoted=(), feedback_value=None
+    )
+
+
+async def _drive_tournament(
+    spec: TournamentSpec,
+    base: Path,
+    group_id: str,
+    registry: AdapterRegistry | None,
+    *,
+    iterations: tuple[IterationResult, ...],
+    promoted: tuple[str | None, ...],
+    feedback_value: object | None,
+) -> GroupResult:
+    """The round loop, shared by a fresh run and a group resume.
+
+    ``promoted`` seeds the already-recorded per-round winners (aligned with
+    ``iterations``); ``feedback_value`` seeds the next round's fed-forward value.
+    """
+    resolved_registry = registry or AdapterRegistry()
+    iterations_root = group_iterations_root(group_id, base)
+    iterations_root.mkdir(parents=True, exist_ok=True)
+    base_raw = load_workflow_file(spec.workflow)
+    base_dir = spec.workflow.resolve().parent
+    completed = list(iterations)
+    winners = list(promoted)
+    last_winner = winners[-1] if winners else None
+
+    while len(completed) < spec.rounds:
+        index = len(completed)
+        round_raw = _materialize_iteration_raw(
+            base_raw, _round_substitutions(spec, last_winner, feedback_value)
+        )
+        workflow = normalize_workflow(
+            round_raw, source=f"{spec.workflow} (round {index})", base_dir=base_dir
+        )
+        if not any(node.id == spec.compare_node for node in workflow.nodes):
+            raise ControllerError(
+                f"compare_node {spec.compare_node!r} is not in the round workflow"
+            )
+        result = await execute_run(workflow, iterations_root, resolved_registry)
+        run_dir = iterations_root / result.run_id
+        _record_membership(run_dir, result.run_id, group_id, index)
+        completed.append(
+            IterationResult(
+                iteration_index=index, run_id=result.run_id, succeeded=result.succeeded
+            )
+        )
+
+        if not result.succeeded:
+            # A failed round has no winner to promote forward: stop the tournament.
+            winners.append(None)
+            _persist_tournament_state(
+                spec, base, group_id, tuple(completed), tuple(winners), GROUP_FAILED
+            )
+            return GroupResult(group_id=group_id, status=GROUP_FAILED, iterations=tuple(completed))
+
+        last_winner = _round_winner(spec, run_dir, result.run_id)
+        if last_winner is None:
+            # A round whose compare node SUCCEEDED but named no winner (its
+            # structured_output omits `winner_field`) cannot promote a winner forward
+            # nor report a final result. The tournament must "promote winners" and
+            # "report the final result" (AC), so a winnerless round is a controller
+            # FAILURE — never a `complete` with no winner.
+            winners.append(None)
+            _persist_tournament_state(
+                spec, base, group_id, tuple(completed), tuple(winners), GROUP_FAILED
+            )
+            return GroupResult(group_id=group_id, status=GROUP_FAILED, iterations=tuple(completed))
+        winners.append(last_winner)
+        feedback_value = _tournament_feedback(spec, run_dir, result.run_id)
+        status = GROUP_COMPLETE if len(completed) >= spec.rounds else GROUP_RUNNING
+        _persist_tournament_state(spec, base, group_id, tuple(completed), tuple(winners), status)
+
+    return GroupResult(
+        group_id=group_id,
+        status=GROUP_COMPLETE,
+        iterations=tuple(completed),
+        winner=last_winner,
+    )
+
+
+def _round_substitutions(
+    spec: TournamentSpec, winner: str | None, feedback_value: object | None
+) -> tuple[_Substitution, ...]:
+    """The structural substitutions for a round: the promoted winner + any feedback.
+
+    Round 1 promotes nothing (no prior winner). A later round substitutes the prior
+    round's winner into ``promote`` (when declared) AND the fed-forward feedback value
+    into ``feedback`` (when declared) — composed into the single substitution primitive.
+    """
+    substitutions: list[_Substitution] = []
+    if spec.promote is not None and winner is not None:
+        substitutions.append(
+            _Substitution(
+                to_node=spec.promote.to_node, to_field=spec.promote.to_field, value=winner
+            )
+        )
+    substitutions.extend(_feedback_substitution(spec.feedback, feedback_value))
+    return tuple(substitutions)
+
+
+def _round_winner(spec: TournamentSpec, run_dir: Path, run_id: str) -> str | None:
+    """The round's winning candidate: ``compare_node``'s ``structured_output[winner_field]``.
+
+    ``None`` when the compare node produced no structured output or lacks the field. A
+    succeeded round that names ``None`` cannot promote a winner nor report a final
+    result, so the driver treats it as a controller failure (the AC requires promoting
+    winners). The value is coerced to ``str`` (a candidate identifier) when present.
+    """
+    output = _evaluate_node_output(run_dir, run_id, spec.compare_node)
+    if output is None:
+        return None
+    structured = output.get("structured_output")
+    if not isinstance(structured, dict):
+        return None
+    winner = structured.get(spec.winner_field)
+    return None if winner is None else str(winner)
+
+
+def _tournament_feedback(spec: TournamentSpec, run_dir: Path, run_id: str) -> object | None:
+    """The value to feed the next round, or ``None`` when no feedback spec is declared."""
+    if spec.feedback is None:
+        return None
+    output = _evaluate_node_output(run_dir, run_id, spec.compare_node)
+    return _feedback_value(output, spec.feedback.from_field)
+
+
+def _persist_tournament_state(
+    spec: TournamentSpec,
+    base: Path,
+    group_id: str,
+    iterations: tuple[IterationResult, ...],
+    winners: tuple[str | None, ...],
+    status: str,
+) -> None:
+    """Persist the tournament Run Group's authoritative controller state (ADR 0009).
+
+    Records each round's promoted winner on its iteration entry (the comparison trail)
+    and the final winner at the top level, so ``group.json`` is the single queryable
+    source of the tournament's result without re-reading every round's output.
+    """
+    extra_iteration_fields = {
+        it.run_id: {"promoted": winners[position]}
+        for position, it in enumerate(iterations)
+        if position < len(winners)
+    }
+    final_winner = next((winner for winner in reversed(winners) if winner is not None), None)
+    _write_group_state(
+        base,
+        group_id,
+        spec.model_dump(mode="json"),
+        iterations,
+        status,
+        extra_iteration_fields=extra_iteration_fields,
+        extra={"winner": final_winner},
+    )
+
+
+async def resume_tournament(
+    group_id: str, base: Path, registry: AdapterRegistry | None = None
+) -> GroupResult:
+    """Resume an interrupted tournament Run Group (#17, ADR 0002 / 0009).
+
+    Re-reads ``group.json`` and resumes only a NON-TERMINAL group: ``complete`` (every
+    round ran) is terminal and refused; ``running`` (interrupted between rounds) and
+    ``failed`` (the last round's Run is itself resumable per Resume Eligibility)
+    continue. A SUCCEEDED round Run is never re-run; an incomplete last round is
+    ``resume_run``'d in place, then the loop continues promoting the last winner forward.
+    """
+    persisted = load_group_state(group_id, base)
+    spec = TournamentSpec.model_validate(persisted["spec"])
+    resolved_registry = registry or AdapterRegistry()
+    iterations_root = group_iterations_root(group_id, base)
+
+    status = persisted["status"]
+    if status == GROUP_COMPLETE:
+        raise ControllerError(
+            f"run group {group_id!r} already finished (status: {status}); nothing to resume"
+        )
+
+    completed = [
+        IterationResult(
+            iteration_index=it["iteration_index"],
+            run_id=it["run_id"],
+            succeeded=it["succeeded"],
+        )
+        for it in persisted["iterations"]
+    ]
+    winners: list[str | None] = [it.get("promoted") for it in persisted["iterations"]]
+
+    if completed:
+        last = completed[-1]
+        last_run_dir = iterations_root / last.run_id
+        with StateStore(last_run_dir / "state.sqlite", read_only=True) as state:
+            last_status = state.run_status(last.run_id)
+        if is_resumable(last_status):
+            resumed = await resume_run(last.run_id, iterations_root, resolved_registry)
+            completed[-1] = IterationResult(
+                iteration_index=last.iteration_index,
+                run_id=resumed.run_id,
+                succeeded=resumed.succeeded,
+            )
+            _record_membership(last_run_dir, resumed.run_id, group_id, last.iteration_index)
+            resumed_winner = (
+                _round_winner(spec, last_run_dir, resumed.run_id) if resumed.succeeded else None
+            )
+            if not resumed.succeeded or resumed_winner is None:
+                # A failed round, or a succeeded round that named no winner, cannot
+                # promote a winner forward (parity with the fresh-drive guard): fail.
+                if winners:
+                    winners[-1] = None
+                _persist_tournament_state(
+                    spec, base, group_id, tuple(completed), tuple(winners), GROUP_FAILED
+                )
+                return GroupResult(
+                    group_id=group_id, status=GROUP_FAILED, iterations=tuple(completed)
+                )
+            if winners:
+                winners[-1] = resumed_winner
+
+    feedback_value: object | None = None
+    if completed and completed[-1].succeeded:
+        last = completed[-1]
+        feedback_value = _tournament_feedback(spec, iterations_root / last.run_id, last.run_id)
+
+    return await _drive_tournament(
+        spec,
+        base,
+        group_id,
+        resolved_registry,
+        iterations=tuple(completed),
+        promoted=tuple(winners),
         feedback_value=feedback_value,
     )
