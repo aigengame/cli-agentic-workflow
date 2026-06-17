@@ -19,7 +19,7 @@ from pathlib import Path
 from types import TracebackType
 from typing import Any
 
-from caw.status import ERRORED, RUNNING, SKIPPED, NodeStatus, RunStatus
+from caw.status import AWAITING, ERRORED, PARKED, RUNNING, SKIPPED, NodeStatus, RunStatus
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS run (
@@ -125,6 +125,18 @@ class StateStore:
             (ERRORED, error, finished_at, run_id),
         )
 
+    def record_run_parked(self, run_id: str) -> None:
+        """Mark a Run ``parked`` at a Human Gate (#10, ADR 0010).
+
+        A parked Run is not finished — it awaits approval and will resume — so,
+        unlike ``record_run_finished``, it sets no ``finished_at``. A resume flips
+        it back to ``running`` (``record_run_running``) before advancing.
+        """
+        self._execute(
+            "UPDATE run SET status = ? WHERE run_id = ?",
+            (PARKED, run_id),
+        )
+
     def record_node_started(self, run_id: str, node_id: str) -> None:
         self._execute(
             "INSERT INTO node (run_id, node_id, status) VALUES (?, ?, ?)",
@@ -171,6 +183,21 @@ class StateStore:
         self._execute(
             "INSERT INTO node (run_id, node_id, status, cause) VALUES (?, ?, ?, ?)",
             (run_id, node_id, SKIPPED, cause),
+        )
+
+    def record_node_awaiting(self, run_id: str, node_id: str) -> None:
+        """Record a human_gate Node as ``awaiting`` approval (#10, ADR 0010).
+
+        A gate launches no Attempt, so like a skipped Node it has no prior
+        ``running`` row on first park: it is inserted straight into ``awaiting``.
+        A plain resume of an already-parked Run re-parks the same gate, whose row
+        now exists, so the write UPSERTs on the ``(run_id, node_id)`` PK to stay
+        idempotent rather than breaching it.
+        """
+        self._execute(
+            "INSERT INTO node (run_id, node_id, status) VALUES (?, ?, ?) "
+            "ON CONFLICT(run_id, node_id) DO UPDATE SET status = excluded.status",
+            (run_id, node_id, AWAITING),
         )
 
     def record_attempt(

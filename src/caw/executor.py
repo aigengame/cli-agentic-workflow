@@ -20,6 +20,7 @@ from caw.contract import OutputContractError, validate_output_contract
 from caw.events import EventLog
 from caw.model import (
     AgentNodeInputs,
+    HumanGateNodeInputs,
     Node,
     ShellNodeInputs,
     Workflow,
@@ -32,6 +33,7 @@ from caw.state import StateStore
 from caw.status import (
     ERRORED,
     FAILED,
+    PARKED,
     SKIPPED,
     SUCCEEDED,
     TIMED_OUT,
@@ -165,6 +167,11 @@ class RunResult:
     ``join: any`` Node whose every dependency skipped). A ``blocked`` skip carries
     a ``skipped_blockers`` entry; the others carry none, so a Reporter renders a
     closed gate distinctly from withheld-by-failure work.
+
+    ``awaiting_node_ids`` names the human_gate Nodes the Run is parked on (#10): a
+    non-empty set means the Run did not finish — it parked at the scheduler
+    fixpoint awaiting approval — and its ``status`` is ``parked`` regardless of how
+    the already-run Nodes fared.
     """
 
     run_id: str
@@ -172,6 +179,12 @@ class RunResult:
     skipped_node_ids: tuple[str, ...] = ()
     skipped_blockers: Mapping[str, str] = field(default_factory=dict)
     skipped_causes: Mapping[str, str] = field(default_factory=dict)
+    awaiting_node_ids: tuple[str, ...] = ()
+
+    @property
+    def parked(self) -> bool:
+        """Whether the Run parked at a Human Gate rather than reaching a terminal (#10)."""
+        return bool(self.awaiting_node_ids)
 
     @property
     def succeeded(self) -> bool:
@@ -184,6 +197,10 @@ class RunResult:
 
     @property
     def status(self) -> RunStatus:
+        # A parked Run is neither succeeded nor failed — it is awaiting approval, so
+        # `parked` takes precedence over the run-down node outcomes (#10).
+        if self.parked:
+            return PARKED
         return SUCCEEDED if self.succeeded else FAILED
 
 
@@ -456,6 +473,13 @@ async def _execute_node(node: Node, registry: AdapterRegistry) -> NodeResult:
     """
     if isinstance(node.inputs, ShellNodeInputs):
         return await _execute_shell_node(node)
+    if isinstance(node.inputs, HumanGateNodeInputs):
+        # A human_gate launches no Attempt: the scheduler parks it in place
+        # (_park_gate). Reaching this dispatch means the scheduler failed to
+        # intercept it — an internal invariant breach, not a node failure (#10).
+        raise RuntimeError(
+            f"human_gate node {node.id!r} must be parked by the scheduler, not executed"
+        )
     try:
         return await _execute_agent_node(node, registry)
     except Exception as exc:
@@ -569,6 +593,12 @@ class _Scheduler:
         # ``_skipped`` on every visit (which made a wide skip cone quadratic).
         self._skipped_set: set[str] = set()
         self._result_ids: set[str] = set()
+        # human_gate Nodes parked in place: recorded `awaiting`, launched as no
+        # task. Like a done Node they are excluded from readiness so they are never
+        # re-launched, but unlike a succeeded Node they do NOT satisfy dependents —
+        # so the Run reaches a fixpoint and parks rather than running past the gate
+        # (#10, ADR 0010).
+        self._awaiting: set[str] = set()
         # Per-Node Attempt bookkeeping for the in-run retry loop (#6). ``_attempt``
         # is the Attempt NUMBER the next launch of a Node uses, so re-launched
         # Nodes write distinct ``attempt`` rows ((run_id, node_id, attempt) is the
@@ -598,7 +628,7 @@ class _Scheduler:
     def _ready_nodes(self) -> list[Node]:
         """Nodes whose needs are all satisfied and that are neither running nor done."""
         running = {node.id for node in self._in_flight.values()}
-        done = self._result_ids | self._skipped_set | self._satisfied.keys()
+        done = self._result_ids | self._skipped_set | self._satisfied.keys() | self._awaiting
         return [
             node
             for node in self._ordered
@@ -652,6 +682,20 @@ class _Scheduler:
         while True:
             progressed = False
             for node in self._ready_nodes():
+                if node.kind == "human_gate":
+                    # A gate consumes no concurrency slot and launches no task. A
+                    # gate whose own `when` gate closed is skipped like any Node,
+                    # propagating to its dependents (#7); otherwise it parks in place
+                    # (#10, ADR 0010).
+                    if node.when is not None and not evaluate_predicate(
+                        node.when, self._output_of
+                    ):
+                        self._skip_with_cause(node.id, cause=SKIP_WHEN_FALSE, blocker=None)
+                        progressed = True
+                        break
+                    self._park_gate(node)
+                    progressed = True
+                    continue
                 if len(self._in_flight) >= self._concurrency:
                     break
                 if node.when is not None and not evaluate_predicate(node.when, self._output_of):
@@ -676,6 +720,20 @@ class _Scheduler:
                 progressed = True
             if not progressed:
                 return
+
+    def _park_gate(self, node: Node) -> None:
+        """Record a human_gate Node as awaiting and park it in place (#10, ADR 0010).
+
+        The gate launches no Attempt and holds no concurrency slot: it is recorded
+        ``awaiting`` in State and the Event trace and tracked in ``_awaiting`` so
+        readiness excludes it (never re-launched) WITHOUT satisfying its dependents,
+        so the Run reaches a fixpoint and parks once nothing else can progress.
+        """
+        if node.id in self._awaiting:
+            return
+        self._state.record_node_awaiting(run_id=self._run_id, node_id=node.id)
+        self._awaiting.add(node.id)
+        self._events.append("gate_awaiting", {"node_id": node.id})
 
     def _record_attempt(self, node: Node, result: NodeResult) -> None:
         """Record one Attempt's outcome in State and the Event trace.
@@ -980,6 +1038,11 @@ class _Scheduler:
             skipped_node_ids=tuple(self._skipped),
             skipped_blockers=dict(self._skipped_blockers),
             skipped_causes=dict(self._skipped_causes),
+            # Deterministic declaration order (execution_order), so a parked Run's
+            # awaiting gates render stably (#10).
+            awaiting_node_ids=tuple(
+                node.id for node in self._ordered if node.id in self._awaiting
+            ),
         )
 
     async def _drain_in_flight(self) -> None:
@@ -1053,11 +1116,18 @@ async def _drive_scheduler(
     is recorded ``errored`` over every in-flight Node without masking the original
     exception. Shared by ``execute_run`` and ``resume_run`` so a resumed Run
     finalizes identically to a fresh one (#6).
+
+    A Run that parked at a Human Gate is NOT finished: it is recorded ``parked``
+    (no ``finished_at``) and emits no ``run_finished`` — the ``gate_awaiting``
+    Events already mark the park, and a resume advances it (#10, ADR 0010).
     """
     try:
         run_result = await scheduler.run()
-        state.record_run_finished(run_id=run_id, status=run_result.status, finished_at=_now())
-        events.append("run_finished", {"status": run_result.status})
+        if run_result.parked:
+            state.record_run_parked(run_id=run_id)
+        else:
+            state.record_run_finished(run_id=run_id, status=run_result.status, finished_at=_now())
+            events.append("run_finished", {"status": run_result.status})
     except BaseException as exc:
         message = str(exc)
         error = f"{type(exc).__name__}: {message}" if message else type(exc).__name__

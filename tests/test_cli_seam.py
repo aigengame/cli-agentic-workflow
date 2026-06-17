@@ -1411,3 +1411,42 @@ def test_run_malformed_agent_node_is_a_config_error_before_executing_anything(
     assert lines[0].startswith("error:")
     assert "summarize" in lines[0], "the error names the node id"
     assert not (tmp_path / ".caw").exists(), "no run directory is created for invalid input"
+
+
+def test_run_parking_at_a_human_gate_exits_zero_and_reports_parked(
+    write_workflow_data: Callable[[dict[str, Any]], Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # `caw run` reaching a human_gate parks cleanly in a non-TTY session (ADR 0010):
+    # the process exits 0 (a park is not a failure), names the awaiting gate, and does
+    # not report the Run succeeded.
+    workflow_file = write_workflow_data(
+        {
+            "name": "gated",
+            "version": 1,
+            "nodes": [
+                {"id": "build", "kind": "shell", "inputs": {"command": "echo built"}},
+                {
+                    "id": "gate",
+                    "kind": "human_gate",
+                    "needs": ["build"],
+                    "inputs": {"prompt": "Approve?"},
+                },
+                {
+                    "id": "deploy",
+                    "kind": "shell",
+                    "needs": ["gate"],
+                    "inputs": {"command": "echo deployed"},
+                },
+            ],
+        }
+    )
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["run", str(workflow_file)])
+
+    assert result.exit_code == 0, result.output
+    assert "parked" in result.output
+    assert "gate" in result.output
+    assert "succeeded" not in result.output, "a parked run is not reported succeeded"

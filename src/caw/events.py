@@ -22,6 +22,11 @@ EventType = Literal[
     "node_finished",
     "node_skipped",
     "node_retrying",
+    # Human Gate events (#10, ADR 0010): a gate parks the Run (awaiting), and an
+    # approval/rejection advances or ends it.
+    "gate_awaiting",
+    "gate_approved",
+    "gate_rejected",
 ]
 
 EVENT_TYPES: frozenset[str] = frozenset(get_args(EventType))
