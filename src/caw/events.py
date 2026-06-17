@@ -11,7 +11,7 @@ from typing import Any, Literal, get_args
 # frozenset derived from the SAME Literal so an unknown type is also rejected at
 # runtime — the event sequence is the machine-readable trace of a run, so an
 # unrecognized type must never slip in. New patterns extend this Literal in one
-# place (e.g. the Human Gate's gate_* events, ADR 0010) rather than passing raw
+# place (e.g. the Human Gate's gate_* events, #10) rather than passing raw
 # strings at call sites.
 EventType = Literal[
     "run_started",

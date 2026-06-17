@@ -29,7 +29,16 @@ from caw.model import (
 )
 from caw.predicate import evaluate_predicate
 from caw.state import StateStore
-from caw.status import ERRORED, FAILED, SKIPPED, SUCCEEDED, TIMED_OUT
+from caw.status import (
+    ERRORED,
+    FAILED,
+    SKIPPED,
+    SUCCEEDED,
+    TIMED_OUT,
+    FailureKind,
+    NodeStatus,
+    RunStatus,
+)
 
 # The named reasons a Node was skipped (#7), recorded as the skip's `cause` in
 # State and surfaced in the RunResult so a Reporter renders a closed `when` gate
@@ -89,7 +98,7 @@ class NodeResult:
     finished_at: str
     structured_output: object | None = None
     artifacts: tuple[Path, ...] = ()
-    failure_kind: str | None = None
+    failure_kind: FailureKind | None = None
     # The Adapter that ran an agent Node, threaded so a failure message can name
     # it (#6.5); ``None`` for a shell Node, which has no Adapter.
     adapter: str | None = None
@@ -105,9 +114,9 @@ class NodeResult:
         return self.failure_kind is None
 
     @property
-    def status(self) -> str:
+    def status(self) -> NodeStatus:
         # succeeded ⇔ failure_kind is None, so a non-success always carries a
-        # concrete kind string; assert keeps the return type str for mypy.
+        # concrete FailureKind (itself a NodeStatus member).
         if self.failure_kind is None:
             return SUCCEEDED
         return self.failure_kind
@@ -174,7 +183,7 @@ class RunResult:
         return all(result.succeeded for result in self.node_results)
 
     @property
-    def status(self) -> str:
+    def status(self) -> RunStatus:
         return SUCCEEDED if self.succeeded else FAILED
 
 

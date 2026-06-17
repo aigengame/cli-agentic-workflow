@@ -19,7 +19,7 @@ from pathlib import Path
 from types import TracebackType
 from typing import Any
 
-from caw.status import ERRORED, RUNNING, SKIPPED
+from caw.status import ERRORED, RUNNING, SKIPPED, NodeStatus, RunStatus
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS run (
@@ -100,7 +100,7 @@ class StateStore:
             (run_id, workflow_name, definition_checksum, RUNNING, created_at),
         )
 
-    def record_run_finished(self, run_id: str, status: str, finished_at: str) -> None:
+    def record_run_finished(self, run_id: str, status: RunStatus, finished_at: str) -> None:
         self._execute(
             "UPDATE run SET status = ?, finished_at = ? WHERE run_id = ?",
             (status, finished_at, run_id),
@@ -145,7 +145,7 @@ class StateStore:
         )
 
     def record_node_finished(
-        self, run_id: str, node_id: str, status: str, cause: str | None = None
+        self, run_id: str, node_id: str, status: NodeStatus, cause: str | None = None
     ) -> None:
         """Drive an existing Node row to a terminal status, with an optional cause.
 
