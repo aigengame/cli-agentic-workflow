@@ -31,6 +31,7 @@ from caw.model import (
 from caw.predicate import evaluate_predicate
 from caw.state import StateStore
 from caw.status import (
+    AWAITING,
     ERRORED,
     FAILED,
     PARKED,
@@ -1228,9 +1229,18 @@ def _load_resume_workflow(run_dir: Path, registry: AdapterRegistry) -> Workflow:
 
 
 async def resume_run(
-    run_id: str, runs_root: Path, registry: AdapterRegistry | None = None
+    run_id: str,
+    runs_root: Path,
+    registry: AdapterRegistry | None = None,
+    *,
+    approvals: tuple[str, ...] = (),
 ) -> RunResult:
     """Resume an interrupted or failed Run, re-running only its incomplete Nodes (#6).
+
+    ``approvals`` names human_gate Nodes to approve (#10, ADR 0010): each must be an
+    awaiting gate, and is flipped ``awaiting`` -> ``succeeded`` before classification
+    so the existing seed-satisfied path unlocks its dependents. A gate left awaiting
+    re-parks. Approving a Node that is not an awaiting gate is a ``ResumeError``.
 
     Reopens the EXISTING run directory ``runs_root/<run_id>`` (a ``ResumeError`` if
     absent or if the Run already succeeded), reconstructs the Workflow from the
@@ -1275,6 +1285,31 @@ async def resume_run(
                 f"not forward-compatible with this version"
             )
         node_statuses = state.node_statuses(run_id)
+        # Human Gate approvals (#10, ADR 0010): validate every named Node is an
+        # awaiting gate BEFORE mutating State (all-or-nothing), then flip each
+        # `awaiting` -> `succeeded` with an `{"approved": true}` output and a
+        # gate_approved Event, so the seed-satisfied classification below unlocks its
+        # dependents. A gate left unnamed stays `awaiting` and re-parks.
+        for node_id in approvals:
+            if node_statuses.get(node_id) != AWAITING:
+                raise ResumeError(
+                    f"cannot approve node {node_id!r}: it is not an awaiting human gate "
+                    f"(status: {node_statuses.get(node_id) or 'unknown'})"
+                )
+        for node_id in approvals:
+            now = _now()
+            state.record_attempt(
+                run_id=run_id,
+                node_id=node_id,
+                attempt=1,
+                started_at=now,
+                finished_at=now,
+                exit_status=0,
+                output={"approved": True},
+            )
+            state.record_node_finished(run_id=run_id, node_id=node_id, status=SUCCEEDED)
+            events.append("gate_approved", {"node_id": node_id})
+            node_statuses[node_id] = SUCCEEDED
         max_attempts = state.max_attempt_per_node(run_id)
         # A `succeeded` Node is done; every other recorded Node is re-run. A re-run
         # Node continues numbering past its recorded Attempts so the attempt PK

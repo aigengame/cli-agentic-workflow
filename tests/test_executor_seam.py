@@ -105,6 +105,35 @@ async def test_a_parked_run_is_not_reported_succeeded(tmp_path: Path) -> None:
     )
 
 
+@pytest.mark.asyncio
+async def test_approving_a_parked_gate_resumes_and_runs_downstream(tmp_path: Path) -> None:
+    # `caw resume --approve <gate>` flips the awaiting gate to succeeded and resumes
+    # through the existing seed-satisfied path (#10, ADR 0010): the gate's downstream
+    # now runs, the Run succeeds, and the approval is recorded as a gate_approved
+    # Event and an `{"approved": true}` node output.
+    runs_root = tmp_path / "runs"
+    parked = await execute_run(gated_workflow(), runs_root)
+    assert parked.status == "parked"
+
+    resumed = await resume_run(parked.run_id, runs_root, approvals=("gate",))
+
+    assert resumed.status == "succeeded"
+    assert "deploy" in {node.node_id for node in resumed.node_results}, (
+        "the approved gate's downstream runs"
+    )
+    run_dir = single_run_dir(runs_root)
+    statuses = {
+        row["node_id"]: row["status"]
+        for row in state_rows(run_dir, "SELECT node_id, status FROM node")
+    }
+    assert statuses["gate"] == "succeeded"
+    assert statuses["deploy"] == "succeeded"
+    events = read_events(run_dir)
+    assert any(
+        event["type"] == "gate_approved" and event["data"]["node_id"] == "gate" for event in events
+    )
+
+
 def test_rejected_and_succeeded_runs_are_not_resumable() -> None:
     # ADR 0010 Resume Eligibility: a `rejected` Run is refused like `succeeded`; a
     # `parked` Run, by contrast, is resumable (advanced by approve/reject), and the

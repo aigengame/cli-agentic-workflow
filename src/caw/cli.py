@@ -461,16 +461,29 @@ def run(workflow_file: Path) -> None:
 
 
 @app.command()
-def resume(run_id: str) -> None:
+def resume(
+    run_id: str,
+    approve: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--approve",
+            help="Approve an awaiting human gate by node id (repeatable).",
+        ),
+    ] = None,
+) -> None:
     """Resume an interrupted or failed run, re-running only its incomplete nodes.
 
     Mirrors ``run``'s output and exit-code contract: 0 on success, 1 on a failed
     node, 3 on an infrastructure error. An unknown run id or a run that already
     succeeded is not resumable and is refused as a config-class error (exit 2)
     with a single ``error:`` line, never re-executing it.
+
+    ``--approve <node-id>`` advances a parked run by approving an awaiting human
+    gate (#10); a gate left unnamed re-parks. Approving a node that is not an
+    awaiting gate is the same config-class refusal (exit 2).
     """
     try:
-        result = asyncio.run(resume_run(run_id, runs_root()))
+        result = asyncio.run(resume_run(run_id, runs_root(), approvals=tuple(approve or ())))
     except ResumeError as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=2) from exc
