@@ -91,6 +91,33 @@ async def test_a_run_reaching_a_human_gate_parks(tmp_path: Path) -> None:
     )
 
 
+@pytest.mark.asyncio
+async def test_a_parked_run_is_not_reported_succeeded(tmp_path: Path) -> None:
+    # A parked Run is not a successful terminal — it awaits approval (#10) — so
+    # RunResult.succeeded is False even though its already-run Nodes all succeeded,
+    # keeping controllers that branch on `succeeded` from misclassifying it.
+    result = await execute_run(gated_workflow(), tmp_path / "runs")
+
+    assert result.status == "parked"
+    assert result.succeeded is False
+    assert all(node.succeeded for node in result.node_results), (
+        "the run-down nodes still succeeded"
+    )
+
+
+def test_rejected_and_succeeded_runs_are_not_resumable() -> None:
+    # ADR 0010 Resume Eligibility: a `rejected` Run is refused like `succeeded`; a
+    # `parked` Run, by contrast, is resumable (advanced by approve/reject), and the
+    # other interrupted terminals stay resumable (#6).
+    from caw.executor import is_resumable
+
+    assert is_resumable("succeeded") is False
+    assert is_resumable("rejected") is False
+    assert is_resumable("parked") is True
+    assert is_resumable("failed") is True
+    assert is_resumable(None) is False
+
+
 def conditional_workflow(*nodes: dict[str, Any]) -> Workflow:
     """Build a shell Workflow from raw node dicts carrying `when` / `join` (#7).
 

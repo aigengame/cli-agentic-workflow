@@ -77,6 +77,25 @@ def test_when_cannot_reference_a_human_gate_output() -> None:
     assert "gate" in str(excinfo.value)
 
 
+@pytest.mark.parametrize(("field", "value"), [("retries", 3), ("timeout", 1.0)])
+def test_human_gate_rejects_subprocess_node_fields(field: str, value: object) -> None:
+    # A human_gate spawns no process, so the subprocess-shaped Node fields do not
+    # apply (ADR 0010): authoring `retries`/`timeout` on a gate is a config error,
+    # not a silently-ignored value.
+    raw: dict[str, Any] = {
+        "name": "sample",
+        "version": 1,
+        "nodes": [
+            {"id": "gate", "kind": "human_gate", "inputs": {"prompt": "ok?"}, field: value},
+        ],
+    }
+
+    with pytest.raises(WorkflowConfigError) as excinfo:
+        normalize_workflow(raw, source="workflow.yaml")
+
+    assert field in str(excinfo.value)
+
+
 def test_cycle_error_names_only_the_cycle_members_not_downstream_nodes() -> None:
     raw: dict[str, Any] = {
         "name": "sample",

@@ -662,6 +662,27 @@ class Node(BaseModel):
                 )
         return self
 
+    @model_validator(mode="after")
+    def _human_gate_rejects_subprocess_fields(self) -> "Node":
+        # A human_gate spawns no process, so the subprocess-shaped Node fields do
+        # not apply (ADR 0010). The inputs-level ones (env/cwd/artifacts/
+        # output_schema) are already forbidden by HumanGateNodeInputs; retries and
+        # timeout are node-level, so reject a non-default value here rather than
+        # silently ignoring an authored control that cannot affect a parked gate.
+        if self.kind != "human_gate":
+            return self
+        if self.retries != 0:
+            raise ValueError(
+                f"node {self.id!r} is a human_gate, which runs no process, so `retries` "
+                f"does not apply"
+            )
+        if self.timeout is not None:
+            raise ValueError(
+                f"node {self.id!r} is a human_gate, which runs no process, so `timeout` "
+                f"does not apply"
+            )
+        return self
+
 
 class Workflow(BaseModel):
     """A normalized Workflow IR for one Run."""

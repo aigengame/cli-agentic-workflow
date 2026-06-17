@@ -34,6 +34,7 @@ from caw.status import (
     ERRORED,
     FAILED,
     PARKED,
+    REJECTED,
     SKIPPED,
     SUCCEEDED,
     TIMED_OUT,
@@ -188,6 +189,12 @@ class RunResult:
 
     @property
     def succeeded(self) -> bool:
+        # A parked Run is NOT a successful terminal — it awaits approval (#10) — so
+        # it is never `succeeded` even though its already-run Nodes all succeeded.
+        # This keeps consumers that branch on `succeeded` (e.g. Pattern Controllers)
+        # from treating a parked iteration as a finished success.
+        if self.parked:
+            return False
         # A Run fails iff an ATTEMPTED Node failed. A failure-driven (`blocked`)
         # skip always coincides with a failed Node already in `node_results`, so
         # it is captured here; a benign skip — a closed `when` gate or a fully
@@ -1140,19 +1147,21 @@ class ResumeError(Exception):
     """Raised when a Run cannot be resumed: it is absent or not resume-eligible (#6)."""
 
 
-# A Run that already SUCCEEDED has nothing left to do, so resuming it is refused;
-# every other recorded status — a failed run, an errored/cancelled (interrupted)
-# run, even a run still marked ``running`` because it was killed mid-flight — has
-# incomplete work and IS resumable. Eligibility lives here so the entry point and
-# the CLI share one rule.
-_NON_RESUMABLE_RUN_STATUSES = frozenset({SUCCEEDED})
+# A Run that already SUCCEEDED has nothing left to do, and a REJECTED Run is a
+# decided human "no" (#10, ADR 0010) — both are refused. Every other recorded
+# status — a failed run, an errored/cancelled (interrupted) run, a `parked` run
+# awaiting approval, even a run still marked ``running`` because it was killed
+# mid-flight — has work left and IS resumable. Eligibility lives here so the entry
+# point and the CLI share one rule.
+_NON_RESUMABLE_RUN_STATUSES = frozenset({SUCCEEDED, REJECTED})
 
 
 def is_resumable(run_status: str | None) -> bool:
-    """Whether a Run with this recorded status can be resumed (#6).
+    """Whether a Run with this recorded status can be resumed (#6, #10).
 
-    ``None`` (an unknown Run) is not resumable; a ``succeeded`` Run is not (nothing
-    to do); any other terminal/interrupted status is.
+    ``None`` (an unknown Run) is not resumable; a ``succeeded`` or ``rejected`` Run
+    is not (a decided terminal); any other terminal/interrupted status — including
+    ``parked`` — is.
     """
     return run_status is not None and run_status not in _NON_RESUMABLE_RUN_STATUSES
 
