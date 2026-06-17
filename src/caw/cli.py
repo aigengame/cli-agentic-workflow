@@ -485,12 +485,14 @@ def resume(
         ),
     ] = None,
 ) -> None:
-    """Resume an interrupted or failed run, re-running only its incomplete nodes.
+    """Resume a run: re-run an interrupted/failed run's incomplete nodes, or advance a
+    parked run by approving or declining its awaiting human gates.
 
-    Mirrors ``run``'s output and exit-code contract: 0 on success, 1 on a failed
-    node, 3 on an infrastructure error. An unknown run id or a run that already
-    succeeded is not resumable and is refused as a config-class error (exit 2)
-    with a single ``error:`` line, never re-executing it.
+    Mirrors ``run``'s output and exit-code contract: 0 on success (or a clean park),
+    1 on a failed node or a rejected run, 3 on an infrastructure error. An unknown
+    run id or a run that already succeeded or was rejected is not resumable and is
+    refused as a config-class error (exit 2) with a single ``error:`` line, never
+    re-executing it.
 
     ``--approve <node-id>`` advances a parked run by approving an awaiting human
     gate (#10); a gate left unnamed re-parks. ``--reject <node-id>`` ends the run

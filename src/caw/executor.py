@@ -1248,7 +1248,12 @@ async def resume_run(
     approvals: tuple[str, ...] = (),
     rejections: tuple[str, ...] = (),
 ) -> RunResult:
-    """Resume an interrupted or failed Run, re-running only its incomplete Nodes (#6).
+    """Resume a Run: re-run an interrupted/failed Run's incomplete Nodes, or advance a
+    parked Run by approving or declining its awaiting Human Gates (#6, #10).
+
+    A ``parked`` Run is resumable even though nothing failed — its Await is advanced
+    by ``approvals``/``rejections``, not by re-running completed work; a ``succeeded``
+    or ``rejected`` Run is a decided terminal and is refused (Resume Eligibility).
 
     ``approvals`` names human_gate Nodes to approve (#10, ADR 0010): each must be an
     awaiting gate, and is flipped ``awaiting`` -> ``succeeded`` before classification
@@ -1301,6 +1306,11 @@ async def resume_run(
                 f"not forward-compatible with this version"
             )
         node_statuses = state.node_statuses(run_id)
+        # Duplicate decision ids collapse to one, order-preserving, so a repeated
+        # --approve/--reject for a gate is idempotent rather than crashing on the
+        # attempt PK or double-recording the rejection (#10 review).
+        approvals = tuple(dict.fromkeys(approvals))
+        rejections = tuple(dict.fromkeys(rejections))
         # Human Gate decisions (#10, ADR 0010): validate every named Node is an
         # awaiting gate BEFORE any State mutation (all-or-nothing).
         for node_id in (*approvals, *rejections):
@@ -1311,8 +1321,13 @@ async def resume_run(
                 )
         # A rejection ENDS the Run: any --reject drives its gate(s) and the Run to
         # `rejected` and terminates here, so a co-named --approve does not save it.
-        # No scheduler runs and the gated downstream never executes; `rejected` is a
-        # decided terminal refused by Resume Eligibility (is_resumable).
+        # This is the narrow exception to the shared finalization seam: a rejected
+        # parked Run has no Nodes to execute and none in flight to tear down, so it
+        # finalizes DIRECTLY to `rejected` rather than routing through `_drive_scheduler`
+        # (which runs the scheduler) or `_finalize_crashed_run` (which records
+        # `errored`). It is ADR 0010's deliberate-termination realized as a clean direct
+        # finalize; the gated downstream never executes, and `rejected` is a decided
+        # terminal refused by Resume Eligibility (is_resumable).
         if rejections:
             now = _now()
             for node_id in rejections:
