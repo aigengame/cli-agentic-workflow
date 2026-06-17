@@ -134,6 +134,40 @@ async def test_approving_a_parked_gate_resumes_and_runs_downstream(tmp_path: Pat
     )
 
 
+@pytest.mark.asyncio
+async def test_rejecting_a_parked_gate_ends_the_run(tmp_path: Path) -> None:
+    # `caw resume --reject <gate>` ends the Run via deliberate termination (#10,
+    # ADR 0010): the gate and Run go `rejected`, downstream never runs, the Run is
+    # not resumable, and a gate_rejected Event is recorded.
+    runs_root = tmp_path / "runs"
+    parked = await execute_run(gated_workflow(), runs_root)
+    assert parked.status == "parked"
+
+    rejected = await resume_run(parked.run_id, runs_root, rejections=("gate",))
+
+    assert rejected.status == "rejected"
+    assert rejected.succeeded is False
+    assert "deploy" not in {node.node_id for node in rejected.node_results}, (
+        "a rejected run never runs the gated downstream"
+    )
+    run_dir = single_run_dir(runs_root)
+    statuses = {
+        row["node_id"]: row["status"]
+        for row in state_rows(run_dir, "SELECT node_id, status FROM node")
+    }
+    assert statuses["gate"] == "rejected"
+    assert "deploy" not in statuses, "an unreached node has no row"
+    assert state_rows(run_dir, "SELECT status FROM run")[0]["status"] == "rejected"
+
+    with pytest.raises(ResumeError):
+        await resume_run(parked.run_id, runs_root)
+
+    events = read_events(run_dir)
+    assert any(
+        event["type"] == "gate_rejected" and event["data"]["node_id"] == "gate" for event in events
+    )
+
+
 def test_rejected_and_succeeded_runs_are_not_resumable() -> None:
     # ADR 0010 Resume Eligibility: a `rejected` Run is refused like `succeeded`; a
     # `parked` Run, by contrast, is resumable (advanced by approve/reject), and the

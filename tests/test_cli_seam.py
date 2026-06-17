@@ -1493,3 +1493,25 @@ def test_resume_approve_runs_the_gated_downstream(
     assert resumed.exit_code == 0, resumed.output
     assert "succeeded" in resumed.output
     assert "node deploy attempt 1 exited 0" in resumed.output
+
+
+def test_resume_reject_ends_the_run(
+    write_workflow_data: Callable[[dict[str, Any]], Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # `caw resume <run-id> --reject <gate>` ends a parked run as rejected: exit 1
+    # (a non-success terminal), the rejection is reported, and the gated downstream
+    # never runs (#10, ADR 0010).
+    workflow_file = write_workflow_data(_gated_workflow_data())
+    monkeypatch.chdir(tmp_path)
+    parked = runner.invoke(app, ["run", str(workflow_file)])
+    assert parked.exit_code == 0, parked.output
+    run_id = next((tmp_path / ".caw" / "runs").iterdir()).name
+
+    rejected = runner.invoke(app, ["resume", run_id, "--reject", "gate"])
+
+    assert rejected.exit_code == 1, rejected.output
+    assert "rejected" in rejected.output
+    assert "deploy" not in rejected.output, "a rejected run never runs the gated downstream"
+    assert "succeeded" not in rejected.output
