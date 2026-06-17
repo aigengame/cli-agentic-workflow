@@ -98,7 +98,8 @@ timeout is diagnosable as a timeout and an adapter/internal fault is distinguish
 a node that ran and exited non-zero. The kinds are `failed` (non-zero exit), `timed_out`
 (exceeded the node's wall-clock `timeout`; the subprocess is terminated), and `errored`
 (an Adapter or internal exception prevented a result), alongside `succeeded` and the
-scheduler's `skipped`.
+scheduler's `skipped`. A declined Human Gate is a `rejected` Run, not a failure kind —
+that decided-outcome status is defined under Human Gate and Resume Eligibility, not here.
 _Avoid_: error code, failure type
 
 **Resume**:
@@ -109,8 +110,10 @@ _Avoid_: restart, retry, rerun
 
 **Resume Eligibility**:
 The rule in State that decides whether a Run can be resumed: a Run that already
-`succeeded` (nothing left to do) or is unknown is refused; every other terminal or
-interrupted Run (failed, errored, cancelled) is resumable.
+`succeeded` (nothing left to do), was `rejected` (a decided human outcome), or is unknown is
+refused; every other terminal or interrupted Run (failed, errored, cancelled) is resumable.
+A `parked` Run is resumable — its Await is advanced by approving or declining the awaiting
+Node, not by re-running completed work.
 _Avoid_: resumable flag
 
 ### Patterns and Composition
@@ -129,13 +132,16 @@ _Avoid_: fork-join
 
 **Await**:
 A primitive that parks a run on a condition outside the graph until the condition is
-satisfied. Waiting for upstream nodes to complete is ordinary Edge scheduling, not an
-Await.
+satisfied. A parked Run has status `parked`; the awaiting Node has status `awaiting`. Several
+Nodes may be `awaiting` at once, and the Run stays `parked` until each is resolved. Waiting
+for upstream nodes to complete is ordinary Edge scheduling, not an Await.
 _Avoid_: wait, sleep, poll
 
 **Human Gate**:
 The human-in-the-loop specialization of Await, where the external condition is an explicit
-human approval to continue the run.
+human approval to continue the run. Approval, addressed to a specific `awaiting` Node,
+continues the Run; declining drives that Node and the Run to `rejected` and ends the Run.
+It is the only Await trigger source in v0.1.
 _Avoid_: approval step, manual step
 
 **Pattern**:
