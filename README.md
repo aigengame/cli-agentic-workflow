@@ -237,6 +237,14 @@ caw report <run-id> --format markdown
 | `caw loop resume <group-id>` | Resume an interrupted run group at the group level | ✅ now |
 | `caw loop report <group-id>` | Aggregate every iteration of a run group into one report | ✅ now |
 | `caw loop init [path]` | Scaffold a complete runnable loop-until-done example | ✅ now |
+| `caw verify run <spec>` | Run an adversarial-verification run group from a controller spec | ✅ now |
+| `caw verify resume <group-id>` | Resume an interrupted adversarial-verification run group | ✅ now |
+| `caw verify report <group-id>` | Aggregate an adversarial-verification run group into one report | ✅ now |
+| `caw verify init [path]` | Scaffold a complete runnable adversarial-verification example | ✅ now |
+| `caw tournament run <spec>` | Run a tournament run group from a controller spec | ✅ now |
+| `caw tournament resume <group-id>` | Resume an interrupted tournament run group | ✅ now |
+| `caw tournament report <group-id>` | Aggregate a tournament run group into one report | ✅ now |
+| `caw tournament init [path]` | Scaffold a complete runnable tournament example | ✅ now |
 
 ## Built-in patterns
 
@@ -250,11 +258,11 @@ example of any shipped pattern with `caw patterns init <name>`.
 | --- | --- | --- |
 | Pipeline | Linear node chain | ✅ now |
 | Parallel | Independent branches joined downstream | ✅ now |
-| Classify and act | Classifier routes to one of several `when`-gated branches | 🚧 planned |
-| Generate and filter | N candidate generators, then a scoring/validation filter | 🚧 planned |
-| Fan-out synthesis | Parallel agents, then a synthesis node (the reference sample runs `claude.print` and `codex.exec` side by side) | 🚧 planned |
-| Adversarial verification | Generator + verifiers, with accept / reject / regenerate | 🚧 planned |
-| Tournament | Rounds or brackets with winner promotion and comparison evidence | 🚧 planned |
+| Classify and act | Classifier routes to one of several `when`-gated branches | ✅ now |
+| Generate and filter | N candidate generators, then a scoring/validation filter | ✅ now |
+| Fan-out synthesis | Parallel agents, then a synthesis node (the reference sample runs `claude.print` and `codex.exec` side by side) | ✅ now |
+| Adversarial verification | Generator + verifiers, with accept / reject / regenerate | ✅ now |
+| Tournament | Rounds or brackets with winner promotion and comparison evidence | ✅ now |
 | Loop until done | Iterates immutable runs in a Run Group until the done Predicate holds | ✅ now |
 
 ### Run Groups and the loop-until-done controller
