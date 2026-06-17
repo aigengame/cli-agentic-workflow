@@ -11,10 +11,11 @@ node parks the Run, and approval happens through an interactive TTY confirmation
 `caw resume <run-id> --approve <node-id>`. ADR 0003 already chose the asyncio executor for
 its first-class park semantics but left the *workflow-level* await/approval model open. This
 ADR records HOW await parking and the Human Gate are built on top of the existing Resume
-machinery (#6), and why each mechanism is shaped as it is. The guiding result: approval and
-rejection need almost no new kernel control flow — they reuse Resume's "seed satisfied"
-classification — so the new surface is a node kind, two run statuses, two node statuses, and
-a CLI flag pair, not a new execution path.
+machinery (#6), and why each mechanism is shaped as it is. The guiding result: the gate needs
+almost no new kernel control flow — approval reuses Resume's "seed satisfied" classification
+and rejection reuses the executor's existing deliberate-termination path — so the new surface
+is a node kind, two run statuses, two node statuses, and a CLI flag pair, not a new execution
+path.
 
 ## Decisions
 
@@ -43,11 +44,17 @@ contradicts the executor's "run everything ready" model (ADR 0003) and wastes pa
 Sequential gates fall out for free: approving a gate whose downstream reaches another gate
 re-parks at that next gate on the following resume.
 
-### Rejection is a decided, non-resumable terminal — distinct from cancelled and failed
+### Rejection ends the Run — a decided, non-resumable terminal distinct from cancelled and failed
 
-Declining a gate is symmetric to approving it: `caw resume <run-id> --reject <node-id>` drives
-the named gate node to `rejected` and the Run to `rejected`; the gate's dependents block-skip
-under the existing "a failed dependency blocks dependents" rule (ADR 0007), and the Run ends.
+Rejection addresses a gate the same way approval does — `caw resume <run-id> --reject
+<node-id>` — but where approval ADVANCES the Run, rejection ENDS it (PRD #1: "declining ends
+the run as not approved"). The named gate node and the Run both go `rejected`, the scheduler
+stops, and any in-flight siblings or other `awaiting` gates are abandoned. This is the
+executor's existing deliberate-termination path — the way a cancelled Run stops — NOT the
+failed-dependency skip rule: downstream nodes are simply never attempted because the Run ended,
+so rejection does NOT reclassify any dependency as a blocker and needs no change to ADR 0007's
+failed-blocks-dependents / `blocked`-cause model. (Because any `--reject` ends the Run, a
+resume that names both an approve and a reject still ends `rejected` — the reject dominates.)
 
 `rejected` is a NEW status, not a reuse of `cancelled` or `failed`:
 
@@ -57,8 +64,11 @@ under the existing "a failed dependency blocks dependents" rule (ADR 0007), and 
   `--approve` override the human's no — a footgun. A `rejected` Run is therefore REFUSED by
   Resume Eligibility, like `succeeded`; to re-decide, start a new Run. This also keeps the
   Run an immutable record of the decision, consistent with ADR 0002.
-- Not `failed`: a human "no" is not an error. Recording it as `failed` would make a Reporter
-  render a legitimate decision as a failure. `rejected` lets reports say "not approved".
+- Not `failed`: a human "no" is not an error — recording it as `failed` would make a Reporter
+  render a legitimate decision as a failure. It also carries the wrong dependency semantics: a
+  failed dependency blocks only its own dependents while sibling branches finish and the Run
+  fails at the end (ADR 0007), whereas a rejection ENDS the whole Run. `rejected` keeps both
+  the report wording ("not approved") and the run-ending behavior distinct from failure.
 
 ### Resume Eligibility: `parked` resumes, `rejected` is refused
 
@@ -68,14 +78,14 @@ A `parked` Run joins the resumable set: its Await is advanced by approving or de
 `awaiting`, so the run re-parks idempotently. `rejected` joins the refused set alongside
 `succeeded`.
 
-### Multi-gate resume is node-addressed and may name several gates at once
+### Multi-gate resume is node-addressed and may approve several gates at once
 
 Because the fixpoint can leave multiple gates `awaiting`, `--approve`/`--reject` address a
 specific node by id (which is why the PRD's surface is `--approve <node-id>`, not a bare
-`--approve`). One resume invocation may carry several, e.g.
-`caw resume <run-id> --approve g1 --reject g2`. After that resume advances, any gate left
-unnamed stays `awaiting` and the Run re-parks. Approving and rejecting are the only two
-operations on an `awaiting` node.
+`--approve`). One resume may approve several, e.g. `caw resume <run-id> --approve g1
+--approve g2`; any gate left unnamed stays `awaiting` and the Run re-parks. A `--reject`, by
+contrast, ends the Run (above), so it never leaves other gates to re-park. Approving and
+rejecting are the only two operations on an `awaiting` node.
 
 ### `human_gate` node shape: a `prompt` in, an `approved` out, not yet a predicate source
 
@@ -125,8 +135,10 @@ prevents a typo'd new event type from passing type-checking.
 - **Reuse `cancelled` for rejection** — rejected: `cancelled` is an interrupted, resumable
   status; rejection is a decided, non-resumable one, and conflating them would let `--approve`
   override a human's no.
-- **Reuse `failed` for a rejected gate** — rejected: a human "no" is not an error and must not
-  render as a failure in reports.
+- **Reuse `failed` for a rejected gate** — rejected: a human "no" is not an error (it must not
+  render as a failure in reports), and `failed` carries the wrong control flow — a failed
+  dependency blocks only its own dependents while sibling branches finish (ADR 0007), whereas a
+  rejection ends the whole Run.
 - **Wire `approved` into `when`-producible fields now** — rejected: with "decline ends the
   Run", `approved` is always true downstream, so a v0.1 predicate on it is dead surface that
   would mislead authors. The field is emitted for the trace and kept out of predicates until
@@ -138,12 +150,12 @@ prevents a typo'd new event type from passing type-checking.
 ## Consequences
 
 - The executor, validation, checksum, and single-run Resume gain no new execution path: a gate
-  parks the scheduler at a fixpoint, and approval/rejection are a status flip plus the
-  unchanged Resume from #6.
+  parks the scheduler at a fixpoint, approval is a status flip plus the unchanged Resume from
+  #6, and rejection reuses the existing deliberate-termination (cancel/finalize) path.
 - `parked` and `rejected` extend the run-status set and `awaiting`/`rejected` the node-status
   set; Resume Eligibility now refuses `rejected` (with `succeeded`) and admits `parked`.
-  CONTEXT.md's Await, Human Gate, Resume Eligibility, and Error Classification entries are
-  updated to carry these terms.
+  CONTEXT.md's Await, Human Gate, and Resume Eligibility entries carry these terms; Error
+  Classification only notes that `rejected` is not a failure kind and points to those entries.
 - #30 is the prerequisite for #10's vocabulary: it lands the owned status enum and typed
   event-type vocabulary first, and #10 extends them in one place.
 - External-event Await triggers (files, webhooks, timers) remain out of v0.1 scope but reuse

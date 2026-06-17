@@ -98,8 +98,8 @@ timeout is diagnosable as a timeout and an adapter/internal fault is distinguish
 a node that ran and exited non-zero. The kinds are `failed` (non-zero exit), `timed_out`
 (exceeded the node's wall-clock `timeout`; the subprocess is terminated), and `errored`
 (an Adapter or internal exception prevented a result), alongside `succeeded` and the
-scheduler's `skipped`. A declined Human Gate is recorded as `rejected` — a decided human
-outcome, not a failure — so a Reporter renders it as "not approved" rather than as an error.
+scheduler's `skipped`. A declined Human Gate is a `rejected` Run, not a failure kind —
+that decided-outcome status is defined under Human Gate and Resume Eligibility, not here.
 _Avoid_: error code, failure type
 
 **Resume**:
