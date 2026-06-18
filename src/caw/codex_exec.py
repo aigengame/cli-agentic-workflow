@@ -90,7 +90,10 @@ class CodexExecAdapter(SubprocessAdapter, Adapter):
         # supplementary input from stdin, which would otherwise block) and kills+reaps the
         # whole tree on a cancellation/timeout.
         completed = await self.run_cli(
-            argv, context_label=node_context(invocation), env=invocation.env
+            argv,
+            context_label=node_context(invocation),
+            env=invocation.env,
+            cwd=invocation.working_dir,
         )
         exit_status = completed.returncode
         stdout = completed.stdout

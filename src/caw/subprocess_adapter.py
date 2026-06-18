@@ -232,30 +232,46 @@ class SubprocessAdapter:
         context_label: str,
         env: Mapping[str, str] | None = None,
         capture_artifacts: bool = True,
+        cwd: Path | None = None,
     ) -> CompletedSubprocess:
         """Spawn the CLI for ``argv`` and return its normalized completion.
 
         ``argv[0]`` must be the binary name a caller obtained from
         :meth:`resolve_cli_path`; this method spawns it with stdin isolated
         (``DEVNULL``), a private session/process group (so the whole tree is killable
-        by group), and ``env`` — the node's already-filtered allow-list for an
+        by group), ``env`` — the node's already-filtered allow-list for an
         ``invoke``, or ``None`` for an infrastructure probe that may use the ambient
-        environment. ``communicate`` is wrapped so a timeout/cancellation kills and
-        reaps the tree, leaving no orphan, before re-raising. The returncode is passed
-        through as a real int (a signal-kill stays negative, never the ``-1`` TIMED_OUT
+        environment — and an optional node-owned ``cwd``. Artifact discovery scans
+        that cwd when supplied, otherwise the ambient cwd used by direct calls.
+        ``communicate`` is wrapped so a timeout/cancellation kills and reaps the
+        tree, leaving no orphan, before re-raising. The returncode is passed through
+        as a real int (a signal-kill stays negative, never the ``-1`` TIMED_OUT
         sentinel, #84) and stdout/stderr decode recoverably.
         """
-        artifact_root = Path.cwd()
+        artifact_root = cwd if cwd is not None else Path.cwd()
+        if cwd is not None:
+            cwd.mkdir(parents=True, exist_ok=True)
         before = _artifact_snapshot(artifact_root) if capture_artifacts else {}
         try:
-            process = await asyncio.create_subprocess_exec(
-                *argv,
-                stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=dict(env) if env is not None else None,
-                start_new_session=True,
-            )
+            if cwd is None:
+                process = await asyncio.create_subprocess_exec(
+                    *argv,
+                    stdin=asyncio.subprocess.DEVNULL,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=dict(env) if env is not None else None,
+                    start_new_session=True,
+                )
+            else:
+                process = await asyncio.create_subprocess_exec(
+                    *argv,
+                    stdin=asyncio.subprocess.DEVNULL,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=dict(env) if env is not None else None,
+                    cwd=str(cwd),
+                    start_new_session=True,
+                )
         except FileNotFoundError as exc:
             # Defense-in-depth: resolve_cli_path already gave a clean pre-spawn
             # missing-CLI error, but a TOCTOU race (the binary vanishing between

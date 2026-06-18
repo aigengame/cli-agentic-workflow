@@ -189,13 +189,17 @@ async def test_invoke_reports_files_created_by_the_cli_as_artifacts(
 ) -> None:
     # #16: codex.exec has the same artifact-capture behavior as claude.print.
     produced = tmp_path / "agent-report.md"
-    monkeypatch.chdir(tmp_path)
     patch_which(monkeypatch)
     patch_spawn(monkeypatch, ProducingProcess(produced))
     adapter = CodexExecAdapter()
 
     result = await adapter.invoke(
-        AgentInvocation(node_id="n", adapter="codex.exec", prompt="write a report")
+        AgentInvocation(
+            node_id="n",
+            adapter="codex.exec",
+            prompt="write a report",
+            working_dir=tmp_path,
+        )
     )
 
     assert result.exit_status == 0

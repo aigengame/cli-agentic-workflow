@@ -148,6 +148,32 @@ async def test_artifact_cleanup_keeps_the_active_run_and_prunes_older_artifacts(
 
 
 @pytest.mark.asyncio
+async def test_artifact_cleanup_keeps_newest_runs_by_immutable_run_state(
+    tmp_path: Path,
+) -> None:
+    # Review follow-up for #16: pruning an old run's artifacts mutates that old
+    # directory's mtime. Retention must still keep the newest N runs' artifacts,
+    # so the ordering source cannot be the mutable run directory mtime.
+    artifact = tmp_path / "report.md"
+    artifact.write_text("# report\n", encoding="utf-8")
+    fixture = write_fixture(tmp_path / "fixture.json", exit_status=0, artifacts=[str(artifact)])
+    raw = agent_workflow(fixture).model_dump(mode="json")
+    raw["artifact_cleanup"] = {"keep_last_runs": 2}
+    workflow = normalize_workflow(raw, source="<test>")
+    runs_root = tmp_path / "runs"
+
+    first = await execute_run(workflow, runs_root)
+    second = await execute_run(workflow, runs_root)
+    third = await execute_run(workflow, runs_root)
+    fourth = await execute_run(workflow, runs_root)
+
+    assert not (runs_root / first.run_id / "artifacts").exists()
+    assert not (runs_root / second.run_id / "artifacts").exists()
+    assert (runs_root / third.run_id / "artifacts" / "agent" / "report.md").is_file()
+    assert (runs_root / fourth.run_id / "artifacts" / "agent" / "report.md").is_file()
+
+
+@pytest.mark.asyncio
 async def test_artifact_cleanup_default_keeps_existing_artifacts(tmp_path: Path) -> None:
     # #16: the default is conservative. Without an explicit cleanup policy, a new
     # run never deletes artifacts from older runs.

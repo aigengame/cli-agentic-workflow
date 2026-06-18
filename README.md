@@ -193,7 +193,8 @@ artifact_cleanup:
 `final_output` tells `caw report` which persisted node output is the workflow's final result
 and which JSON Schema to validate it against at report time. `artifact_cleanup.keep_last_runs`
 retains artifacts for the newest N runs, always preserving the current run; when omitted,
-artifact cleanup is disabled.
+artifact cleanup is disabled. Real agent artifacts are discovered from each node's private
+working directory, then copied into `artifacts/<node-id>/` before State indexes them.
 
 ## Example
 

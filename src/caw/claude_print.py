@@ -85,7 +85,10 @@ class ClaudePrintAdapter(SubprocessAdapter, Adapter):
         # needs (e.g. its auth/config vars) so they appear in invocation.env. A
         # cancellation/timeout kills and reaps the whole tree (the base's lifecycle).
         completed = await self.run_cli(
-            argv, context_label=node_context(invocation), env=invocation.env
+            argv,
+            context_label=node_context(invocation),
+            env=invocation.env,
+            cwd=invocation.working_dir,
         )
         exit_status = completed.returncode
         stdout = completed.stdout

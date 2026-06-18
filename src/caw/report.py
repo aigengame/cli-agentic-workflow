@@ -298,6 +298,7 @@ def _gather_group(group_id: str, base: Path) -> dict[str, Any]:
                 "nodes": per_run["nodes"],
                 "graph": per_run["graph"],
                 "trace": per_run["trace"],
+                "final_output": per_run["final_output"],
             }
         )
     return {
@@ -324,7 +325,15 @@ def _render_group_json(report: dict[str, Any]) -> str:
         "iterations": [
             {
                 key: iteration[key]
-                for key in ("iteration_index", "run_id", "status", "nodes", "trace")
+                for key in (
+                    "iteration_index",
+                    "run_id",
+                    "status",
+                    "nodes",
+                    "trace",
+                    "final_output",
+                )
+                if key != "final_output" or iteration[key] is not None
             }
             for iteration in report["iterations"]
         ],
@@ -354,6 +363,11 @@ def _render_group_jsonl(report: dict[str, Any]) -> str:
                     "run_id": iteration["run_id"],
                     "status": iteration["status"],
                     "nodes": iteration["nodes"],
+                    **(
+                        {"final_output": iteration["final_output"]}
+                        if iteration["final_output"] is not None
+                        else {}
+                    ),
                 }
             )
         )
@@ -380,6 +394,15 @@ def _render_group_text(report: dict[str, Any]) -> str:
         )
         for node in iteration["nodes"]:
             lines.append(f"    {node['id']}: {node['status']}{_node_detail(node)}")
+        if iteration["final_output"] is not None:
+            final = iteration["final_output"]
+            lines.append("    final output:")
+            lines.append(
+                f"      {final['node']}.{final['field']}: {final['status']} "
+                f"(schema: {final['schema']})"
+            )
+            if final["error"]:
+                lines.append(f"      error: {final['error']}")
     return "\n".join(lines)
 
 
@@ -402,6 +425,13 @@ def _render_group_markdown(report: dict[str, Any]) -> str:
         out += ["", "### Nodes", ""]
         for node in iteration["nodes"]:
             out.append(f"- {node['id']} — {node['status']}{_node_detail(node)}")
+        if iteration["final_output"] is not None:
+            final = iteration["final_output"]
+            out += ["", "### Final Output", ""]
+            out.append(f"- `{final['node']}.{final['field']}` — {final['status']}")
+            out.append(f"- Schema: `{final['schema']}`")
+            if final["error"]:
+                out.append(f"- Error: {final['error']}")
         out.append("")
     return "\n".join(out)
 

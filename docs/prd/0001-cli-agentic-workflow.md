@@ -482,9 +482,10 @@ Suggested local run layout:
 ```
 
 Agent Adapters may report files a writable Agent CLI run created or modified; the kernel
-collects those files into the run directory before indexing them in State. A Workflow may
-declare `artifact_cleanup.keep_last_runs` to retain artifacts for the newest N runs while
-always preserving the current run; the default is no cleanup.
+assigns each agent invocation a node-owned working directory, collects files reported from
+that boundary into the run directory, then indexes only those run-owned copies in State. A
+Workflow may declare `artifact_cleanup.keep_last_runs` to retain artifacts for the newest N
+runs while always preserving the current run; the default is no cleanup.
 
 A Workflow may also declare `final_output` (`node`, `field`, `schema`) so `caw report`
 validates the persisted final result against a JSON Schema and renders the validation

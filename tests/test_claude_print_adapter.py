@@ -165,13 +165,17 @@ async def test_invoke_reports_files_created_by_the_cli_as_artifacts(
     # The Adapter reports new/changed files so the kernel can collect them into the
     # run directory and index the durable copies in State.
     produced = tmp_path / "agent-report.md"
-    monkeypatch.chdir(tmp_path)
     patch_which(monkeypatch)
     patch_spawn(monkeypatch, ProducingProcess(produced))
     adapter = ClaudePrintAdapter()
 
     result = await adapter.invoke(
-        AgentInvocation(node_id="n", adapter="claude.print", prompt="write a report")
+        AgentInvocation(
+            node_id="n",
+            adapter="claude.print",
+            prompt="write a report",
+            working_dir=tmp_path,
+        )
     )
 
     assert result.exit_status == 0

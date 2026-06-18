@@ -406,6 +406,16 @@ def _artifact_destination(target_dir: Path, filename: str, used_names: set[str])
         index += 1
 
 
+def _agent_work_dir(run_dir: Path, node_id: str) -> Path:
+    """The private cwd/artifact-discovery boundary for one agent node invocation."""
+    return run_dir / "work" / node_id
+
+
+def _cleanup_agent_work_dir(work_dir: Path) -> None:
+    """Remove an agent node's private scratch directory after artifact collection."""
+    shutil.rmtree(work_dir, ignore_errors=True)
+
+
 async def _execute_agent_node(node: Node, registry: AdapterRegistry, run_dir: Path) -> NodeResult:
     """Run an agent Node through its Adapter and validate its Output Contract.
 
@@ -433,6 +443,8 @@ async def _execute_agent_node(node: Node, registry: AdapterRegistry, run_dir: Pa
     inputs = node.inputs
     started_at = _now()
     adapter = registry.resolve(inputs.adapter)
+    work_dir = _agent_work_dir(run_dir, node.id)
+    work_dir.mkdir(parents=True, exist_ok=True)
     invocation = AgentInvocation(
         node_id=node.id,
         adapter=inputs.adapter,
@@ -441,70 +453,74 @@ async def _execute_agent_node(node: Node, registry: AdapterRegistry, run_dir: Pa
         env=_resolve_declared_env(inputs.env),
         output_schema=inputs.output_schema,
         fixture=inputs.fixture,
+        working_dir=work_dir,
     )
     # The timeout wraps the Adapter invocation — the wall-clock the node spends
     # waiting on the external Agent CLI (#6). A TimeoutError is classified
     # TIMED_OUT here rather than caught by the generic ERRORED handler in
     # _execute_node, so a slow agent is diagnosable as a timeout, not an error.
     try:
-        async with asyncio.timeout(node.timeout):
-            result = await adapter.invoke(invocation)
-    except TimeoutError:
+        try:
+            async with asyncio.timeout(node.timeout):
+                result = await adapter.invoke(invocation)
+        except TimeoutError:
+            return NodeResult(
+                node_id=node.id,
+                exit_status=-1,
+                stdout="",
+                stderr=f"node {node.id!r} (adapter {inputs.adapter!r}) "
+                f"exceeded its timeout of {node.timeout}s",
+                started_at=started_at,
+                finished_at=_now(),
+                failure_kind=TIMED_OUT,
+                adapter=inputs.adapter,
+            )
+        exit_status = result.exit_status
+        stderr = result.stderr
+        # The adapter-determined-failure contract (ADR 0006, #83): an Adapter that ran
+        # the agent but normalized its result as a FAILURE raises `adapter_failure`
+        # WITHOUT manufacturing a non-zero exit. The kernel honors it ONCE here — the
+        # single point that decides whether an agent result is a failed Node — so a
+        # zero-exit result carrying the flag fails exactly like a non-zero exit, while
+        # the adapter keeps the process's REAL exit_status (no fabricated exit code).
+        failed = exit_status != 0 or result.adapter_failure
+        # The Output Contract guards a SUCCESSFUL invocation's output (#63): a failed
+        # node — whether by a non-zero exit OR an adapter-determined failure — carries
+        # no trustworthy structured output, so the contract is not evaluated and cannot
+        # mask the agent's own failure cause with a contract message.
+        if not failed and inputs.output_schema is not None:
+            try:
+                # Run the Output Contract off the event loop: the validator's read +
+                # parse + meta-schema-check + compile is synchronous blocking I/O (it
+                # happens once per schema path and is cached, #67), so dispatching it to
+                # a worker thread keeps a slow disk or a large schema from stalling the
+                # asyncio scheduler that is driving the Run's concurrent Nodes.
+                await asyncio.to_thread(
+                    validate_output_contract, inputs.output_schema, result.structured_output
+                )
+            except OutputContractError as exc:
+                # A contract breach is a KERNEL-determined failure on a process that
+                # exited zero; there is no real non-zero process exit to preserve, so
+                # the kernel records exit_status 1 as the node's failure (the #63
+                # behavior), distinct from the adapter-determined case above where a
+                # real exit_status is kept and `adapter_failure` carries the signal.
+                exit_status = 1
+                failed = True
+                stderr = f"{stderr}\n{exc}".strip() if stderr else str(exc)
         return NodeResult(
             node_id=node.id,
-            exit_status=-1,
-            stdout="",
-            stderr=f"node {node.id!r} (adapter {inputs.adapter!r}) "
-            f"exceeded its timeout of {node.timeout}s",
+            exit_status=exit_status,
+            stdout=result.stdout,
+            stderr=stderr,
             started_at=started_at,
             finished_at=_now(),
-            failure_kind=TIMED_OUT,
+            structured_output=result.structured_output,
+            artifacts=_collect_artifacts(node.id, result.artifacts, run_dir),
+            failure_kind=FAILED if failed else None,
             adapter=inputs.adapter,
         )
-    exit_status = result.exit_status
-    stderr = result.stderr
-    # The adapter-determined-failure contract (ADR 0006, #83): an Adapter that ran
-    # the agent but normalized its result as a FAILURE raises `adapter_failure`
-    # WITHOUT manufacturing a non-zero exit. The kernel honors it ONCE here — the
-    # single point that decides whether an agent result is a failed Node — so a
-    # zero-exit result carrying the flag fails exactly like a non-zero exit, while
-    # the adapter keeps the process's REAL exit_status (no fabricated exit code).
-    failed = exit_status != 0 or result.adapter_failure
-    # The Output Contract guards a SUCCESSFUL invocation's output (#63): a failed
-    # node — whether by a non-zero exit OR an adapter-determined failure — carries
-    # no trustworthy structured output, so the contract is not evaluated and cannot
-    # mask the agent's own failure cause with a contract message.
-    if not failed and inputs.output_schema is not None:
-        try:
-            # Run the Output Contract off the event loop: the validator's read +
-            # parse + meta-schema-check + compile is synchronous blocking I/O (it
-            # happens once per schema path and is cached, #67), so dispatching it to
-            # a worker thread keeps a slow disk or a large schema from stalling the
-            # asyncio scheduler that is driving the Run's concurrent Nodes.
-            await asyncio.to_thread(
-                validate_output_contract, inputs.output_schema, result.structured_output
-            )
-        except OutputContractError as exc:
-            # A contract breach is a KERNEL-determined failure on a process that
-            # exited zero; there is no real non-zero process exit to preserve, so
-            # the kernel records exit_status 1 as the node's failure (the #63
-            # behavior), distinct from the adapter-determined case above where a
-            # real exit_status is kept and `adapter_failure` carries the signal.
-            exit_status = 1
-            failed = True
-            stderr = f"{stderr}\n{exc}".strip() if stderr else str(exc)
-    return NodeResult(
-        node_id=node.id,
-        exit_status=exit_status,
-        stdout=result.stdout,
-        stderr=stderr,
-        started_at=started_at,
-        finished_at=_now(),
-        structured_output=result.structured_output,
-        artifacts=_collect_artifacts(node.id, result.artifacts, run_dir),
-        failure_kind=FAILED if failed else None,
-        adapter=inputs.adapter,
-    )
+    finally:
+        _cleanup_agent_work_dir(work_dir)
 
 
 async def _execute_node(node: Node, registry: AdapterRegistry, run_dir: Path) -> NodeResult:
@@ -1188,12 +1204,21 @@ def _apply_artifact_cleanup(workflow: Workflow, runs_root: Path, *, current_run_
         shutil.rmtree(run_dir / "artifacts", ignore_errors=True)
 
 
-def _run_dir_sort_key(path: Path) -> tuple[int, str]:
-    """Sort run directories by filesystem mtime, then name for deterministic retention."""
+def _run_dir_sort_key(path: Path) -> tuple[str, str]:
+    """Sort run directories by immutable persisted creation time, then name."""
+    return (_run_created_at(path) or "", path.name)
+
+
+def _run_created_at(run_dir: Path) -> str | None:
+    """Read one run's persisted creation timestamp for artifact retention ordering."""
+    state_path = run_dir / "state.sqlite"
+    if not state_path.is_file():
+        return None
     try:
-        return (path.stat().st_mtime_ns, path.name)
-    except OSError:
-        return (0, path.name)
+        with StateStore(state_path, read_only=True) as state:
+            return state.run_created_at(run_dir.name)
+    except Exception:
+        return None
 
 
 async def _drive_scheduler(
