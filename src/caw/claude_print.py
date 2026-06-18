@@ -149,6 +149,7 @@ class ClaudePrintAdapter(SubprocessAdapter, Adapter):
             stdout=stdout,
             stderr=stderr,
             structured_output=structured_output,
+            artifacts=completed.artifacts,
             adapter_failure=adapter_failure,
         )
 

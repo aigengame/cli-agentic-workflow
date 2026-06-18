@@ -132,8 +132,8 @@ The real variant ([`fanout-synthesis.real.yaml`](examples/fanout-synthesis/fanou
 points the two branches at `claude.print` and `codex.exec`, requires both CLIs on PATH and
 authenticated, and is exercised end-to-end by the e2e suite
 (`tests/e2e/test_fanout_synthesis_runs.py`). The Markdown report keeps the final conclusion
-(each node's outcome, including the synthesize node's) in its own `## Nodes` section, distinct
-from the `## Trace` of events.
+(each node's outcome, including the synthesize node's) and optional `## Final Output`
+validation distinct from the `## Trace` of events.
 
 ## Why caw
 
@@ -167,7 +167,7 @@ nodes concurrently on an asyncio event loop, and persists everything under `.caw
   state.sqlite                # node status, attempts, outputs, resume eligibility
   events.jsonl                # append-only machine-readable trace
   workflow.normalized.json    # the exact graph that ran, with checksum
-  artifacts/<node-id>/        # stdout, stderr, structured outputs
+  artifacts/<node-id>/        # run-owned copies of files produced by agent nodes
 ```
 
 Iterative behavior (loops, regeneration, tournament rounds) never mutates a running graph:
@@ -177,6 +177,23 @@ linking them into a run group that reports and resumes as a unit.
 Conditional behavior lives in node-level `when` predicates; structured outputs are
 validated against JSON Schema (draft 2020-12) output contracts; env vars reach a node only
 when explicitly declared and are never persisted.
+
+Optional top-level hardening controls:
+
+```yaml
+final_output:
+  node: synthesize
+  field: structured_output
+  schema: schemas/final-answer.schema.json
+
+artifact_cleanup:
+  keep_last_runs: 5
+```
+
+`final_output` tells `caw report` which persisted node output is the workflow's final result
+and which JSON Schema to validate it against at report time. `artifact_cleanup.keep_last_runs`
+retains artifacts for the newest N runs, always preserving the current run; when omitted,
+artifact cleanup is disabled.
 
 ## Example
 

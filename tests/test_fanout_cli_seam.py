@@ -78,8 +78,9 @@ def test_mock_sample_report_separates_conclusion_from_trace(
     # AC4: the sample's Markdown report separates the final conclusion (each node's
     # outcome, including the synthesize node's) from the trace evidence (the event
     # sequence). Run the sample offline, then render its Markdown report and assert the
-    # conclusion section (## Nodes) precedes a distinct ## Trace section, with the
-    # synthesize node's outcome living in the conclusion, not the trace.
+    # conclusion section (## Nodes) and final-output schema validation precede a
+    # distinct ## Trace section, with the synthesize node's outcome living in the
+    # conclusion, not the trace.
     monkeypatch.chdir(tmp_path)
 
     ran = runner.invoke(app, ["run", str(_MOCK_SAMPLE)])
@@ -91,11 +92,15 @@ def test_mock_sample_report_separates_conclusion_from_trace(
     markdown = report.output
 
     nodes_heading = markdown.index("## Nodes")
+    final_heading = markdown.index("## Final Output")
     trace_heading = markdown.index("## Trace")
     # The conclusion comes first and the trace is a distinct, later section.
-    assert nodes_heading < trace_heading, "the conclusion precedes the trace evidence"
+    assert nodes_heading < final_heading < trace_heading, (
+        "the conclusion and final output validation precede the trace evidence"
+    )
     # The synthesize node's outcome lives in the conclusion, not the trace.
     conclusion = markdown[nodes_heading:trace_heading]
     assert f"{_SYNTH_ID} — succeeded" in conclusion, (
         "the synthesize node's conclusion is surfaced separately from the trace"
     )
+    assert f"`{_SYNTH_ID}.structured_output` — valid" in conclusion

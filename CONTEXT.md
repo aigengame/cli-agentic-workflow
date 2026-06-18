@@ -87,6 +87,12 @@ _Avoid_: session, run context
 A durable file produced by a node attempt during a run, indexed in the run's State.
 _Avoid_: output file, deliverable
 
+**Final Output**:
+The persisted output field a Workflow declares as the reportable final result, identified by
+node id, field name, and JSON Schema. A Reporter validates it at report time and renders the
+validation result alongside the run conclusion and trace evidence.
+_Avoid_: result blob
+
 **Event**:
 An append-only record of one occurrence during a run; the event sequence is the
 machine-readable trace of a run.

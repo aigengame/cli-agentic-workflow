@@ -5,6 +5,7 @@ import contextlib
 import json
 import os
 import secrets
+import shutil
 import signal
 from collections import deque
 from collections.abc import Mapping
@@ -362,25 +363,50 @@ def _resolve_shell_env(declared: tuple[str, ...] | None) -> Mapping[str, str] | 
     return _resolve_declared_env(declared)
 
 
-def _existing_artifacts(artifacts: tuple[Path, ...]) -> tuple[Path, ...]:
-    """Keep only artifact paths that are durable files that actually exist (#67).
+def _collect_artifacts(
+    node_id: str, artifacts: tuple[Path, ...], run_dir: Path
+) -> tuple[Path, ...]:
+    """Copy produced artifact files into the run directory and return their durable paths.
 
-    An Artifact is a "durable file produced by a node attempt" indexed in State, so
-    the index must not over-promise: an adapter-supplied path is validated for
-    existence as a regular FILE before being indexed. A path that does not exist,
-    or that exists but is not a file (e.g. a directory), is dropped rather than
-    recorded — State then never claims a produced file that never existed.
-
-    This is the minimal EXISTENCE guard only; it deliberately does NOT scope a path
-    to the run directory, so an existing file ANYWHERE on disk is still indexed. The
-    remaining artifact lifecycle — collection, retention, and run-directory SCOPING
-    (rejecting/relocating an out-of-run-directory path) — is owned by #16, not this
-    guard.
+    An Adapter may report paths in its working directory. The kernel owns the
+    lifecycle: only existing regular files are collected, copied under
+    ``artifacts/<node-id>/``, and the collected copies are what State indexes (#16).
     """
-    return tuple(path for path in artifacts if path.is_file())
+    collected: list[Path] = []
+    if not artifacts:
+        return ()
+    target_dir = run_dir / "artifacts" / node_id
+    target_dir.mkdir(parents=True, exist_ok=True)
+    used_names: set[str] = set()
+    for source in artifacts:
+        if not source.is_file():
+            continue
+        destination = _artifact_destination(target_dir, source.name, used_names)
+        shutil.copy2(source, destination)
+        collected.append(destination)
+    return tuple(collected)
 
 
-async def _execute_agent_node(node: Node, registry: AdapterRegistry) -> NodeResult:
+def _artifact_destination(target_dir: Path, filename: str, used_names: set[str]) -> Path:
+    """Return a non-colliding destination path for one collected artifact."""
+    name = filename or "artifact"
+    candidate = target_dir / name
+    if name not in used_names and not candidate.exists():
+        used_names.add(name)
+        return candidate
+    stem = candidate.stem or "artifact"
+    suffix = candidate.suffix
+    index = 2
+    while True:
+        renamed = f"{stem}-{index}{suffix}"
+        candidate = target_dir / renamed
+        if renamed not in used_names and not candidate.exists():
+            used_names.add(renamed)
+            return candidate
+        index += 1
+
+
+async def _execute_agent_node(node: Node, registry: AdapterRegistry, run_dir: Path) -> NodeResult:
     """Run an agent Node through its Adapter and validate its Output Contract.
 
     A node fails when the Agent CLI exited non-zero, when the Adapter signals an
@@ -475,13 +501,13 @@ async def _execute_agent_node(node: Node, registry: AdapterRegistry) -> NodeResu
         started_at=started_at,
         finished_at=_now(),
         structured_output=result.structured_output,
-        artifacts=_existing_artifacts(result.artifacts),
+        artifacts=_collect_artifacts(node.id, result.artifacts, run_dir),
         failure_kind=FAILED if failed else None,
         adapter=inputs.adapter,
     )
 
 
-async def _execute_node(node: Node, registry: AdapterRegistry) -> NodeResult:
+async def _execute_node(node: Node, registry: AdapterRegistry, run_dir: Path) -> NodeResult:
     """Dispatch a Node Attempt to the runner for its kind.
 
     The single dispatch seam every new Node kind extends: shell Nodes spawn a
@@ -501,7 +527,7 @@ async def _execute_node(node: Node, registry: AdapterRegistry) -> NodeResult:
             f"human_gate node {node.id!r} must be parked by the scheduler, not executed"
         )
     try:
-        return await _execute_agent_node(node, registry)
+        return await _execute_agent_node(node, registry, run_dir)
     except Exception as exc:
         # ANY Exception from the agent path — an AdapterError (unknown adapter,
         # unreadable/malformed fixture), an OutputContractError, or an arbitrary
@@ -579,6 +605,7 @@ class _Scheduler:
         state: StateStore,
         events: EventLog,
         run_id: str,
+        run_dir: Path,
         registry: AdapterRegistry,
         *,
         satisfied_seed: Mapping[str, str] | None = None,
@@ -589,6 +616,7 @@ class _Scheduler:
         self._state = state
         self._events = events
         self._run_id = run_id
+        self._run_dir = run_dir
         self._registry = registry
         self._concurrency = workflow.concurrency
         self._by_id: dict[str, Node] = {node.id: node for node in workflow.nodes}
@@ -741,7 +769,7 @@ class _Scheduler:
                     self._state.record_node_started(run_id=self._run_id, node_id=node.id)
                     self._started.add(node.id)
                 self._events.append("node_started", {"node_id": node.id, "attempt": attempt})
-                task = asyncio.ensure_future(_execute_node(node, self._registry))
+                task = asyncio.ensure_future(_execute_node(node, self._registry, self._run_dir))
                 self._in_flight[task] = node
                 progressed = True
             if not progressed:
@@ -1132,8 +1160,40 @@ async def execute_run(
             created_at=_now(),
         )
         events.append("run_started", {"workflow_name": workflow.name})
-        scheduler = _Scheduler(workflow, state, events, run_id, registry or AdapterRegistry())
-        return await _drive_scheduler(scheduler, state, events, run_id)
+        scheduler = _Scheduler(
+            workflow, state, events, run_id, run_dir, registry or AdapterRegistry()
+        )
+        result = await _drive_scheduler(scheduler, state, events, run_id)
+    _apply_artifact_cleanup(workflow, runs_root, current_run_id=run_id)
+    return result
+
+
+def _apply_artifact_cleanup(workflow: Workflow, runs_root: Path, *, current_run_id: str) -> None:
+    """Apply the Workflow's artifact cleanup policy, never touching the current Run."""
+    policy = workflow.artifact_cleanup
+    if policy is None:
+        return
+    try:
+        run_dirs = [path for path in runs_root.iterdir() if path.is_dir()]
+    except OSError:
+        return
+    current_dir = runs_root / current_run_id
+    keep: set[Path] = {current_dir}
+    others = [path for path in run_dirs if path != current_dir]
+    others.sort(key=_run_dir_sort_key, reverse=True)
+    keep.update(others[: max(policy.keep_last_runs - 1, 0)])
+    for run_dir in run_dirs:
+        if run_dir in keep:
+            continue
+        shutil.rmtree(run_dir / "artifacts", ignore_errors=True)
+
+
+def _run_dir_sort_key(path: Path) -> tuple[int, str]:
+    """Sort run directories by filesystem mtime, then name for deterministic retention."""
+    try:
+        return (path.stat().st_mtime_ns, path.name)
+    except OSError:
+        return (0, path.name)
 
 
 async def _drive_scheduler(
@@ -1389,10 +1449,13 @@ async def resume_run(
             state,
             events,
             run_id,
+            run_dir,
             resolved_registry,
             satisfied_seed=satisfied,
             attempt_seed=attempt_seed,
             started_seed=started_seed,
             awaiting_seed=awaiting_before,
         )
-        return await _drive_scheduler(scheduler, state, events, run_id)
+        result = await _drive_scheduler(scheduler, state, events, run_id)
+    _apply_artifact_cleanup(workflow, runs_root, current_run_id=run_id)
+    return result

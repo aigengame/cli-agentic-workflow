@@ -478,10 +478,17 @@ Suggested local run layout:
       workflow.normalized.json
       artifacts/
         <node-id>/
-          stdout.txt
-          stderr.txt
-          output.json
+          <produced-file>
 ```
+
+Agent Adapters may report files a writable Agent CLI run created or modified; the kernel
+collects those files into the run directory before indexing them in State. A Workflow may
+declare `artifact_cleanup.keep_last_runs` to retain artifacts for the newest N runs while
+always preserving the current run; the default is no cleanup.
+
+A Workflow may also declare `final_output` (`node`, `field`, `schema`) so `caw report`
+validates the persisted final result against a JSON Schema and renders the validation
+result alongside the conclusion and trace evidence.
 
 ## Implementation Plan
 

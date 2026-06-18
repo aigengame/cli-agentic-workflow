@@ -45,6 +45,8 @@ async def test_agent_node_runs_through_mock_adapter_replaying_a_fixture(
 async def test_agent_node_structured_output_and_artifacts_are_indexed_in_state(
     tmp_path: Path,
 ) -> None:
+    # #16: adapter-supplied artifact paths are collected into the run directory
+    # before State indexes them, so reports point at durable run-owned copies.
     artifact = tmp_path / "report.md"
     artifact.write_text("# report\n", encoding="utf-8")
     fixture = write_fixture(
@@ -59,10 +61,12 @@ async def test_agent_node_structured_output_and_artifacts_are_indexed_in_state(
     await execute_run(workflow, tmp_path / "runs")
 
     run_dir = single_run_dir(tmp_path / "runs")
+    collected = run_dir / "artifacts" / "agent" / "report.md"
+    assert collected.read_text(encoding="utf-8") == "# report\n"
     (attempt,) = state_rows(run_dir, "SELECT output_json FROM attempt")
     output = json.loads(attempt["output_json"])
     assert output["structured_output"] == {"summary": "s"}
-    assert output["artifacts"] == [str(artifact)]
+    assert output["artifacts"] == [str(collected)]
 
 
 @pytest.mark.asyncio
@@ -85,13 +89,15 @@ async def test_a_nonexistent_artifact_path_is_not_indexed_in_state(tmp_path: Pat
 
     assert result.succeeded
     (agent_result,) = result.node_results
-    assert [str(p) for p in agent_result.artifacts] == [str(real)], (
-        "only the existing artifact is indexed; the phantom path is dropped"
-    )
     run_dir = single_run_dir(tmp_path / "runs")
+    collected = run_dir / "artifacts" / "agent" / "real.md"
+    assert [str(p) for p in agent_result.artifacts] == [str(collected)], (
+        "only the existing artifact is collected; the phantom path is dropped"
+    )
+    assert collected.read_text(encoding="utf-8") == "# real\n"
     (attempt,) = state_rows(run_dir, "SELECT output_json FROM attempt")
     output = json.loads(attempt["output_json"])
-    assert output["artifacts"] == [str(real)], "State indexes only the existing artifact"
+    assert output["artifacts"] == [str(collected)], "State indexes only the collected artifact"
 
 
 @pytest.mark.asyncio
@@ -110,6 +116,53 @@ async def test_a_directory_artifact_path_is_not_indexed_as_a_durable_file(
     assert result.succeeded
     (agent_result,) = result.node_results
     assert agent_result.artifacts == (), "a directory is not a durable produced file"
+
+
+@pytest.mark.asyncio
+async def test_artifact_cleanup_keeps_the_active_run_and_prunes_older_artifacts(
+    tmp_path: Path,
+) -> None:
+    # #16: keep-last-N cleanup is conservative. It removes only old run artifact
+    # directories after the current run exists, never the current run's artifacts.
+    artifact = tmp_path / "report.md"
+    artifact.write_text("# report\n", encoding="utf-8")
+    fixture = write_fixture(tmp_path / "fixture.json", exit_status=0, artifacts=[str(artifact)])
+    raw = agent_workflow(fixture).model_dump(mode="json")
+    raw["artifact_cleanup"] = {"keep_last_runs": 1}
+    workflow = normalize_workflow(raw, source="<test>")
+    runs_root = tmp_path / "runs"
+
+    first = await execute_run(workflow, runs_root)
+    first_dir = runs_root / first.run_id
+    first_artifacts = first_dir / "artifacts"
+    assert first_artifacts.is_dir(), "the active first run keeps its artifacts"
+
+    second = await execute_run(workflow, runs_root)
+    second_dir = runs_root / second.run_id
+
+    assert not first_artifacts.exists(), "older run artifacts were pruned"
+    assert (second_dir / "artifacts" / "agent" / "report.md").is_file(), (
+        "the current run's artifacts are never pruned by its own cleanup pass"
+    )
+    assert (first_dir / "state.sqlite").is_file(), "cleanup never removes run State"
+
+
+@pytest.mark.asyncio
+async def test_artifact_cleanup_default_keeps_existing_artifacts(tmp_path: Path) -> None:
+    # #16: the default is conservative. Without an explicit cleanup policy, a new
+    # run never deletes artifacts from older runs.
+    artifact = tmp_path / "report.md"
+    artifact.write_text("# report\n", encoding="utf-8")
+    fixture = write_fixture(tmp_path / "fixture.json", exit_status=0, artifacts=[str(artifact)])
+    workflow = agent_workflow(fixture)
+    runs_root = tmp_path / "runs"
+
+    first = await execute_run(workflow, runs_root)
+    first_artifacts = runs_root / first.run_id / "artifacts"
+    second = await execute_run(workflow, runs_root)
+
+    assert first_artifacts.is_dir()
+    assert (runs_root / second.run_id / "artifacts").is_dir()
 
 
 @pytest.mark.asyncio

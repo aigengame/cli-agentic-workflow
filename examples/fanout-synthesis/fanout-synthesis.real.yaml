@@ -27,6 +27,10 @@
 # `synthesize` node `needs` BOTH, so a successful run synthesizes both real answers.
 name: fanout-synthesis-real
 version: 1
+final_output:
+  node: synthesize
+  field: structured_output
+  schema: synthesis.schema.json
 nodes:
   - id: claude_branch
     kind: agent

@@ -1637,7 +1637,12 @@ def _isolated_skip_cascade_seconds(workflow: Workflow) -> float:
         def append(self, *_args: object, **_kwargs: object) -> None: ...
 
     scheduler = _Scheduler(
-        workflow, cast(Any, _NoOpState()), cast(Any, _NoOpEvents()), "run", AdapterRegistry()
+        workflow,
+        cast(Any, _NoOpState()),
+        cast(Any, _NoOpEvents()),
+        "run",
+        Path("run"),
+        AdapterRegistry(),
     )
     gc.disable()
     try:

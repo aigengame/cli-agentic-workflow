@@ -104,6 +104,45 @@ class CompletedSubprocess:
     returncode: int
     stdout: str
     stderr: str
+    artifacts: tuple[Path, ...] = ()
+
+
+_ARTIFACT_SCAN_EXCLUDED_DIRS = frozenset(
+    {".git", ".caw", ".venv", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
+)
+
+
+def _artifact_fingerprint(path: Path) -> tuple[int, int] | None:
+    """Return a cheap file-change fingerprint, or None when the path is not a file."""
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    if not path.is_file():
+        return None
+    return (stat.st_mtime_ns, stat.st_size)
+
+
+def _artifact_snapshot(root: Path) -> dict[Path, tuple[int, int]]:
+    """Snapshot regular files under ``root`` for real-CLI artifact detection (#16)."""
+    snapshot: dict[Path, tuple[int, int]] = {}
+    for directory, dirnames, filenames in os.walk(root):
+        dirnames[:] = [name for name in dirnames if name not in _ARTIFACT_SCAN_EXCLUDED_DIRS]
+        current = Path(directory)
+        for filename in filenames:
+            path = current / filename
+            fingerprint = _artifact_fingerprint(path)
+            if fingerprint is not None:
+                snapshot[path] = fingerprint
+    return snapshot
+
+
+def _changed_artifacts(root: Path, before: Mapping[Path, tuple[int, int]]) -> tuple[Path, ...]:
+    """Files under ``root`` that were created or modified since ``before``."""
+    after = _artifact_snapshot(root)
+    return tuple(
+        sorted(path for path, fingerprint in after.items() if before.get(path) != fingerprint)
+    )
 
 
 async def _communicate_or_kill(
@@ -192,6 +231,7 @@ class SubprocessAdapter:
         *,
         context_label: str,
         env: Mapping[str, str] | None = None,
+        capture_artifacts: bool = True,
     ) -> CompletedSubprocess:
         """Spawn the CLI for ``argv`` and return its normalized completion.
 
@@ -205,6 +245,8 @@ class SubprocessAdapter:
         through as a real int (a signal-kill stays negative, never the ``-1`` TIMED_OUT
         sentinel, #84) and stdout/stderr decode recoverably.
         """
+        artifact_root = Path.cwd()
+        before = _artifact_snapshot(artifact_root) if capture_artifacts else {}
         try:
             process = await asyncio.create_subprocess_exec(
                 *argv,
@@ -228,6 +270,7 @@ class SubprocessAdapter:
             returncode=process.returncode,
             stdout=stdout_bytes.decode("utf-8", errors="backslashreplace"),
             stderr=stderr_bytes.decode("utf-8", errors="backslashreplace"),
+            artifacts=(_changed_artifacts(artifact_root, before) if capture_artifacts else ()),
         )
 
     async def capability_check(self) -> str:
@@ -250,7 +293,9 @@ class SubprocessAdapter:
         """
         resolved_cli = self.resolve_cli_path("capability check")
         completed = await self.run_cli(
-            [resolved_cli, "--version"], context_label="capability check"
+            [resolved_cli, "--version"],
+            context_label="capability check",
+            capture_artifacts=False,
         )
         if completed.returncode != 0:
             stderr = completed.stderr.strip()

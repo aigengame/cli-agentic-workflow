@@ -145,8 +145,13 @@ work #79 and is exercised by the real-CLI e2e #86 today).
   behaviors whose correctness depends on the real CLI. The two are co-weighted — neither is
   a privileged "primary" seam. (Corrected from an earlier "permanent" framing that
   over-weighted the mock and let real-CLI coverage lapse.)
-- `AgentResult.artifacts` is indexed minimally in State now; the full artifact lifecycle
-  (collection, cleanup, retention) is deferred to #16.
+- `AgentResult.artifacts` is the Adapter-to-kernel handoff for files a real writable
+  Agent CLI run created or modified. Real subprocess Adapters discover changed regular
+  files in their working directory and return those source paths; the kernel then collects
+  them into the run directory under `artifacts/<node-id>/` and persists only those
+  run-owned copies in State (#16). A Workflow may declare `artifact_cleanup.keep_last_runs`
+  to prune old run artifact directories after a run finishes; the current run is always
+  preserved, and the default is conservative (no cleanup).
 - The `SubprocessAdapter` base (#83) is where a cross-cutting subprocess fix lands once
   rather than per-CLI: `codex.exec` (#11) sets its CLI name and missing-CLI hint and inherits
   the whole lifecycle. The base is NOT itself a registered Adapter — it has no `invoke`; the
