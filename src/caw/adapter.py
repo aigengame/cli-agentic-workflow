@@ -41,7 +41,9 @@ class AgentInvocation:
     the parent environment, already resolved to their values by the kernel's env
     policy; an Adapter passes these to the Agent CLI process and nowhere else. The
     kernel never persists these values (#5). ``output_schema`` and ``fixture`` are
-    resolved file paths or ``None``.
+    resolved file paths or ``None``. ``working_dir`` is the node-owned directory a
+    real Adapter may use as the subprocess cwd and artifact-discovery boundary; it
+    is ``None`` for direct adapter calls that deliberately use the ambient cwd.
 
     The repr REDACTS env values (#65): the declared NAMES render — they are
     already in the inspectable definition — but each VALUE is replaced with a
@@ -56,13 +58,15 @@ class AgentInvocation:
     env: Mapping[str, str] = field(default_factory=dict)
     output_schema: Path | None = None
     fixture: Path | None = None
+    working_dir: Path | None = None
 
     def __repr__(self) -> str:
         redacted_env = {name: "***" for name in self.env}
         return (
             f"{type(self).__name__}(node_id={self.node_id!r}, adapter={self.adapter!r}, "
             f"prompt={self.prompt!r}, args={self.args!r}, env={redacted_env!r}, "
-            f"output_schema={self.output_schema!r}, fixture={self.fixture!r})"
+            f"output_schema={self.output_schema!r}, fixture={self.fixture!r}, "
+            f"working_dir={self.working_dir!r})"
         )
 
 

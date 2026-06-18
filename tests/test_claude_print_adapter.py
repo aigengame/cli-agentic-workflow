@@ -78,6 +78,18 @@ class FakeProcess:
         return self.returncode
 
 
+class ProducingProcess(FakeProcess):
+    """A fake CLI process that writes one artifact while it runs."""
+
+    def __init__(self, artifact: Path) -> None:
+        super().__init__(0, stdout=b"ok")
+        self._artifact = artifact
+
+    async def communicate(self, input: bytes | None = None) -> tuple[bytes, bytes]:
+        self._artifact.write_text("created by claude\n", encoding="utf-8")
+        return await super().communicate(input)
+
+
 FAKE_CLAUDE_PATH = "/fake/abs/bin/claude"
 
 
@@ -143,6 +155,31 @@ async def test_zero_exit_normalizes_stdout_and_stderr(
     assert result.stderr == ""
     assert result.structured_output is None
     assert result.artifacts == ()
+
+
+@pytest.mark.asyncio
+async def test_invoke_reports_files_created_by_the_cli_as_artifacts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # #16: a writable real Agent CLI run may create files in its working directory.
+    # The Adapter reports new/changed files so the kernel can collect them into the
+    # run directory and index the durable copies in State.
+    produced = tmp_path / "agent-report.md"
+    patch_which(monkeypatch)
+    patch_spawn(monkeypatch, ProducingProcess(produced))
+    adapter = ClaudePrintAdapter()
+
+    result = await adapter.invoke(
+        AgentInvocation(
+            node_id="n",
+            adapter="claude.print",
+            prompt="write a report",
+            working_dir=tmp_path,
+        )
+    )
+
+    assert result.exit_status == 0
+    assert result.artifacts == (produced,)
 
 
 @pytest.mark.asyncio

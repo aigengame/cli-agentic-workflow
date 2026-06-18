@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from conftest import write_schema
 from typer.testing import CliRunner
 
 from caw.cli import app
@@ -82,6 +83,118 @@ def test_report_json_surfaces_an_agent_nodes_structured_output(
     report = json.loads(runner.invoke(app, ["report", run_id, "--format", "json"]).output)
     classify = next(node for node in report["nodes"] if node["id"] == "classify")
     assert classify["structured_output"] == {"category": "bug"}
+
+
+def test_report_json_validates_declared_final_output(
+    write_workflow_data: Callable[[dict[str, Any]], Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #16: a Workflow may declare the final output a report should validate.
+    # Reporting reads the persisted node output, validates it against the declared
+    # schema, and carries the validation result in the report without re-running.
+    fixture = tmp_path / "synthesize.fixture.json"
+    fixture.write_text(
+        json.dumps(
+            {
+                "exit_status": 0,
+                "structured_output": {"summary": "ship it"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    schema = write_schema(
+        tmp_path / "final.schema.json",
+        {"type": "object", "required": ["summary"], "properties": {"summary": {"type": "string"}}},
+    )
+    workflow_file = write_workflow_data(
+        {
+            "name": "sample",
+            "version": 1,
+            "final_output": {
+                "node": "synthesize",
+                "field": "structured_output",
+                "schema": str(schema),
+            },
+            "nodes": [
+                {
+                    "id": "synthesize",
+                    "kind": "agent",
+                    "inputs": {"adapter": "mock", "prompt": "synthesize", "fixture": str(fixture)},
+                }
+            ],
+        }
+    )
+    monkeypatch.chdir(tmp_path)
+    assert runner.invoke(app, ["run", str(workflow_file)]).exit_code == 0
+    run_id = _run_dir_name(tmp_path)
+
+    result = runner.invoke(app, ["report", run_id, "--format", "json"])
+
+    assert result.exit_code == 0, result.output
+    report = json.loads(result.output)
+    assert report["final_output"] == {
+        "node": "synthesize",
+        "field": "structured_output",
+        "schema": str(schema),
+        "status": "valid",
+        "value": {"summary": "ship it"},
+        "error": None,
+    }
+
+
+def test_report_surfaces_declared_final_output_schema_violations(
+    write_workflow_data: Callable[[dict[str, Any]], Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #16: report-time final-output validation is diagnostic. A schema violation
+    # must be visible in the report, without preventing the report from rendering
+    # the run's conclusion and trace evidence.
+    fixture = tmp_path / "synthesize.fixture.json"
+    fixture.write_text(
+        json.dumps({"exit_status": 0, "structured_output": {"title": "missing summary"}}),
+        encoding="utf-8",
+    )
+    schema = write_schema(
+        tmp_path / "final.schema.json",
+        {"type": "object", "required": ["summary"], "properties": {"summary": {"type": "string"}}},
+    )
+    workflow_file = write_workflow_data(
+        {
+            "name": "sample",
+            "version": 1,
+            "final_output": {
+                "node": "synthesize",
+                "field": "structured_output",
+                "schema": str(schema),
+            },
+            "nodes": [
+                {
+                    "id": "synthesize",
+                    "kind": "agent",
+                    "inputs": {"adapter": "mock", "prompt": "synthesize", "fixture": str(fixture)},
+                }
+            ],
+        }
+    )
+    monkeypatch.chdir(tmp_path)
+    assert runner.invoke(app, ["run", str(workflow_file)]).exit_code == 0
+    run_id = _run_dir_name(tmp_path)
+
+    json_result = runner.invoke(app, ["report", run_id, "--format", "json"])
+    markdown = runner.invoke(app, ["report", run_id, "--format", "markdown"])
+
+    assert json_result.exit_code == 0, json_result.output
+    report = json.loads(json_result.output)
+    assert report["status"] == "succeeded", "the run still reports its execution status"
+    assert report["trace"], "the report still carries trace evidence"
+    assert report["final_output"]["status"] == "invalid"
+    assert "required property" in report["final_output"]["error"]
+    assert markdown.exit_code == 0, markdown.output
+    assert "## Final Output" in markdown.output
+    assert "invalid" in markdown.output
+    assert str(schema) in markdown.output
 
 
 def test_report_renders_a_parked_run_status_agnostically(

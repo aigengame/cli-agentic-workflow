@@ -274,6 +274,13 @@ class StateStore:
         ).fetchone()
         return None if row is None else str(row[0])
 
+    def run_created_at(self, run_id: str) -> str | None:
+        """The recorded creation timestamp of a Run, or ``None`` if no such Run exists."""
+        row = self._connection.execute(
+            "SELECT created_at FROM run WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        return None if row is None else str(row[0])
+
     def node_statuses(self, run_id: str) -> dict[str, str]:
         """Map each recorded Node of a Run to its status.
 

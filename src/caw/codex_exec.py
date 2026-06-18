@@ -90,7 +90,10 @@ class CodexExecAdapter(SubprocessAdapter, Adapter):
         # supplementary input from stdin, which would otherwise block) and kills+reaps the
         # whole tree on a cancellation/timeout.
         completed = await self.run_cli(
-            argv, context_label=node_context(invocation), env=invocation.env
+            argv,
+            context_label=node_context(invocation),
+            env=invocation.env,
+            cwd=invocation.working_dir,
         )
         exit_status = completed.returncode
         stdout = completed.stdout
@@ -100,7 +103,12 @@ class CodexExecAdapter(SubprocessAdapter, Adapter):
         # surfaced AS-IS without parsing — the exit code is the primary signal and must
         # not be masked by an unparseable stream.
         if exit_status != 0:
-            return AgentResult(exit_status=exit_status, stdout=stdout, stderr=stderr)
+            return AgentResult(
+                exit_status=exit_status,
+                stdout=stdout,
+                stderr=stderr,
+                artifacts=completed.artifacts,
+            )
         # A zero exit: fold the JSONL event stream to the final agent message and, when a
         # schema was required, the structured object parsed from it.
         events = self._parse_events(stdout)
@@ -120,6 +128,7 @@ class CodexExecAdapter(SubprocessAdapter, Adapter):
                 exit_status=exit_status,
                 stdout=stdout,
                 stderr=self._annotate_cli_error(stderr, failure),
+                artifacts=completed.artifacts,
                 adapter_failure=True,
             )
         message = self._final_agent_message(events)
@@ -145,6 +154,7 @@ class CodexExecAdapter(SubprocessAdapter, Adapter):
             stdout=stdout,
             stderr=stderr,
             structured_output=structured_output,
+            artifacts=completed.artifacts,
         )
 
     @staticmethod

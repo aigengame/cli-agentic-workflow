@@ -5,6 +5,7 @@ import contextlib
 import json
 import os
 import secrets
+import shutil
 import signal
 from collections import deque
 from collections.abc import Mapping
@@ -362,25 +363,60 @@ def _resolve_shell_env(declared: tuple[str, ...] | None) -> Mapping[str, str] | 
     return _resolve_declared_env(declared)
 
 
-def _existing_artifacts(artifacts: tuple[Path, ...]) -> tuple[Path, ...]:
-    """Keep only artifact paths that are durable files that actually exist (#67).
+def _collect_artifacts(
+    node_id: str, artifacts: tuple[Path, ...], run_dir: Path
+) -> tuple[Path, ...]:
+    """Copy produced artifact files into the run directory and return their durable paths.
 
-    An Artifact is a "durable file produced by a node attempt" indexed in State, so
-    the index must not over-promise: an adapter-supplied path is validated for
-    existence as a regular FILE before being indexed. A path that does not exist,
-    or that exists but is not a file (e.g. a directory), is dropped rather than
-    recorded — State then never claims a produced file that never existed.
-
-    This is the minimal EXISTENCE guard only; it deliberately does NOT scope a path
-    to the run directory, so an existing file ANYWHERE on disk is still indexed. The
-    remaining artifact lifecycle — collection, retention, and run-directory SCOPING
-    (rejecting/relocating an out-of-run-directory path) — is owned by #16, not this
-    guard.
+    An Adapter may report paths in its working directory. The kernel owns the
+    lifecycle: only existing regular files are collected, copied under
+    ``artifacts/<node-id>/``, and the collected copies are what State indexes (#16).
     """
-    return tuple(path for path in artifacts if path.is_file())
+    collected: list[Path] = []
+    if not artifacts:
+        return ()
+    target_dir = run_dir / "artifacts" / node_id
+    target_dir.mkdir(parents=True, exist_ok=True)
+    used_names: set[str] = set()
+    for source in artifacts:
+        if not source.is_file():
+            continue
+        destination = _artifact_destination(target_dir, source.name, used_names)
+        shutil.copy2(source, destination)
+        collected.append(destination)
+    return tuple(collected)
 
 
-async def _execute_agent_node(node: Node, registry: AdapterRegistry) -> NodeResult:
+def _artifact_destination(target_dir: Path, filename: str, used_names: set[str]) -> Path:
+    """Return a non-colliding destination path for one collected artifact."""
+    name = filename or "artifact"
+    candidate = target_dir / name
+    if name not in used_names and not candidate.exists():
+        used_names.add(name)
+        return candidate
+    stem = candidate.stem or "artifact"
+    suffix = candidate.suffix
+    index = 2
+    while True:
+        renamed = f"{stem}-{index}{suffix}"
+        candidate = target_dir / renamed
+        if renamed not in used_names and not candidate.exists():
+            used_names.add(renamed)
+            return candidate
+        index += 1
+
+
+def _agent_work_dir(run_dir: Path, node_id: str) -> Path:
+    """The private cwd/artifact-discovery boundary for one agent node invocation."""
+    return run_dir / "work" / node_id
+
+
+def _cleanup_agent_work_dir(work_dir: Path) -> None:
+    """Remove an agent node's private scratch directory after artifact collection."""
+    shutil.rmtree(work_dir, ignore_errors=True)
+
+
+async def _execute_agent_node(node: Node, registry: AdapterRegistry, run_dir: Path) -> NodeResult:
     """Run an agent Node through its Adapter and validate its Output Contract.
 
     A node fails when the Agent CLI exited non-zero, when the Adapter signals an
@@ -407,6 +443,8 @@ async def _execute_agent_node(node: Node, registry: AdapterRegistry) -> NodeResu
     inputs = node.inputs
     started_at = _now()
     adapter = registry.resolve(inputs.adapter)
+    work_dir = _agent_work_dir(run_dir, node.id)
+    work_dir.mkdir(parents=True, exist_ok=True)
     invocation = AgentInvocation(
         node_id=node.id,
         adapter=inputs.adapter,
@@ -415,73 +453,77 @@ async def _execute_agent_node(node: Node, registry: AdapterRegistry) -> NodeResu
         env=_resolve_declared_env(inputs.env),
         output_schema=inputs.output_schema,
         fixture=inputs.fixture,
+        working_dir=work_dir,
     )
     # The timeout wraps the Adapter invocation — the wall-clock the node spends
     # waiting on the external Agent CLI (#6). A TimeoutError is classified
     # TIMED_OUT here rather than caught by the generic ERRORED handler in
     # _execute_node, so a slow agent is diagnosable as a timeout, not an error.
     try:
-        async with asyncio.timeout(node.timeout):
-            result = await adapter.invoke(invocation)
-    except TimeoutError:
+        try:
+            async with asyncio.timeout(node.timeout):
+                result = await adapter.invoke(invocation)
+        except TimeoutError:
+            return NodeResult(
+                node_id=node.id,
+                exit_status=-1,
+                stdout="",
+                stderr=f"node {node.id!r} (adapter {inputs.adapter!r}) "
+                f"exceeded its timeout of {node.timeout}s",
+                started_at=started_at,
+                finished_at=_now(),
+                failure_kind=TIMED_OUT,
+                adapter=inputs.adapter,
+            )
+        exit_status = result.exit_status
+        stderr = result.stderr
+        # The adapter-determined-failure contract (ADR 0006, #83): an Adapter that ran
+        # the agent but normalized its result as a FAILURE raises `adapter_failure`
+        # WITHOUT manufacturing a non-zero exit. The kernel honors it ONCE here — the
+        # single point that decides whether an agent result is a failed Node — so a
+        # zero-exit result carrying the flag fails exactly like a non-zero exit, while
+        # the adapter keeps the process's REAL exit_status (no fabricated exit code).
+        failed = exit_status != 0 or result.adapter_failure
+        # The Output Contract guards a SUCCESSFUL invocation's output (#63): a failed
+        # node — whether by a non-zero exit OR an adapter-determined failure — carries
+        # no trustworthy structured output, so the contract is not evaluated and cannot
+        # mask the agent's own failure cause with a contract message.
+        if not failed and inputs.output_schema is not None:
+            try:
+                # Run the Output Contract off the event loop: the validator's read +
+                # parse + meta-schema-check + compile is synchronous blocking I/O (it
+                # happens once per schema path and is cached, #67), so dispatching it to
+                # a worker thread keeps a slow disk or a large schema from stalling the
+                # asyncio scheduler that is driving the Run's concurrent Nodes.
+                await asyncio.to_thread(
+                    validate_output_contract, inputs.output_schema, result.structured_output
+                )
+            except OutputContractError as exc:
+                # A contract breach is a KERNEL-determined failure on a process that
+                # exited zero; there is no real non-zero process exit to preserve, so
+                # the kernel records exit_status 1 as the node's failure (the #63
+                # behavior), distinct from the adapter-determined case above where a
+                # real exit_status is kept and `adapter_failure` carries the signal.
+                exit_status = 1
+                failed = True
+                stderr = f"{stderr}\n{exc}".strip() if stderr else str(exc)
         return NodeResult(
             node_id=node.id,
-            exit_status=-1,
-            stdout="",
-            stderr=f"node {node.id!r} (adapter {inputs.adapter!r}) "
-            f"exceeded its timeout of {node.timeout}s",
+            exit_status=exit_status,
+            stdout=result.stdout,
+            stderr=stderr,
             started_at=started_at,
             finished_at=_now(),
-            failure_kind=TIMED_OUT,
+            structured_output=result.structured_output,
+            artifacts=_collect_artifacts(node.id, result.artifacts, run_dir),
+            failure_kind=FAILED if failed else None,
             adapter=inputs.adapter,
         )
-    exit_status = result.exit_status
-    stderr = result.stderr
-    # The adapter-determined-failure contract (ADR 0006, #83): an Adapter that ran
-    # the agent but normalized its result as a FAILURE raises `adapter_failure`
-    # WITHOUT manufacturing a non-zero exit. The kernel honors it ONCE here — the
-    # single point that decides whether an agent result is a failed Node — so a
-    # zero-exit result carrying the flag fails exactly like a non-zero exit, while
-    # the adapter keeps the process's REAL exit_status (no fabricated exit code).
-    failed = exit_status != 0 or result.adapter_failure
-    # The Output Contract guards a SUCCESSFUL invocation's output (#63): a failed
-    # node — whether by a non-zero exit OR an adapter-determined failure — carries
-    # no trustworthy structured output, so the contract is not evaluated and cannot
-    # mask the agent's own failure cause with a contract message.
-    if not failed and inputs.output_schema is not None:
-        try:
-            # Run the Output Contract off the event loop: the validator's read +
-            # parse + meta-schema-check + compile is synchronous blocking I/O (it
-            # happens once per schema path and is cached, #67), so dispatching it to
-            # a worker thread keeps a slow disk or a large schema from stalling the
-            # asyncio scheduler that is driving the Run's concurrent Nodes.
-            await asyncio.to_thread(
-                validate_output_contract, inputs.output_schema, result.structured_output
-            )
-        except OutputContractError as exc:
-            # A contract breach is a KERNEL-determined failure on a process that
-            # exited zero; there is no real non-zero process exit to preserve, so
-            # the kernel records exit_status 1 as the node's failure (the #63
-            # behavior), distinct from the adapter-determined case above where a
-            # real exit_status is kept and `adapter_failure` carries the signal.
-            exit_status = 1
-            failed = True
-            stderr = f"{stderr}\n{exc}".strip() if stderr else str(exc)
-    return NodeResult(
-        node_id=node.id,
-        exit_status=exit_status,
-        stdout=result.stdout,
-        stderr=stderr,
-        started_at=started_at,
-        finished_at=_now(),
-        structured_output=result.structured_output,
-        artifacts=_existing_artifacts(result.artifacts),
-        failure_kind=FAILED if failed else None,
-        adapter=inputs.adapter,
-    )
+    finally:
+        _cleanup_agent_work_dir(work_dir)
 
 
-async def _execute_node(node: Node, registry: AdapterRegistry) -> NodeResult:
+async def _execute_node(node: Node, registry: AdapterRegistry, run_dir: Path) -> NodeResult:
     """Dispatch a Node Attempt to the runner for its kind.
 
     The single dispatch seam every new Node kind extends: shell Nodes spawn a
@@ -501,7 +543,7 @@ async def _execute_node(node: Node, registry: AdapterRegistry) -> NodeResult:
             f"human_gate node {node.id!r} must be parked by the scheduler, not executed"
         )
     try:
-        return await _execute_agent_node(node, registry)
+        return await _execute_agent_node(node, registry, run_dir)
     except Exception as exc:
         # ANY Exception from the agent path — an AdapterError (unknown adapter,
         # unreadable/malformed fixture), an OutputContractError, or an arbitrary
@@ -579,6 +621,7 @@ class _Scheduler:
         state: StateStore,
         events: EventLog,
         run_id: str,
+        run_dir: Path,
         registry: AdapterRegistry,
         *,
         satisfied_seed: Mapping[str, str] | None = None,
@@ -589,6 +632,7 @@ class _Scheduler:
         self._state = state
         self._events = events
         self._run_id = run_id
+        self._run_dir = run_dir
         self._registry = registry
         self._concurrency = workflow.concurrency
         self._by_id: dict[str, Node] = {node.id: node for node in workflow.nodes}
@@ -741,7 +785,7 @@ class _Scheduler:
                     self._state.record_node_started(run_id=self._run_id, node_id=node.id)
                     self._started.add(node.id)
                 self._events.append("node_started", {"node_id": node.id, "attempt": attempt})
-                task = asyncio.ensure_future(_execute_node(node, self._registry))
+                task = asyncio.ensure_future(_execute_node(node, self._registry, self._run_dir))
                 self._in_flight[task] = node
                 progressed = True
             if not progressed:
@@ -1132,8 +1176,49 @@ async def execute_run(
             created_at=_now(),
         )
         events.append("run_started", {"workflow_name": workflow.name})
-        scheduler = _Scheduler(workflow, state, events, run_id, registry or AdapterRegistry())
-        return await _drive_scheduler(scheduler, state, events, run_id)
+        scheduler = _Scheduler(
+            workflow, state, events, run_id, run_dir, registry or AdapterRegistry()
+        )
+        result = await _drive_scheduler(scheduler, state, events, run_id)
+    _apply_artifact_cleanup(workflow, runs_root, current_run_id=run_id)
+    return result
+
+
+def _apply_artifact_cleanup(workflow: Workflow, runs_root: Path, *, current_run_id: str) -> None:
+    """Apply the Workflow's artifact cleanup policy, never touching the current Run."""
+    policy = workflow.artifact_cleanup
+    if policy is None:
+        return
+    try:
+        run_dirs = [path for path in runs_root.iterdir() if path.is_dir()]
+    except OSError:
+        return
+    current_dir = runs_root / current_run_id
+    keep: set[Path] = {current_dir}
+    others = [path for path in run_dirs if path != current_dir]
+    others.sort(key=_run_dir_sort_key, reverse=True)
+    keep.update(others[: max(policy.keep_last_runs - 1, 0)])
+    for run_dir in run_dirs:
+        if run_dir in keep:
+            continue
+        shutil.rmtree(run_dir / "artifacts", ignore_errors=True)
+
+
+def _run_dir_sort_key(path: Path) -> tuple[str, str]:
+    """Sort run directories by immutable persisted creation time, then name."""
+    return (_run_created_at(path) or "", path.name)
+
+
+def _run_created_at(run_dir: Path) -> str | None:
+    """Read one run's persisted creation timestamp for artifact retention ordering."""
+    state_path = run_dir / "state.sqlite"
+    if not state_path.is_file():
+        return None
+    try:
+        with StateStore(state_path, read_only=True) as state:
+            return state.run_created_at(run_dir.name)
+    except Exception:
+        return None
 
 
 async def _drive_scheduler(
@@ -1389,10 +1474,13 @@ async def resume_run(
             state,
             events,
             run_id,
+            run_dir,
             resolved_registry,
             satisfied_seed=satisfied,
             attempt_seed=attempt_seed,
             started_seed=started_seed,
             awaiting_seed=awaiting_before,
         )
-        return await _drive_scheduler(scheduler, state, events, run_id)
+        result = await _drive_scheduler(scheduler, state, events, run_id)
+    _apply_artifact_cleanup(workflow, runs_root, current_run_id=run_id)
+    return result

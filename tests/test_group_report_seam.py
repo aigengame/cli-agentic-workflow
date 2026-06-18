@@ -16,7 +16,7 @@ from caw.report import ReportFormat, render_group_report
 
 
 def _write_fixture(path: Path, *, done: bool, next_fixture: str | None = None) -> None:
-    structured: dict[str, object] = {}
+    structured: dict[str, object] = {"done": done}
     if next_fixture is not None:
         structured["next_fixture"] = next_fixture
     path.write_text(
@@ -31,18 +31,39 @@ def _write_fixture(path: Path, *, done: bool, next_fixture: str | None = None) -
     )
 
 
+def _write_final_schema(path: Path) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "type": "object",
+                "required": ["done"],
+                "properties": {
+                    "done": {"type": "boolean"},
+                    "next_fixture": {"type": "string"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
 def _write_workflow(directory: Path, first_fixture: str) -> Path:
     workflow = directory / "iteration.yaml"
     workflow.write_text(
         "name: loop-iteration\n"
         "version: 1\n"
+        "final_output:\n"
+        "  node: verdict\n"
+        "  field: structured_output\n"
+        "  schema: final.schema.json\n"
         "nodes:\n"
         "  - id: verdict\n"
         "    kind: agent\n"
         "    inputs:\n"
         "      adapter: mock\n"
         "      prompt: Decide whether the task is done.\n"
-        f"      fixture: {first_fixture}\n",
+        f"      fixture: {first_fixture}\n"
+        "      output_schema: final.schema.json\n",
         encoding="utf-8",
     )
     return workflow
@@ -69,6 +90,7 @@ def _spec(workflow: Path) -> ControllerSpec:
 
 
 async def _run_two_iteration_group(tmp_path: Path) -> str:
+    _write_final_schema(tmp_path / "final.schema.json")
     _write_fixture(tmp_path / "iter1.fixture.json", done=False, next_fixture="iter2.fixture.json")
     _write_fixture(tmp_path / "iter2.fixture.json", done=True)
     workflow = _write_workflow(tmp_path, "iter1.fixture.json")
@@ -109,6 +131,32 @@ async def test_group_report_includes_trace_evidence_per_iteration(tmp_path: Path
         assert iteration["trace"], "each iteration carries its append-only event trace"
         event_types = {event["type"] for event in iteration["trace"]}
         assert "run_started" in event_types, "the iteration's run-start event is traced"
+
+
+@pytest.mark.asyncio
+async def test_group_report_carries_final_output_validation_per_iteration(
+    tmp_path: Path,
+) -> None:
+    # #16 review follow-up: a Run Group wraps per-run reports, so each iteration
+    # must keep the same final-output validation a standalone run report would show.
+    group_id = await _run_two_iteration_group(tmp_path)
+
+    json_report = json.loads(render_group_report(group_id, tmp_path, ReportFormat.json))
+    for iteration in json_report["iterations"]:
+        assert iteration["final_output"]["node"] == "verdict"
+        assert iteration["final_output"]["field"] == "structured_output"
+        assert iteration["final_output"]["status"] == "valid"
+
+    jsonl = render_group_report(group_id, tmp_path, ReportFormat.jsonl)
+    assert '"final_output":' in jsonl
+
+    text = render_group_report(group_id, tmp_path, ReportFormat.text)
+    assert "final output:" in text
+    assert "verdict.structured_output: valid" in text
+
+    markdown = render_group_report(group_id, tmp_path, ReportFormat.markdown)
+    assert "### Final Output" in markdown
+    assert "`verdict.structured_output` — valid" in markdown
 
 
 @pytest.mark.asyncio

@@ -19,6 +19,10 @@
 # `synthesize` node `needs` BOTH, so a successful run joins both branch answers.
 name: fanout-synthesis-mock
 version: 1
+final_output:
+  node: synthesize
+  field: structured_output
+  schema: synthesis.schema.json
 nodes:
   - id: claude_branch
     kind: agent

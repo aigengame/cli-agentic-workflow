@@ -101,6 +101,18 @@ class FakeProcess:
         return self.returncode
 
 
+class ProducingProcess(FakeProcess):
+    """A fake CLI process that writes one artifact while it runs."""
+
+    def __init__(self, artifact: Path) -> None:
+        super().__init__(0, stdout=codex_jsonl(text="ok"))
+        self._artifact = artifact
+
+    async def communicate(self, input: bytes | None = None) -> tuple[bytes, bytes]:
+        self._artifact.write_text("created by codex\n", encoding="utf-8")
+        return await super().communicate(input)
+
+
 FAKE_CODEX_PATH = "/fake/abs/bin/codex"
 
 
@@ -169,6 +181,29 @@ async def test_zero_exit_normalizes_agent_message_and_stderr(
     assert result.stderr == ""
     assert result.structured_output is None
     assert result.artifacts == ()
+
+
+@pytest.mark.asyncio
+async def test_invoke_reports_files_created_by_the_cli_as_artifacts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # #16: codex.exec has the same artifact-capture behavior as claude.print.
+    produced = tmp_path / "agent-report.md"
+    patch_which(monkeypatch)
+    patch_spawn(monkeypatch, ProducingProcess(produced))
+    adapter = CodexExecAdapter()
+
+    result = await adapter.invoke(
+        AgentInvocation(
+            node_id="n",
+            adapter="codex.exec",
+            prompt="write a report",
+            working_dir=tmp_path,
+        )
+    )
+
+    assert result.exit_status == 0
+    assert result.artifacts == (produced,)
 
 
 @pytest.mark.asyncio

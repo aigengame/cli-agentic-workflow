@@ -50,8 +50,9 @@ uv run caw report <run-id> --format markdown
 ```
 
 The Markdown report keeps the **final conclusion** (each node's outcome, including the
-`synthesize` node's) in its own `## Nodes` section, distinct from the `## Trace` of events —
-conclusion separated from trace evidence.
+`synthesize` node's) in its own `## Nodes` section, validates the declared `final_output` in
+`## Final Output`, and keeps both distinct from the `## Trace` of events — conclusion
+separated from trace evidence.
 
 ## Going real: claude.print + codex.exec
 

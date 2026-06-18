@@ -13,6 +13,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
+from caw.contract import OutputContractError, validate_output_contract
 from caw.runlayout import group_iterations_root, group_state_path
 from caw.state import StateStore
 from caw.status import SKIPPED, SUCCEEDED
@@ -33,13 +34,20 @@ def _read_trace(run_dir: Path) -> list[dict[str, Any]]:
     return [json.loads(line) for line in lines if line.strip()]
 
 
-def _read_graph(run_dir: Path) -> list[dict[str, Any]]:
+def _read_snapshot(run_dir: Path) -> dict[str, Any]:
+    """The persisted normalized Workflow snapshot for this Run."""
+    loaded: dict[str, Any] = json.loads(
+        (run_dir / "workflow.normalized.json").read_text(encoding="utf-8")
+    )
+    return loaded
+
+
+def _read_graph(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
     """The Run's nodes and dependency edges, read from the persisted snapshot.
 
     Reads the normalized snapshot rather than re-validating the Workflow, so the
     report reflects exactly the graph that ran, in declaration order.
     """
-    snapshot = json.loads((run_dir / "workflow.normalized.json").read_text(encoding="utf-8"))
     return [
         {"id": node["id"], "needs": list(node.get("needs", []))}
         for node in snapshot["workflow"]["nodes"]
@@ -84,6 +92,7 @@ def _conclusion_nodes(run_dir: Path) -> tuple[str | None, list[dict[str, Any]]]:
 
 def _gather(run_dir: Path) -> dict[str, Any]:
     """Assemble the full report model from the Run's persisted State and Events."""
+    snapshot = _read_snapshot(run_dir)
     status, nodes = _conclusion_nodes(run_dir)
     trace = _read_trace(run_dir)
     blockers = _skip_blockers(trace)
@@ -93,8 +102,41 @@ def _gather(run_dir: Path) -> dict[str, Any]:
         "run_id": run_dir.name,
         "status": status,
         "nodes": nodes,
-        "graph": _read_graph(run_dir),
+        "graph": _read_graph(snapshot),
         "trace": trace,
+        "final_output": _validate_final_output(run_dir, snapshot),
+    }
+
+
+def _validate_final_output(run_dir: Path, snapshot: dict[str, Any]) -> dict[str, Any] | None:
+    """Validate the declared final output from persisted State, if the Workflow has one."""
+    declaration = snapshot["workflow"].get("final_output")
+    if declaration is None:
+        return None
+    node_id = declaration["node"]
+    field = declaration["field"]
+    schema = declaration["schema"]
+    with StateStore(run_dir / "state.sqlite", read_only=True) as state:
+        output = state.node_output(run_dir.name, node_id) or {}
+    value = output.get(field)
+    try:
+        validate_output_contract(Path(schema), value)
+    except OutputContractError as exc:
+        return {
+            "node": node_id,
+            "field": field,
+            "schema": schema,
+            "status": "invalid",
+            "value": value,
+            "error": str(exc),
+        }
+    return {
+        "node": node_id,
+        "field": field,
+        "schema": schema,
+        "status": "valid",
+        "value": value,
+        "error": None,
     }
 
 
@@ -124,12 +166,16 @@ def _skip_blockers(trace: list[dict[str, Any]]) -> dict[str, str | None]:
 def _render_json(report: dict[str, Any]) -> str:
     """Machine-readable conclusion + trace (the confirmed top-level contract, #12)."""
     contract = {key: report[key] for key in ("run_id", "status", "nodes", "trace")}
+    if report["final_output"] is not None:
+        contract["final_output"] = report["final_output"]
     return json.dumps(contract, indent=2)
 
 
 def _render_jsonl(report: dict[str, Any]) -> str:
     """Line-delimited stream: a tagged conclusion record, then one record per event."""
     summary = {key: report[key] for key in ("run_id", "status", "nodes")}
+    if report["final_output"] is not None:
+        summary["final_output"] = report["final_output"]
     lines = [json.dumps({"record": "conclusion", **summary})]
     lines += [json.dumps({"record": "event", **event}) for event in report["trace"]]
     return "\n".join(lines)
@@ -140,6 +186,14 @@ def _render_text(report: dict[str, Any]) -> str:
     lines = [f"run {report['run_id']}: {report['status']}", "nodes:"]
     for node in report["nodes"]:
         lines.append(f"  {node['id']}: {node['status']}{_node_detail(node)}")
+    if report["final_output"] is not None:
+        final = report["final_output"]
+        lines.append("final output:")
+        lines.append(
+            f"  {final['node']}.{final['field']}: {final['status']} (schema: {final['schema']})"
+        )
+        if final["error"]:
+            lines.append(f"  error: {final['error']}")
     lines.append("trace:")
     for event in report["trace"]:
         lines.append(f"  {event['seq']:>4} {event['type']}")
@@ -158,6 +212,14 @@ def _render_markdown(report: dict[str, Any]) -> str:
     out += ["", "## Nodes", ""]
     for node in report["nodes"]:
         out.append(f"- {node['id']} — {node['status']}{_node_detail(node)}")
+
+    if report["final_output"] is not None:
+        final = report["final_output"]
+        out += ["", "## Final Output", ""]
+        out.append(f"- `{final['node']}.{final['field']}` — {final['status']}")
+        out.append(f"- Schema: `{final['schema']}`")
+        if final["error"]:
+            out.append(f"- Error: {final['error']}")
 
     out += ["", "## Artifacts", ""]
     artifacts = [(node["id"], path) for node in report["nodes"] for path in node["artifacts"]]
@@ -236,6 +298,7 @@ def _gather_group(group_id: str, base: Path) -> dict[str, Any]:
                 "nodes": per_run["nodes"],
                 "graph": per_run["graph"],
                 "trace": per_run["trace"],
+                "final_output": per_run["final_output"],
             }
         )
     return {
@@ -262,7 +325,15 @@ def _render_group_json(report: dict[str, Any]) -> str:
         "iterations": [
             {
                 key: iteration[key]
-                for key in ("iteration_index", "run_id", "status", "nodes", "trace")
+                for key in (
+                    "iteration_index",
+                    "run_id",
+                    "status",
+                    "nodes",
+                    "trace",
+                    "final_output",
+                )
+                if key != "final_output" or iteration[key] is not None
             }
             for iteration in report["iterations"]
         ],
@@ -292,6 +363,11 @@ def _render_group_jsonl(report: dict[str, Any]) -> str:
                     "run_id": iteration["run_id"],
                     "status": iteration["status"],
                     "nodes": iteration["nodes"],
+                    **(
+                        {"final_output": iteration["final_output"]}
+                        if iteration["final_output"] is not None
+                        else {}
+                    ),
                 }
             )
         )
@@ -318,6 +394,15 @@ def _render_group_text(report: dict[str, Any]) -> str:
         )
         for node in iteration["nodes"]:
             lines.append(f"    {node['id']}: {node['status']}{_node_detail(node)}")
+        if iteration["final_output"] is not None:
+            final = iteration["final_output"]
+            lines.append("    final output:")
+            lines.append(
+                f"      {final['node']}.{final['field']}: {final['status']} "
+                f"(schema: {final['schema']})"
+            )
+            if final["error"]:
+                lines.append(f"      error: {final['error']}")
     return "\n".join(lines)
 
 
@@ -340,6 +425,13 @@ def _render_group_markdown(report: dict[str, Any]) -> str:
         out += ["", "### Nodes", ""]
         for node in iteration["nodes"]:
             out.append(f"- {node['id']} — {node['status']}{_node_detail(node)}")
+        if iteration["final_output"] is not None:
+            final = iteration["final_output"]
+            out += ["", "### Final Output", ""]
+            out.append(f"- `{final['node']}.{final['field']}` — {final['status']}")
+            out.append(f"- Schema: `{final['schema']}`")
+            if final["error"]:
+                out.append(f"- Error: {final['error']}")
         out.append("")
     return "\n".join(out)
 

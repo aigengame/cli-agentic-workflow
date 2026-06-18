@@ -684,6 +684,28 @@ class Node(BaseModel):
         return self
 
 
+class FinalOutput(BaseModel):
+    """The persisted node output a Reporter treats as the Workflow's final result (#16)."""
+
+    model_config = ConfigDict(
+        frozen=True, extra="forbid", populate_by_name=True, serialize_by_alias=True
+    )
+
+    node: str
+    field: PredicateField
+    schema_path: Path = Field(alias="schema")
+
+    _node_non_blank = field_validator("node")(_require_non_blank)
+
+
+class ArtifactCleanupPolicy(BaseModel):
+    """Retention policy for run-owned artifact directories (#16)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    keep_last_runs: int = Field(ge=1)
+
+
 class Workflow(BaseModel):
     """A normalized Workflow IR for one Run."""
 
@@ -692,6 +714,8 @@ class Workflow(BaseModel):
     name: str
     version: int
     nodes: tuple[Node, ...]
+    final_output: FinalOutput | None = None
+    artifact_cleanup: ArtifactCleanupPolicy | None = None
     # The maximum number of node Attempts the executor runs concurrently. The
     # default leans conservative (4): enough to run a typical fan-out — including
     # the canonical three-branch parallel — without serializing it, while
@@ -761,6 +785,23 @@ class Workflow(BaseModel):
             cycle = " -> ".join(repr(node_id) for node_id in _find_cycle(remaining))
             raise ValueError(f"dependency cycle: {cycle}")
         return nodes
+
+    @model_validator(mode="after")
+    def _final_output_must_reference_a_producible_field(self) -> "Workflow":
+        if self.final_output is None:
+            return self
+        by_id = {node.id: node for node in self.nodes}
+        referenced = by_id.get(self.final_output.node)
+        if referenced is None:
+            raise ValueError(f"final_output references unknown node {self.final_output.node!r}")
+        producible = _PRODUCIBLE_FIELDS_FOR_KIND.get(referenced.kind, frozenset())
+        if self.final_output.field not in producible:
+            raise ValueError(
+                f"final_output references {self.final_output.field!r} of "
+                f"{self.final_output.node!r}, a {referenced.kind!r} node that does "
+                "not produce it"
+            )
+        return self
 
 
 @functools.lru_cache(maxsize=8)
@@ -918,6 +959,8 @@ def normalize_workflow(
     # so what is validated, checksummed, inspected, and run is an ordinary
     # Workflow — identical to the hand-authored `nodes:` equivalent.
     raw = expand_pattern(raw, source)
+    if base_dir is not None:
+        raw = _resolve_final_output_path(raw, base_dir)
     context: dict[str, Any] = {}
     if base_dir is not None:
         context["base_dir"] = base_dir
@@ -929,6 +972,20 @@ def normalize_workflow(
         raise WorkflowConfigError(
             f"invalid workflow definition in {source}: {_first_error_line(exc, raw)}"
         ) from exc
+
+
+def _resolve_final_output_path(raw: dict[str, Any], base_dir: Path) -> dict[str, Any]:
+    """Anchor a relative final-output schema path to the workflow file's directory."""
+    final_output = raw.get("final_output")
+    if not isinstance(final_output, dict):
+        return raw
+    schema = final_output.get("schema")
+    if not isinstance(schema, str | Path):
+        return raw
+    path = Path(schema)
+    if path.is_absolute():
+        return raw
+    return {**raw, "final_output": {**final_output, "schema": str(base_dir / path)}}
 
 
 def definition_checksum(workflow: Workflow) -> str:

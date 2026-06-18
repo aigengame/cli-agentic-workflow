@@ -42,6 +42,20 @@ class FakeProcess:
         return self.returncode
 
 
+class WritingProcess(FakeProcess):
+    """A fake process that writes one file in its cwd and one outside it."""
+
+    def __init__(self, produced: Path, ambient: Path) -> None:
+        super().__init__(0, stdout=b"ok")
+        self._produced = produced
+        self._ambient = ambient
+
+    async def communicate(self, input: bytes | None = None) -> tuple[bytes, bytes]:
+        self._produced.write_text("owned by this invocation\n", encoding="utf-8")
+        self._ambient.write_text("not owned by this invocation\n", encoding="utf-8")
+        return await super().communicate(input)
+
+
 class _ProbeAdapter(SubprocessAdapter):
     """A minimal concrete SubprocessAdapter for exercising the base in isolation."""
 
@@ -112,6 +126,36 @@ async def test_run_cli_passes_strict_env_isolated_stdin_and_a_private_process_gr
     assert captured["env"] == {"DECLARED": "v"}, "exactly the supplied allow-list reaches it"
     assert kwargs.get("stdin") == asyncio.subprocess.DEVNULL
     assert kwargs.get("start_new_session") is True
+
+
+@pytest.mark.asyncio
+async def test_run_cli_captures_only_the_supplied_working_directory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # #16 review follow-up: artifact discovery is scoped to the invocation's
+    # node-owned working directory, not every file changed in the ambient cwd while
+    # the subprocess ran. This prevents concurrent agent nodes from claiming each
+    # other's artifacts.
+    work_dir = tmp_path / "node-work"
+    produced = work_dir / "agent-report.md"
+    ambient = tmp_path / "ambient-report.md"
+    monkeypatch.chdir(tmp_path)
+    patch_which(monkeypatch)
+    captured = patch_spawn(monkeypatch, WritingProcess(produced, ambient))
+    adapter = _ProbeAdapter()
+
+    completed = await adapter.run_cli(
+        [FAKE_CLI_PATH, "--flag"],
+        context_label="ctx",
+        env={"DECLARED": "v"},
+        cwd=work_dir,
+    )
+
+    kwargs = captured["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert Path(str(kwargs.get("cwd"))) == work_dir
+    assert completed.artifacts == (produced,)
+    assert ambient.is_file(), "the fake process did change ambient cwd"
 
 
 @pytest.mark.asyncio

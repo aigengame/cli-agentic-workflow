@@ -33,6 +33,7 @@ from caw.adapter import AdapterRegistry
 from caw.config import load_workflow_file
 from caw.executor import RunResult, execute_run
 from caw.model import AgentNodeInputs, normalize_workflow
+from caw.report import ReportFormat, render_report
 from caw.state import StateStore
 from e2e import harness
 
@@ -149,3 +150,10 @@ async def test_real_sample_fans_the_same_task_to_claude_and_codex_then_synthesiz
     assert isinstance(synth_structured, dict)
     assert isinstance(synth_structured.get("recommendation"), str)
     assert isinstance(synth_structured.get("ranked"), list)
+
+    report = render_report(runs_root / result.run_id, ReportFormat.markdown)
+    assert "## Final Output" in report
+    assert f"`{_SYNTH_ID}.structured_output` — valid" in report
+    assert "## Artifacts" in report
+    assert "## Trace" in report
+    assert "run_started" in report
